@@ -905,13 +905,18 @@ void NestedDissection::order_leaf(const std::vector<int>& ids, int first) {
         }
     }
 
+    // Count live bits directly when every compressed vertex represents one variable
+    const bool unit_weights = std::all_of(weight.begin(), weight.end(), [](int w) { return w == 1; });
+
     // Weighted degree over the live neighbors of one subdomain vertex
     auto degree_of = [&](int i) {
         const std::uint64_t* row   = rows.data() + static_cast<std::size_t>(i) * words;
         int                  value = 0;
         for (int w = 0; w < words; ++w) {
-            for (std::uint64_t bits = row[w] & alive[w]; bits; bits &= bits - 1) {
-                value += weight[w * 64 + std::countr_zero(bits)];
+            std::uint64_t bits = row[w] & alive[w];
+            if (unit_weights) { value += std::popcount(bits); }
+            else {
+                for (; bits; bits &= bits - 1) { value += weight[w * 64 + std::countr_zero(bits)]; }
             }
         }
         return value;
