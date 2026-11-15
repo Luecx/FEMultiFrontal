@@ -1,0 +1,22 @@
+# Local experiments, benchmark matrices and generated build products
+/dev/
+/build/
+
+# Compiler and linker artifacts
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Editor and operating-system files
+/.idea/
+/.vscode/
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

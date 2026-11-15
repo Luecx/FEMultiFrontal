@@ -1,0 +1,145 @@
+/**
+ * @file pivot_driver.cpp
+ * @brief Runs the rank-aware LDLT/LU modes without changing the SPD benchmark.
+ *
+ * Manufactured loads exercise general multiplication and numerical permutation
+ * bookkeeping. Rank-deficient solutions are verified by residual rather than
+ * compared to a nonunique manufactured vector. General input values are never
+ * passed through the symmetric importer.
+ */
+#include "pivot_driver.h"
+#include "pivot_factor.h"
+#include "ordering.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+
+namespace mf {
+
+/**
+ * Execute explicit pivoted modes and report their declared numerical policy.
+ *
+ * PSD is an assertion checked against the computed symmetric inertia estimate.
+ * General includes every nonsymmetric sign pattern; positivity of its symmetric
+ * part is not used to choose Cholesky. The input and matrix graph are distinct.
+ */
+int run_pivot_driver(int argc, char** argv) {
+    // Parse robust-mode settings independently of SPD-only kernel experiments
+    std::string matrix_type = "symmetric";
+    std::string ordering = "nd";
+    int repeat = 1;
+    int threads = 1;
+    double rank_tolerance = 1e-12;
+    double pivot_tolerance = 0.1;
+    bool analyze_only = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--matrix-type" && i + 1 < argc) { matrix_type = argv[++i]; }
+        else if (option == "--ordering" && i + 1 < argc) { ordering = argv[++i]; }
+        else if (option == "--repeat" && i + 1 < argc) { repeat = std::stoi(argv[++i]); }
+        else if (option == "--threads" && i + 1 < argc) { threads = std::stoi(argv[++i]); }
+        else if (option == "--rank-tolerance" && i + 1 < argc) { rank_tolerance = std::stod(argv[++i]); }
+        else if (option == "--pivot-tolerance" && i + 1 < argc) { pivot_tolerance = std::stod(argv[++i]); }
+        else if (option == "--analyze-only") { analyze_only = true; }
+        else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
+    }
+    const bool symmetric = matrix_type == "symmetric" || matrix_type == "psd";
+    if ((!symmetric && matrix_type != "general") || repeat < 1 || threads < 1) {
+        throw std::runtime_error("Expected matrix-type spd/symmetric/psd/general and positive repeat/threads");
+    }
+    if (ordering != "natural" && ordering != "nd") {
+        throw std::runtime_error("Invalid ordering; expected nd or natural");
+    }
+
+    // Select storage before import: a GENERAL numerical operator is never folded
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    const auto matrix = symmetric ? GeneralMatrix::from_symmetric(Matrix::read_market(argv[1])) :
+                                    GeneralMatrix::read_market(argv[1]);
+    const auto loaded = Clock::now();
+    auto graph = matrix.ordering_graph();
+    std::vector<int> order(matrix.n);
+    if (ordering == "nd") { order = nested_dissection(graph, threads); }
+    else { std::iota(order.begin(), order.end(), 0); }
+    const auto ordered = Clock::now();
+    const auto permuted = matrix.permute(order, order);
+    const auto symbolic = Symbolic::analyze(permuted.ordering_graph(), threads);
+    const auto analyzed = Clock::now();
+    auto elapsed = [](Clock::time_point begin, Clock::time_point end) {
+        return std::chrono::duration<double>(end - begin).count();
+    };
+    std::cout << std::unitbuf << std::setprecision(9)
+              << "solver=pivoted_multifrontal matrix_type=" << matrix_type << " threads=" << threads << '\n'
+              << "matrix_n=" << matrix.n << " full_nnz=" << matrix.row.size() << " ordering=" << ordering << '\n'
+              << "load_s=" << elapsed(start, loaded) << " graph_ordering_s=" << elapsed(loaded, ordered)
+              << " permutation_symbolic_s=" << elapsed(ordered, analyzed) << '\n'
+              << "scaling=sqrt_row_column_max rank_tolerance=" << rank_tolerance
+              << " pivot_tolerance=" << pivot_tolerance << " rank_method=threshold_front_pivots\n";
+    if (analyze_only) { return 0; }
+
+    // Build the same nonconstant manufactured load in original matrix coordinates
+    std::vector<double> exact(matrix.n);
+    for (int i = 0; i < matrix.n; ++i) { exact[i] = std::sin(0.17 * i) + 0.5 * std::cos(0.031 * i); }
+    const auto rhs = matrix.multiply(exact);
+    std::vector<double> permuted_rhs(matrix.n);
+    for (int i = 0; i < matrix.n; ++i) { permuted_rhs[i] = rhs[order[i]]; }
+    PivotFactor factor;
+    factor.kind = symmetric ? PivotFactor::Kind::Symmetric : PivotFactor::Kind::General;
+    factor.rank_tolerance = rank_tolerance;
+    factor.pivot_tolerance = pivot_tolerance;
+    factor.threads = threads;
+    std::vector<double> totals;
+    for (int trial = 0; trial < repeat; ++trial) {
+        const auto begin = Clock::now();
+        factor.factorize(permuted, symbolic);
+        const auto factored = Clock::now();
+        if (matrix_type == "psd" && factor.negative_directions != 0) {
+            throw std::runtime_error("The declared PSD matrix has negative pivot directions");
+        }
+        const auto solution = factor.solve(permuted_rhs);
+        const auto solved = Clock::now();
+        totals.push_back(elapsed(begin, solved));
+
+        // Verify the complete original operator; singular solutions need not equal exact
+        std::vector<double> x(matrix.n);
+        for (int i = 0; i < matrix.n; ++i) { x[order[i]] = solution[i]; }
+        const auto product = matrix.multiply(x);
+        long double residual = 0.0L;
+        long double norm = 0.0L;
+        for (int i = 0; i < matrix.n; ++i) {
+            const long double difference = static_cast<long double>(product[i]) - rhs[i];
+            residual += difference * difference;
+            norm += static_cast<long double>(rhs[i]) * rhs[i];
+        }
+        const long double relative = norm > 0.0L ? std::sqrt(residual / norm) : std::sqrt(residual);
+        std::cout << "trial=" << trial + 1 << " factor_s=" << elapsed(begin, factored)
+                  << " solve_s=" << elapsed(factored, solved) << " numeric_total_s=" << totals.back()
+                  << " rank_estimate=" << factor.rank << " nullity_estimate=" << matrix.n - factor.rank
+                  << " solution_unique=" << int(factor.rank == matrix.n) << " max_front=" << factor.maximum_front
+                  << " delayed_candidates=" << factor.delayed_candidates << " pivots_2x2=" << factor.two_by_two_pivots
+                  << " relative_residual=" << relative;
+        if (symmetric) {
+            std::cout << " inertia_positive=" << factor.positive_directions << " inertia_negative=" << factor.negative_directions
+                      << " inertia_zero=" << matrix.n - factor.rank;
+        }
+        std::cout << '\n';
+        if (!std::isfinite(relative) || relative > std::max(1e-8, 100.0 * rank_tolerance)) {
+            throw std::runtime_error("Pivoted benchmark residual failed");
+        }
+    }
+    std::sort(totals.begin(), totals.end());
+    const std::size_t middle = totals.size() / 2;
+    const double median = totals.size() % 2 ? totals[middle] : 0.5 * (totals[middle - 1] + totals[middle]);
+    std::cout << "median_numeric_s=" << median << '\n';
+    return 0;
+}
+
+} // namespace mf
