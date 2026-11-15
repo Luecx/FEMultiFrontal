@@ -16,6 +16,10 @@ namespace mf::dense {
 // begins at local front index one; each column j contains size-j valid values.
 void add_packed_panel(int size, int width, double* const* columns, const double* packed, int origin);
 
+// Add the same contribution panel from tiled storage; physical coordinates
+// include the reserved first pivot while origin retains contribution semantics.
+void add_tiled_panel(int size, int width, double* const* columns, const double* tiled, int origin);
+
 // Factor the leading width-by-width SPD block. Width lies in [1,256]. inverse
 // receives width reciprocal diagonal values. Return -1 on success, otherwise
 // the local nonpositive/nonfinite pivot index; minimum tracks tested pivots.

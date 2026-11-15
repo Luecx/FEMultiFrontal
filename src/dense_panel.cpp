@@ -9,6 +9,7 @@
  * the existing dense kernels in the neighboring module.
  */
 #include "dense_panel.h"
+#include "dense_tiled.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,13 +22,16 @@
 namespace mf::dense {
 
 /**
- * Assemble all remaining pivot columns from one packed contribution traversal.
+ * Assemble the remaining pivot columns from packed or tiled contributions.
  *
- * The first pivot column was separated by extend-add. Thus packed origin maps
- * to local front index one. Full tiles transpose four packed rows into factor
- * columns; diagonal and boundary strips use the same scalar additions.
+ * The first pivot column was separated by extend-add. Full tiles transpose four
+ * source rows into CSC columns; diagonal strips and source tile crossings use
+ * scalar additions. Tiled coordinates retain the reserved original first pivot.
+ *
+ * @tparam Tiled Select tile-row storage instead of row-packed addressing.
  */
-void add_packed_panel(int size, int width, double* const* columns, const double* packed, int origin) {
+template<bool Tiled>
+static void add_panel_impl(int size, int width, double* const* columns, const double* packed, int origin) {
     // The first column is complete, and width-one fronts have no panel to add
     if (width <= 1) { return; }
     auto scalar_rows = [&](int first, int last, int first_column) {
@@ -35,7 +39,7 @@ void add_packed_panel(int size, int width, double* const* columns, const double*
             const std::size_t row = static_cast<std::size_t>(origin+r-1);
             const std::size_t base = row*(row+1)/2+origin;
             for (int j = first_column; j < width && j <= r; ++j) {
-                columns[j][r-j] += packed[base+j-1];
+                columns[j][r-j] += packed[Tiled ? tiled_lower_offset(origin+r, origin+j) : base+j-1];
             }
         }
     };
@@ -45,11 +49,28 @@ void add_packed_panel(int size, int width, double* const* columns, const double*
     scalar_rows(1,std::min(size,4),1);
     r = 4;
     auto tile = [&](int row, int column, int stored_columns) {
-        const std::size_t a = static_cast<std::size_t>(origin+row-1);
-        const __m256d x0 = _mm256_loadu_pd(packed+a*(a+1)/2+origin+column-1);
-        const __m256d x1 = _mm256_loadu_pd(packed+(a+1)*(a+2)/2+origin+column-1);
-        const __m256d x2 = _mm256_loadu_pd(packed+(a+2)*(a+3)/2+origin+column-1);
-        const __m256d x3 = _mm256_loadu_pd(packed+(a+3)*(a+4)/2+origin+column-1);
+        if constexpr (Tiled) {
+            if ((origin + column) % schur_tile_size + 4 > schur_tile_size) {
+                for (int r = row; r < row + 4; ++r) {
+                    for (int j = 0; j < stored_columns; ++j) {
+                        columns[column+j][r-column-j] += packed[tiled_lower_offset(origin+r, origin+column+j)];
+                    }
+                }
+                return;
+            }
+        }
+        auto input = [&](int source_row) {
+            if constexpr (Tiled) {
+                return packed + tiled_lower_offset(origin + source_row, origin + column);
+            } else {
+                const std::size_t r = static_cast<std::size_t>(origin + source_row - 1);
+                return packed + r * (r + 1) / 2 + origin + column - 1;
+            }
+        };
+        const __m256d x0 = _mm256_loadu_pd(input(row));
+        const __m256d x1 = _mm256_loadu_pd(input(row + 1));
+        const __m256d x2 = _mm256_loadu_pd(input(row + 2));
+        const __m256d x3 = _mm256_loadu_pd(input(row + 3));
         const __m256d t0 = _mm256_unpacklo_pd(x0,x1);
         const __m256d t1 = _mm256_unpackhi_pd(x0,x1);
         const __m256d t2 = _mm256_unpacklo_pd(x2,x3);
@@ -79,6 +100,16 @@ void add_packed_panel(int size, int width, double* const* columns, const double*
 #endif
     // Portable path and incomplete output-row tiles retain scalar addressing
     scalar_rows(r,size,1);
+}
+
+/** Add the initialized contribution panel from row-packed storage. */
+void add_packed_panel(int size, int width, double* const* columns, const double* packed, int origin) {
+    add_panel_impl<false>(size, width, columns, packed, origin);
+}
+
+/** Add the initialized contribution panel from tile-row lower storage. */
+void add_tiled_panel(int size, int width, double* const* columns, const double* tiled, int origin) {
+    add_panel_impl<true>(size, width, columns, tiled, origin);
 }
 
 /**

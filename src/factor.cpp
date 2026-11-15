@@ -13,6 +13,7 @@
 #include "factor.h"
 #include "dense.h"
 #include "dense_panel.h"
+#include "dense_tiled.h"
 
 #include <algorithm>
 #include <atomic>
@@ -55,19 +56,22 @@ void Factor::factorize(const Matrix& matrix, const Symbolic& symbolic) {
     try {
 #ifdef _OPENMP
         if (threads > 1) {
-            factorize_impl<false, true>(matrix, symbolic);
+            if (tiled_schur && schur_kernel == SchurKernel::Packed) { factorize_impl<false, true, true>(matrix, symbolic); }
+            else { factorize_impl<false, true, false>(matrix, symbolic); }
             return;
         }
 #endif
         if (!profile_enabled) {
-            factorize_impl<false, false>(matrix, symbolic);
+            if (tiled_schur && schur_kernel == SchurKernel::Packed) { factorize_impl<false, false, true>(matrix, symbolic); }
+            else { factorize_impl<false, false, false>(matrix, symbolic); }
             return;
         }
 
         // Include final local-container destruction in the profiled total
         using Clock = std::chrono::steady_clock;
         const auto begin = Clock::now();
-        factorize_impl<true, false>(matrix, symbolic);
+        if (tiled_schur && schur_kernel == SchurKernel::Packed) { factorize_impl<true, false, true>(matrix, symbolic); }
+        else { factorize_impl<true, false, false>(matrix, symbolic); }
         const double total = std::chrono::duration<double>(Clock::now() - begin).count();
         const double measured = std::accumulate(phase_seconds.begin(), phase_seconds.end(), 0.0);
         phase_seconds[Other] += std::max(0.0, total - measured);
@@ -93,8 +97,10 @@ void Factor::factorize(const Matrix& matrix, const Symbolic& symbolic) {
  * Nonpositive or nonfinite pivots terminate factorization with their index.
  *
  * @tparam Profile Enable wall-clock boundaries without changing arithmetic.
+ * @tparam Parallel Use subtree and dense-tile tasks in the existing team.
+ * @tparam Tiled Enable large-front tiled storage; false removes layout checks.
  */
-template<bool Profile, bool Parallel>
+template<bool Profile, bool Parallel, bool Tiled>
 void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
     // Compile phase boundaries out of the unprofiled specialization
     using Clock = std::chrono::steady_clock;
@@ -144,6 +150,11 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
     huge_page_hints_accepted = prefer_huge_pages && memory::advise_huge_pages(value.data(), value.size() * sizeof(double));
     std::vector<memory::Values> contributions(n);
     std::vector<int> origin(n, 0);
+    std::vector<unsigned char> tiled(Tiled ? n : 0, 0);
+    auto tiled_at = [&](int pivot) {
+        if constexpr (Tiled) { return tiled[pivot] != 0; }
+        return false;
+    };
     std::vector<memory::Indices> worker_position(Parallel ? threads : 1);
     std::size_t live_bytes = 0;
     std::atomic<std::size_t> parallel_live{0};
@@ -236,16 +247,26 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
             if (inherit) {
                 const int child_origin = origin[only_child];
                 update = std::move(contributions[only_child]);
+                if constexpr (Tiled) { tiled[pivot] = tiled[only_child]; }
                 finish_phase(Memory);
-                for (int i = 0; i < size; ++i) {
-                    const std::size_t r = static_cast<std::size_t>(child_origin + i);
-                    column[i] += update[r * (r + 1) / 2 + child_origin];
+                if (tiled_at(pivot)) {
+                    for (int i = 0; i < size; ++i) {
+                        column[i] += update[dense::tiled_lower_offset(child_origin + i + 1, child_origin + 1)];
+                    }
+                } else {
+                    for (int i = 0; i < size; ++i) {
+                        const std::size_t r = static_cast<std::size_t>(child_origin + i);
+                        column[i] += update[r * (r + 1) / 2 + child_origin];
+                    }
                 }
                 origin[pivot] = child_origin + 1;
                 ++task_inherited;
                 finish_phase(Assembly);
             } else {
-                update.assign(static_cast<std::size_t>(updates) * (updates + 1) / 2, 0.0);
+                if constexpr (Tiled) { tiled[pivot] = size >= 512; }
+                const std::size_t entries = tiled_at(pivot) ? dense::tiled_lower_size(size) :
+                    static_cast<std::size_t>(updates) * (updates + 1) / 2;
+                update.assign(entries, 0.0);
                 allocate_bytes(update.size() * sizeof(double));
                 if (prefer_huge_pages && memory::advise_huge_pages(update.data(), update.size() * sizeof(double))) {
                     ++task_huge_hints;
@@ -274,10 +295,12 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 
                 // Derive contiguous runs from the actual scalar mapping, never
                 // from physical DOF groups. Sparse/short mappings retain scatter.
+                const bool source_tiled = tiled_at(child);
+                const bool target_tiled = tiled_at(pivot);
                 child_run_ends.clear();
                 // Paired full-solver measurements show a reliable gain only
                 // without subtree tasks. Keep the established parallel path.
-                bool use_spans = !Parallel && child_size >= 64;
+                bool use_spans = !Parallel && !source_tiled && !target_tiled && child_size >= 64;
                 if (use_spans && child_map.back() - child_map[1] != child_size - 2) {
                     const std::size_t max_runs = static_cast<std::size_t>(child_size - 1) / 8;
                     for (int j = 2; j < child_size; ++j) {
@@ -297,6 +320,26 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
                 // its column from the trailing triangle, removing an inner
                 // branch. Different child rows own disjoint target rows.
                 auto assemble_rows = [&](int first, int last) {
+                    if (source_tiled || target_tiled) {
+                        // Mixed representations use the same scalar child map.
+                        // Every row is still owned by exactly one assembly task.
+                        for (int i = first; i < last; ++i) {
+                            const int r          = child_map[i];
+                            const int source_row = child_origin + i;
+                            const std::size_t source_base = static_cast<std::size_t>(source_row) * (source_row + 1) / 2 + child_origin;
+                            const std::size_t leading = source_tiled ?
+                                dense::tiled_lower_offset(source_row + 1, child_origin + 1) : source_base;
+                            column[r] += source[leading];
+                            for (int j = 1; j <= i; ++j) {
+                                const std::size_t input = source_tiled ?
+                                    dense::tiled_lower_offset(source_row + 1, child_origin + j + 1) : source_base + j;
+                                const std::size_t target = target_tiled ? dense::tiled_lower_offset(r, child_map[j]) :
+                                    static_cast<std::size_t>(r - 1) * r / 2 + child_map[j] - 1;
+                                update[target] += source[input];
+                            }
+                        }
+                        return;
+                    }
                     std::size_t row = static_cast<std::size_t>(child_origin + first);
                     std::size_t offset = row * (row + 1) / 2 + child_origin;
                     for (int i = first; i < last; ++i) {
@@ -352,7 +395,9 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 
             // Read the group's contribution columns together. Row-wise tiles
             // turn repeated strided gathers into contiguous lower-triangle reads.
-            dense::add_packed_panel(size, width, panel_columns.data(), update.data(), origin[pivot]);
+            if (tiled_at(pivot)) {
+                dense::add_tiled_panel(size, width, panel_columns.data(), update.data(), origin[pivot]);
+            } else { dense::add_packed_panel(size, width, panel_columns.data(), update.data(), origin[pivot]); }
             finish_phase(Assembly);
 
             // Factor only the dense leading block, then solve its rectangular
@@ -378,7 +423,9 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
             for (int local = 0; local < width; ++local) {
                 update_columns.push_back(panel_columns[local] + width - local);
             }
-            if (schur_kernel == SchurKernel::Packed && trailing >= 512 && width >= 8) {
+            if (tiled_at(pivot)) {
+                dense::rank_k_subtract_tiled(trailing, width, update_columns.data(), update.data(), origin[pivot], schur_scratch);
+            } else if (schur_kernel == SchurKernel::Packed && trailing >= 512 && width >= 8) {
                 dense::rank_k_subtract_packed6(trailing, width, update_columns.data(),
                                               update.data(), origin[pivot], schur_scratch);
             } else {

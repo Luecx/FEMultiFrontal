@@ -68,6 +68,10 @@ struct Factor {
     std::size_t assembled_fronts = 0;
     std::size_t merged_pivots    = 0;
 
+    // Use tiled temporary storage on large fronts with the optimized kernel.
+    // Small fronts and the Baseline kernel retain row-packed contributions.
+    bool tiled_schur = false;
+
     // Assemble exact pivot panels in tree order and preserve scalar CSC factors
     void factorize(const Matrix& matrix, const Symbolic& symbolic);
 
@@ -78,7 +82,7 @@ struct Factor {
 
 private:
     // Instantiate the panel algorithm with or without phase clock reads
-    template<bool Profile, bool Parallel>
+    template<bool Profile, bool Parallel, bool Tiled>
     void factorize_impl(const Matrix& matrix, const Symbolic& symbolic);
 };
 

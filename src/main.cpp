@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
             std::cerr << "Usage: mfsolve matrix.mtx [--repeat N] [--ordering nd|natural]"
                          " [--update-block N]"
                          " [--schur-kernel baseline|packed|compare]"
+                         " [--schur-storage packed|tiled]"
                          " [--threads N] [--thread-sweep]"
                          " [--huge-pages]"
                          " [--profile-factor off|on|alternate] [--reference-seconds T] [--analyze-only]\n";
@@ -52,16 +53,17 @@ int main(int argc, char** argv) {
             if (std::string(argv[i]) == "--matrix-type") { matrix_type = argv[i + 1]; }
         }
         if (matrix_type != "spd") { return mf::run_pivot_driver(argc, argv); }
-        int         repeat       = 1;
-        std::string ordering     = "nd";
-        bool        analyze_only = false;
-        int         update_block = 32;
-        double      reference_s  = 0.0;
-        std::string profile_mode = "off";
-        std::string schur_mode   = "packed";
-        int         thread_count = 1;
-        bool        thread_sweep = false;
-        bool        huge_pages   = false;
+        int         repeat        = 1;
+        std::string ordering      = "nd";
+        bool        analyze_only  = false;
+        int         update_block  = 32;
+        double      reference_s   = 0.0;
+        std::string profile_mode  = "off";
+        std::string schur_mode    = "packed";
+        std::string schur_storage = "packed";
+        int         thread_count  = 1;
+        bool        thread_sweep  = false;
+        bool        huge_pages    = false;
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--repeat" && i + 1 < argc) {
@@ -78,6 +80,8 @@ int main(int argc, char** argv) {
                 reference_s = std::stod(argv[++i]);
             } else if (option == "--profile-factor" && i + 1 < argc) {
                 profile_mode = argv[++i];
+            } else if (option == "--schur-storage" && i + 1 < argc) {
+                schur_storage = argv[++i];
             } else if (option == "--schur-kernel" && i + 1 < argc) {
                 schur_mode = argv[++i];
             } else if (option == "--threads" && i + 1 < argc) {
@@ -99,6 +103,9 @@ int main(int argc, char** argv) {
         }
         if (profile_mode != "off" && profile_mode != "on" && profile_mode != "alternate") {
             throw std::runtime_error("--profile-factor expects off, on, or alternate");
+        }
+        if (schur_storage != "packed" && schur_storage != "tiled") {
+            throw std::runtime_error("--schur-storage expects packed or tiled");
         }
         if (schur_mode != "baseline" && schur_mode != "packed" && schur_mode != "compare") {
             throw std::runtime_error("--schur-kernel expects baseline, packed, or compare");
@@ -126,7 +133,7 @@ int main(int argc, char** argv) {
         std::cout << "solver=scalar_multifrontal_cholesky threads=" << thread_count
                   << " thread_sweep=" << int(thread_sweep) << " supernodes=0\n";
         std::cout << "factor_profile_mode=" << profile_mode << '\n';
-        std::cout << "schur_kernel_mode=" << schur_mode << '\n';
+        std::cout << "schur_kernel_mode=" << schur_mode << " schur_storage=" << schur_storage << '\n';
 #if defined(__AVX2__) && defined(__FMA__)
         std::cout << "dense_backend=avx2_fma baseline_tile=4x8 packed_tile=6x8 transpose_dot=avx2_gather\n";
 #else
@@ -168,6 +175,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < matrix.n; ++i) { permuted_rhs[i] = rhs[order[i]]; }
         mf::Factor factor;
         factor.update_block_size = update_block;
+        factor.tiled_schur = schur_storage == "tiled";
         factor.prefer_huge_pages = huge_pages;
         std::vector<double> totals;
         std::vector<double> normal_factor_times;
