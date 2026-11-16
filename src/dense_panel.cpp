@@ -6,7 +6,8 @@
  * CSC segments. Scalar POTRF handles the small diagonal block. AVX2 TRSM holds
  * eight rows and four pivot columns in registers, reusing each previous factor
  * vector across four updates. The trailing Schur operation is implemented by
- * the existing dense kernels in the neighboring module.
+ * the existing dense kernels in the neighboring module. Grouped forward
+ * substitution reuses CSC row lists without changing persistent factor storage.
  */
 #include "dense_panel.h"
 
@@ -188,6 +189,70 @@ void solve_panel(int size, int width, double* const* columns, const double* inve
 #endif
     // Scalar remainder also implements the complete portable triangular solve
     scalar_rows(width,size,j,width);
+}
+
+/**
+ * Solve a consecutive CSC pivot group and update its shared ancestor rows.
+ *
+ * Column j contains size-j entries matching rows[j..size). The first width
+ * rows form the leading triangular system. Each remaining RHS entry is held
+ * in registers across all columns, preserving ascending pivot order while
+ * reducing repeated index loads and RHS traffic. At most eight columns are
+ * read concurrently so ordinary hardware prefetching can follow their streams.
+ *
+ * A non-null rhs supplies late pivot additions for task-private work buffers;
+ * otherwise work already includes the original RHS. Rows are sorted and unique,
+ * and width lies in [1,8]. No factor or index storage is modified.
+ */
+void forward_panel(int size, int width, const int* rows, const double* const* columns,
+                   double* work, const double* rhs) {
+    double pivots[8];
+    // Private buffers add b_j only after preceding descendants have accumulated
+    for (int j = 0; j < width; ++j) {
+        const int node = rows[j];
+        if (rhs) { work[node] += rhs[node]; }
+        work[node] /= columns[j][0];
+        pivots[j] = work[node];
+        for (int r = j + 1; r < width; ++r) { work[rows[r]] -= columns[j][r - j] * pivots[j]; }
+    }
+    int r = width;
+#if defined(__AVX2__) && defined(__FMA__)
+    // Every row is distinct. Gather/scatter once per eight rows, rather than
+    // once per column, retaining ascending subtraction order for every entry.
+    for (; r + 8 <= size; r += 8) {
+        const bool contiguous = rows[r + 7] - rows[r] == 7;
+        __m256d y0, y1;
+        if (contiguous) {
+            y0 = _mm256_loadu_pd(work + rows[r]);
+            y1 = _mm256_loadu_pd(work + rows[r] + 4);
+        } else {
+            const __m128i i0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rows + r));
+            const __m128i i1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rows + r + 4));
+            y0 = _mm256_i32gather_pd(work, i0, 8);
+            y1 = _mm256_i32gather_pd(work, i1, 8);
+        }
+        for (int j = 0; j < width; ++j) {
+            const __m256d x = _mm256_set1_pd(pivots[j]);
+            y0 = _mm256_fnmadd_pd(_mm256_loadu_pd(columns[j] + r - j), x, y0);
+            y1 = _mm256_fnmadd_pd(_mm256_loadu_pd(columns[j] + r - j + 4), x, y1);
+        }
+        if (contiguous) {
+            _mm256_storeu_pd(work + rows[r], y0);
+            _mm256_storeu_pd(work + rows[r] + 4, y1);
+        } else {
+            alignas(32) double result[8];
+            _mm256_store_pd(result, y0);
+            _mm256_store_pd(result + 4, y1);
+            for (int i = 0; i < 8; ++i) { work[rows[r + i]] = result[i]; }
+        }
+    }
+#endif
+    // Portable implementation and incomplete row tiles use the same p order
+    for (; r < size; ++r) {
+        double value = work[rows[r]];
+        for (int j = 0; j < width; ++j) { value -= columns[j][r - j] * pivots[j]; }
+        work[rows[r]] = value;
+    }
 }
 
 } // namespace mf::dense

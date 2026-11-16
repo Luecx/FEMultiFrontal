@@ -9,6 +9,7 @@
 #include "factor.h"
 #include "ordering.h"
 #include "dense.h"
+#include "dense_panel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +43,61 @@ int main(int, char** argv) {
             mf::memory::advise_huge_pages(values.data(), values.size() * sizeof(double));
             for (double value : values) {
                 if (value != 3.0) { throw std::runtime_error("Page advice changed numerical storage"); }
+            }
+        }
+
+        // Compare grouped substitution with independent scalar CSC traversal.
+        // Cover every group width, vector tails, row gaps and untouched slots,
+        // including the late RHS additions required by private subtree buffers.
+        for (int width = 1; width <= 8; ++width) {
+            for (int layout : {0, 1, 2}) {
+                for (int size : {width, width+1, width+7, width+8, width+9, width+31, width+97, 257}) {
+                    const int n = size * 3 + 11;
+                    std::vector<int> rows(size);
+                    for (int r = 0; r < size; ++r) {
+                        rows[r] = layout == 0 ? 3*r+7 : layout == 1 ? r+7 : r+7+(r/13)*2;
+                    }
+                    std::vector<std::vector<double>> storage(width);
+                    std::vector<const double*>       columns(width);
+                    for (int j = 0; j < width; ++j) {
+                        storage[j].resize(size-j);
+                        for (int r = j; r < size; ++r) {
+                            storage[j][r-j] = r == j ? 1.0+0.01*j : 0.013*std::sin(0.17*r+0.13*j);
+                        }
+                        columns[j] = storage[j].data();
+                    }
+                    for (bool late_rhs : {false, true}) {
+                        std::vector<double> rhs(n), expected(n), actual(n);
+                        for (int i = 0; i < n; ++i) {
+                            rhs[i]      = std::cos(0.19*i);
+                            expected[i] = 0.2*std::sin(0.11*i);
+                            actual[i]   = expected[i];
+                        }
+
+                        // The reference follows each complete column in order
+                        for (int j = 0; j < width; ++j) {
+                            if (late_rhs) { expected[rows[j]] += rhs[rows[j]]; }
+                            expected[rows[j]] /= columns[j][0];
+                            const double pivot = expected[rows[j]];
+                            for (int r = j+1; r < size; ++r) {
+                                expected[rows[r]] -= columns[j][r-j] * pivot;
+                            }
+                        }
+                        mf::dense::forward_panel(
+                            size,
+                            width,
+                            rows.data(),
+                            columns.data(),
+                            actual.data(),
+                            late_rhs ? rhs.data() : nullptr
+                        );
+                        for (int i = 0; i < n; ++i) {
+                            if (!std::isfinite(actual[i]) || std::abs(expected[i]-actual[i]) > 1e-13) {
+                                throw std::runtime_error("Grouped forward substitution differs from scalar columns");
+                            }
+                        }
+                    }
+                }
             }
         }
 

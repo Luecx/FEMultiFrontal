@@ -475,7 +475,9 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 /**
  * Solve L y = b followed by L^T x = y in the permuted coordinate system.
  *
- * The forward pass scatters each normalized pivot into its descendant rows.
+ * The forward pass subtracts normalized pivots from higher-index ancestor rows.
+ * Exact consecutive chains share a row list and update each suffix entry once
+ * per group of at most eight columns, limiting simultaneous factor streams.
  * The reverse pass gathers the transpose contribution from those same rows.
  * Neither pass reads dense contribution storage or the original matrix.
  * Large single-root plans split into independent subtrees. Forward tasks use
@@ -491,6 +493,25 @@ std::vector<double> Factor::solve(const Symbolic& symbolic, const std::vector<do
     }
     auto x = rhs;
 
+    // Exact consecutive scalar chains share one row list. Sparse/small factors
+    // keep the legacy traversal so plan construction cannot dominate a solve.
+    constexpr int panel_limit = 8;
+    std::vector<unsigned char> panel_width;
+    if (n >= 1024 && value.size() >= static_cast<std::size_t>(n) * 16) {
+        panel_width.assign(n, 0);
+        for (int first = 0; first < n;) {
+            int head  = first;
+            int width = 1;
+            while (width < panel_limit && head + 1 < n &&
+                   symbolic.parent[head] == head + 1 && symbolic.reuse_child[head + 1] == head) {
+                ++head;
+                ++width;
+            }
+            panel_width[head] = static_cast<unsigned char>(width);
+            first = head + 1;
+        }
+    }
+
     // Apply one scalar column. Off-diagonal rows are ancestors in the exact
     // elimination tree, so independent subtrees cannot update one another.
     auto forward = [&](int c, double* work) {
@@ -500,6 +521,23 @@ std::vector<double> Factor::solve(const Symbolic& symbolic, const std::vector<do
         for (std::size_t p = begin + 1; p < symbolic.ptr[c + 1]; ++p) {
             work[symbolic.row[p]] -= value[p] * pivot;
         }
+    };
+    // Add private RHS entries at the same point as the scalar algorithm. A
+    // group cannot cross a frontier branch because every link has one child.
+    auto forward_group = [&](int head, double* work, const double* input) {
+        const int width = panel_width[head];
+        if (width == 0) { return; }
+        if (width == 1) {
+            if (input) { work[head] += input[head]; }
+            forward(head, work);
+            return;
+        }
+        const int first = head - width + 1;
+        const double* columns[panel_limit];
+        for (int j = 0; j < width; ++j) { columns[j] = value.data() + symbolic.ptr[first + j]; }
+        const std::size_t begin = symbolic.ptr[first];
+        const int         size  = static_cast<int>(symbolic.ptr[first + 1] - begin);
+        dense::forward_panel(size, width, symbolic.row.data() + begin, columns, work, input);
     };
     auto backward = [&](int c) {
         const std::size_t begin   = symbolic.ptr[c];
@@ -566,9 +604,16 @@ std::vector<double> Factor::solve(const Symbolic& symbolic, const std::vector<do
                 const int last  = first + symbolic.subtree_size[root];
                 for (int index = first; index < last; ++index) {
                     const int node = symbolic.postorder[index];
-                    work[node] += rhs[node];
-                    forward(node, work.data());
-                    x[node] = work[node];
+                    if (panel_width.empty()) {
+                        work[node] += rhs[node];
+                        forward(node, work.data());
+                        x[node] = work[node];
+                    } else {
+                        const int width = panel_width[node];
+                        if (width == 0) { continue; }
+                        forward_group(node, work.data(), rhs.data());
+                        for (int c = node - width + 1; c <= node; ++c) { x[c] = work[c]; }
+                    }
                 }
             }
 
@@ -577,7 +622,10 @@ std::vector<double> Factor::solve(const Symbolic& symbolic, const std::vector<do
             for (int node : separator) {
                 for (int task = 0; task < tasks; ++task) { x[node] += contributions[task][node]; }
             }
-            for (int node : separator) { forward(node, x.data()); }
+            for (int node : separator) {
+                if (panel_width.empty()) { forward(node, x.data()); }
+                else { forward_group(node, x.data(), nullptr); }
+            }
 
             // Transpose substitution reverses dependencies: ancestors first,
             // then subtrees whose unknowns and written solution entries differ.
@@ -594,8 +642,11 @@ std::vector<double> Factor::solve(const Symbolic& symbolic, const std::vector<do
     }
 #endif
 
-    // Preserve the established scalar traversal for serial and small systems
-    for (int c = 0; c < n; ++c) { forward(c, x.data()); }
+    // Apply groups in pivot order; small or sparse plans retain scalar traversal
+    for (int c = 0; c < n; ++c) {
+        if (panel_width.empty()) { forward(c, x.data()); }
+        else { forward_group(c, x.data(), nullptr); }
+    }
     for (int c = n - 1; c >= 0; --c) { backward(c); }
     return x;
 }

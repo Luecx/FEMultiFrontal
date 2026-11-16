@@ -72,6 +72,7 @@ struct Factor {
     void factorize(const Matrix& matrix, const Symbolic& symbolic);
 
     // Solve in permuted coordinates using the stored lower factor and transpose.
+    // Exact consecutive chains share forward row traversal in groups of eight.
     // Large single-root plans merge task-private RHS contributions before the
     // separator solve, avoiding overlapping forward scatters into shared state.
     std::vector<double> solve(const Symbolic& symbolic, const std::vector<double>& rhs) const;

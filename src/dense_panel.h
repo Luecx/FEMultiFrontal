@@ -25,4 +25,11 @@ int factor_pivot_block(int width, double* const* columns, double* inverse, doubl
 // and its reciprocal diagonals. Columns retain their scalar CSC representation.
 void solve_panel(int size, int width, double* const* columns, const double* inverse);
 
+// Forward substitution on up to eight consecutive columns with one common row
+// list. Column j stores rows[j..size); rows are sorted and distinct. If rhs is
+// non-null, add rhs[rows[j]] immediately before solving pivot j in private work;
+// otherwise work already contains the RHS. Factor columns remain read-only.
+void forward_panel(int size, int width, const int* rows, const double* const* columns,
+                   double* work, const double* rhs);
+
 } // namespace mf::dense
