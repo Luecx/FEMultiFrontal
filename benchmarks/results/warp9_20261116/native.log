@@ -1,0 +1,13 @@
+matrix_n=995328 threads=16 ordering=nd preparation_s=3.18910957 factor_nnz=1010480940 max_front=5328
+trial=1 warmup=1 threads_used=16 update_block=32 factor_s=7.46918705 solve_s=0.413368939 relative_residual=8.45573553e-16 relative_solution_error=3.66915933e-10
+trial=1 warmup=1 threads_used=16 update_block=128 factor_s=5.56285556 solve_s=0.409569288 relative_residual=8.7209223e-16 relative_solution_error=2.39969731e-10
+trial=2 warmup=0 threads_used=16 update_block=128 factor_s=5.49881313 solve_s=0.401746292 relative_residual=8.7209223e-16 relative_solution_error=2.39969731e-10
+trial=2 warmup=0 threads_used=16 update_block=32 factor_s=7.16410899 solve_s=0.367262036 relative_residual=8.45573553e-16 relative_solution_error=3.66915933e-10
+trial=3 warmup=0 threads_used=16 update_block=32 factor_s=7.11869711 solve_s=0.410561854 relative_residual=8.45573553e-16 relative_solution_error=3.66915933e-10
+trial=3 warmup=0 threads_used=16 update_block=128 factor_s=5.9864032 solve_s=0.524330981 relative_residual=8.7209223e-16 relative_solution_error=2.39969731e-10
+trial=4 warmup=0 threads_used=16 update_block=128 factor_s=6.88924993 solve_s=0.706797629 relative_residual=8.7209223e-16 relative_solution_error=2.39969731e-10
+trial=4 warmup=0 threads_used=16 update_block=32 factor_s=8.980144 solve_s=0.435328303 relative_residual=8.45573553e-16 relative_solution_error=3.66915933e-10
+trial=5 warmup=0 threads_used=16 update_block=32 factor_s=8.0544704 solve_s=0.430264572 relative_residual=8.45573553e-16 relative_solution_error=3.66915933e-10
+trial=5 warmup=0 threads_used=16 update_block=128 factor_s=5.66209759 solve_s=0.427837886 relative_residual=8.7209223e-16 relative_solution_error=2.39969731e-10
+trial=6 warmup=0 threads_used=16 update_block=128 factor_s=5.85064168 solve_s=0.464280264 relative_residual=8.7209223e-16 relative_solution_error=2.39969731e-10
+trial=6 warmup=0 threads_used=16 update_block=32 factor_s=7.40500037 solve_s=0.417627709 relative_residual=8.45573553e-16 relative_solution_error=3.66915933e-10

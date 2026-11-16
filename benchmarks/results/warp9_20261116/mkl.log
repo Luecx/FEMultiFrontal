@@ -1,0 +1,7 @@
+solver=mkl_pardiso_spd matrix_n=995328 threads=16 analysis_s=3.00503724 factor_nnz=1045191337
+trial=1 factor_s=9.11988802 solve_s=0.669307631 numeric_total_s=9.78919565 relative_residual=4.5513701e-16 relative_solution_error=3.21160633e-10
+trial=2 factor_s=9.05034476 solve_s=0.725425065 numeric_total_s=9.77576982 relative_residual=4.54868884e-16 relative_solution_error=2.39822866e-10
+trial=3 factor_s=8.81562265 solve_s=0.693649352 numeric_total_s=9.509272 relative_residual=4.54567305e-16 relative_solution_error=6.27479095e-11
+trial=4 factor_s=8.54286719 solve_s=0.641155425 numeric_total_s=9.18402262 relative_residual=4.54491549e-16 relative_solution_error=1.93330686e-10
+trial=5 factor_s=8.49813912 solve_s=0.73837208 numeric_total_s=9.2365112 relative_residual=4.54679304e-16 relative_solution_error=9.59585983e-11
+trial=6 factor_s=9.32163751 solve_s=1.26388184 numeric_total_s=10.5855194 relative_residual=4.55667508e-16 relative_solution_error=2.80914125e-10

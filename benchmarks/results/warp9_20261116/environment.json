@@ -1,0 +1,68 @@
+{
+  "hostname": "warp9.sla.rwth-aachen.de",
+  "cpus": [
+    0,
+    1,
+    2,
+    4,
+    5,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    17,
+    18,
+    19,
+    20
+  ],
+  "threads": 16,
+  "repeat": 6,
+  "warmups_per_configuration": 1,
+  "load_before": [
+    38.38,
+    38.15,
+    35.36
+  ],
+  "commands": [
+    [
+      "taskset",
+      "-c",
+      "0,1,2,4,5,9,10,11,12,13,14,15,17,18,19,20",
+      "/tmp/femultifrontal-schur-20261116-f_eggers/baseline/block_sweep",
+      "/tmp/femultifrontal-schur-20261116-f_eggers/model/matrix.csc",
+      "16",
+      "6",
+      "off",
+      "32,128"
+    ],
+    [
+      "taskset",
+      "-c",
+      "0,1,2,4,5,9,10,11,12,13,14,15,17,18,19,20",
+      "/tmp/femultifrontal-schur-20261116-f_eggers/mkl_reference",
+      "/tmp/femultifrontal-schur-20261116-f_eggers/model/matrix.csc",
+      "16",
+      "6"
+    ]
+  ],
+  "environment": {
+    "OMP_DYNAMIC": "FALSE",
+    "OMP_WAIT_POLICY": "ACTIVE",
+    "OMP_PROC_BIND": "close",
+    "OMP_PLACES": "cores",
+    "OMP_THREAD_LIMIT": "16",
+    "OMP_NUM_THREADS": "16",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_DYNAMIC": "FALSE",
+    "MKL_NUM_THREADS": "16"
+  },
+  "matrix_sha256": "b8eeaa319f60368340cb47838ae1e9e3103fb3345d77b33aceb13511744756f3",
+  "load_after": [
+    42.21,
+    40.97,
+    36.93
+  ]
+}

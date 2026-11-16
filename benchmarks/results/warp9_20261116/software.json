@@ -1,0 +1,27 @@
+[
+  {
+    "name": "mkl",
+    "version": "2026.1.0",
+    "build": "hd2095e1_245"
+  },
+  {
+    "name": "mkl-include",
+    "version": "2026.1.0",
+    "build": "ha770c72_245"
+  },
+  {
+    "name": "libgomp",
+    "version": "16.2.0",
+    "build": "he0feb66_4"
+  },
+  {
+    "name": "gcc_impl_linux-64",
+    "version": "14.4.0",
+    "build": "h4b2a866_7"
+  },
+  {
+    "name": "python",
+    "version": "3.14.7",
+    "build": "hcd007b5_106_cp314"
+  }
+]
