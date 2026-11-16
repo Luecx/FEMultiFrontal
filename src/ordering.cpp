@@ -979,6 +979,11 @@ void NestedDissection::order_leaf(const std::vector<int>& ids, int first) {
  * members in ascending original order, so they form a chain of fronts in the
  * elimination tree.
  *
+ * Large inputs build sorted adjacency, hash neighborhoods and sort candidates
+ * with the requested OpenMP team. Worker row segments follow source-column
+ * order and sorting retains the original total comparator, so preprocessing
+ * produces exactly the same graph and candidate sequence as the serial path.
+ *
  * @param matrix Symmetric matrix whose lower-triangular pattern is ordered.
  * @param threads Number of OpenMP threads for independent subdomains.
  * @return Permutation with order[new] = original.
@@ -992,28 +997,74 @@ std::vector<int> nested_dissection(const Matrix& matrix, int threads) {
     const int n = matrix.n;
     if (n == 0) { return {}; }
 
-    // Build the sorted full scalar adjacency without diagonal entries. Rows of
-    // earlier columns arrive first, so every adjacency row stays ascending.
+    // Partition original columns among workers. Per-worker row cursors keep
+    // scatter segments disjoint and preserve the serial ascending row order.
+    // Both traversals use the same static partition within one team, including
+    // when the runtime supplies fewer workers than requested.
     std::vector<std::size_t> ptr(static_cast<std::size_t>(n) + 1, 0);
-    for (int c = 0; c < n; ++c) {
-        for (std::size_t p = matrix.ptr[c]; p < matrix.ptr[c + 1]; ++p) {
-            const int r = matrix.row[p];
-            if (r != c) {
-                ++ptr[c + 1];
-                ++ptr[r + 1];
+    std::vector<int> adj;
+#ifdef _OPENMP
+    if (threads > 1 && n >= 32768) {
+        std::vector<std::size_t> cursor(static_cast<std::size_t>(threads) * n, 0);
+#pragma omp parallel num_threads(threads)
+        {
+            const int worker = omp_get_thread_num();
+            auto* next = cursor.data() + static_cast<std::size_t>(worker) * n;
+#pragma omp for schedule(static)
+            for (int c = 0; c < n; ++c) {
+                for (std::size_t p = matrix.ptr[c]; p < matrix.ptr[c + 1]; ++p) {
+                    const int r = matrix.row[p];
+                    if (r != c) { ++next[c]; ++next[r]; }
+                }
+            }
+#pragma omp single
+            {
+                // Prefix each row by worker number, matching source-column order
+                for (int v = 0; v < n; ++v) {
+                    std::size_t count = 0;
+                    for (int t = 0; t < threads; ++t) { count += cursor[static_cast<std::size_t>(t) * n + v]; }
+                    ptr[v + 1] = ptr[v] + count;
+                    std::size_t offset = ptr[v];
+                    for (int t = 0; t < threads; ++t) {
+                        auto& entry = cursor[static_cast<std::size_t>(t) * n + v];
+                        const auto size = entry;
+                        entry = offset;
+                        offset += size;
+                    }
+                }
+                adj.resize(ptr[n]);
+            }
+#pragma omp for schedule(static)
+            for (int c = 0; c < n; ++c) {
+                for (std::size_t p = matrix.ptr[c]; p < matrix.ptr[c + 1]; ++p) {
+                    const int r = matrix.row[p];
+                    if (r != c) { adj[next[c]++] = r; adj[next[r]++] = c; }
+                }
             }
         }
-    }
-    std::partial_sum(ptr.begin(), ptr.end(), ptr.begin());
-    std::vector<int> adj(ptr[n]);
+    } else
+#endif
     {
-        auto next = ptr;
         for (int c = 0; c < n; ++c) {
             for (std::size_t p = matrix.ptr[c]; p < matrix.ptr[c + 1]; ++p) {
                 const int r = matrix.row[p];
                 if (r != c) {
-                    adj[next[c]++] = r;
-                    adj[next[r]++] = c;
+                    ++ptr[c + 1];
+                    ++ptr[r + 1];
+                }
+            }
+        }
+        std::partial_sum(ptr.begin(), ptr.end(), ptr.begin());
+        adj.resize(ptr[n]);
+        {
+            auto next = ptr;
+            for (int c = 0; c < n; ++c) {
+                for (std::size_t p = matrix.ptr[c]; p < matrix.ptr[c + 1]; ++p) {
+                    const int r = matrix.row[p];
+                    if (r != c) {
+                        adj[next[c]++] = r;
+                        adj[next[r]++] = c;
+                    }
                 }
             }
         }
@@ -1021,6 +1072,9 @@ std::vector<int> nested_dissection(const Matrix& matrix, int threads) {
 
     // Hash every closed neighborhood and sort the unknowns into candidate runs
     std::vector<std::uint64_t> hash(n);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static) if(n >= 32768)
+#endif
     for (int v = 0; v < n; ++v) {
         std::uint64_t h = mix(static_cast<std::uint64_t>(v));
         for (std::size_t p = ptr[v]; p < ptr[v + 1]; ++p) { h += mix(static_cast<std::uint64_t>(adj[p])); }
@@ -1028,13 +1082,40 @@ std::vector<int> nested_dissection(const Matrix& matrix, int threads) {
     }
     std::vector<int> candidates(n);
     std::iota(candidates.begin(), candidates.end(), 0);
-    std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+    auto less = [&](int a, int b) {
         const std::size_t da = ptr[a + 1] - ptr[a];
         const std::size_t db = ptr[b + 1] - ptr[b];
         if (da != db) { return da < db; }
         if (hash[a] != hash[b]) { return hash[a] < hash[b]; }
         return a < b;
-    });
+    };
+    // Sort independent chunks, then merge with the same total comparison.
+    // The original-index tie break makes the permutation exactly deterministic.
+#ifdef _OPENMP
+    if (threads > 1 && n >= 65536) {
+        const std::size_t total = static_cast<std::size_t>(n);
+        const std::size_t chunk = (total + threads - 1) / threads;
+#pragma omp parallel for num_threads(threads) schedule(static)
+        for (std::size_t first = 0; first < total; first += chunk) {
+            std::sort(candidates.begin() + first, candidates.begin() + std::min(total, first + chunk), less);
+        }
+        std::vector<int> scratch(n);
+        for (std::size_t stride = chunk; stride < total; stride *= 2) {
+#pragma omp parallel for num_threads(threads) schedule(static)
+            for (std::size_t first = 0; first < total; first += 2 * stride) {
+                const auto middle = std::min(total, first + stride);
+                const auto last   = std::min(total, first + 2 * stride);
+                std::merge(candidates.begin() + first, candidates.begin() + middle,
+                           candidates.begin() + middle, candidates.begin() + last,
+                           scratch.begin() + first, less);
+            }
+            candidates.swap(scratch);
+        }
+    } else
+#endif
+    {
+        std::sort(candidates.begin(), candidates.end(), less);
+    }
 
     // Verify closed-neighborhood equality inside every run. The first
     // unassigned member of a run is the smallest unknown of its group.
