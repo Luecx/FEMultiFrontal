@@ -16,9 +16,15 @@ VARIANT  := $(VARIANT)-omp
 CXXFLAGS += -fopenmp
 LDFLAGS  += -fopenmp
 endif
+# Alternate contribution layout. BPT=1 replaces only the SPD factorization.
+BPT ?= 0
+ifeq ($(BPT),1)
+VARIANT := $(VARIANT)-bpt
+LIB_SOURCES := $(filter-out src/main.cpp src/factor.cpp,$(wildcard src/*.cpp))
+else
+LIB_SOURCES := $(filter-out src/main.cpp src/factor_bpt.cpp,$(wildcard src/*.cpp))
+endif
 BUILD_DIR := build/$(VARIANT)
-
-LIB_SOURCES := $(filter-out src/main.cpp,$(wildcard src/*.cpp))
 LIB_OBJECTS := $(LIB_SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)
 TEST_OBJECTS := $(BUILD_DIR)/tests/check.o $(BUILD_DIR)/tests/robustness.o
 OBJECTS := $(LIB_OBJECTS) $(BUILD_DIR)/main.o $(TEST_OBJECTS)
@@ -53,3 +59,12 @@ clean:
 	$(RM) -r build
 
 -include $(OBJECTS:.o=.d)
+
+ifeq ($(BPT),1)
+.PHONY: check-bpt
+$(BUILD_DIR)/tests/bpt: $(LIB_OBJECTS) $(BUILD_DIR)/tests/bpt.o
+	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
+check: check-bpt
+check-bpt: $(BUILD_DIR)/tests/bpt
+	./$(BUILD_DIR)/tests/bpt
+endif
