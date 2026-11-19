@@ -31,12 +31,16 @@ namespace mf {
  *
  * Row/column sets may differ after LU pivoting, even though this square system
  * retains equal counts. Values are row-major and include delayed candidates.
+ * An exact symmetric suffix may keep its original stride and diagonal origin
+ * across a chain of fronts. The logical index sets describe only live entries.
  * Every buffer has one consuming parent; unrelated subtrees own disjoint blocks.
  */
 struct NumericFront {
     std::vector<int> rows;
     std::vector<int> columns;
     memory::Values values;
+    int stride = 0;
+    int origin = 0;
 };
 
 /**
@@ -112,30 +116,47 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
     auto process = [&](int owner) {
-        // Union symbolic future indices with actual delayed child rows/columns
+        // An exact unary match can consume a child buffer directly. Delayed
+        // rows can change the index set, so check the actual outgoing IDs.
         NumericFront front;
-        front.rows.assign(symbolic.row.begin() + symbolic.ptr[owner], symbolic.row.begin() + symbolic.ptr[owner + 1]);
-        front.columns = front.rows;
-        for (int child = symbolic.first_child[owner]; child != -1; child = symbolic.next_child[child]) {
-            front.rows.insert(front.rows.end(), contributions[child].rows.begin(), contributions[child].rows.end());
-            front.columns.insert(front.columns.end(), contributions[child].columns.begin(), contributions[child].columns.end());
+        const auto first = symbolic.row.begin() + symbolic.ptr[owner];
+        const auto last  = symbolic.row.begin() + symbolic.ptr[owner+1];
+        const int child_to_reuse = symmetric && symbolic.reuse_child.size() == static_cast<std::size_t>(n)
+            ? symbolic.reuse_child[owner] : -1;
+        const bool inherited = child_to_reuse != -1 &&
+            std::equal(first, last, contributions[child_to_reuse].rows.begin(), contributions[child_to_reuse].rows.end());
+        if (inherited) {
+            front = std::move(contributions[child_to_reuse]);
+            contributions[child_to_reuse] = NumericFront{};
+        } else {
+            // Union symbolic future indices with all delayed child IDs
+            front.rows.assign(first, last);
+            front.columns = front.rows;
+            for (int child = symbolic.first_child[owner]; child != -1; child = symbolic.next_child[child]) {
+                front.rows.insert(front.rows.end(), contributions[child].rows.begin(), contributions[child].rows.end());
+                front.columns.insert(front.columns.end(), contributions[child].columns.begin(), contributions[child].columns.end());
+            }
+            std::sort(front.rows.begin(), front.rows.end());
+            std::sort(front.columns.begin(), front.columns.end());
+            front.rows.erase(std::unique(front.rows.begin(), front.rows.end()), front.rows.end());
+            front.columns.erase(std::unique(front.columns.begin(), front.columns.end()), front.columns.end());
         }
-        std::sort(front.rows.begin(), front.rows.end());
-        std::sort(front.columns.begin(), front.columns.end());
-        front.rows.erase(std::unique(front.rows.begin(), front.rows.end()), front.rows.end());
-        front.columns.erase(std::unique(front.columns.begin(), front.columns.end()), front.columns.end());
         if (symmetric && front.rows != front.columns) { throw std::runtime_error("LDLT frontal index invariant failed"); }
         const int nr = static_cast<int>(front.rows.size());
         const int nc = static_cast<int>(front.columns.size());
         widths[owner] = std::max(nr, nc);
-        front.values.assign(static_cast<std::size_t>(nr) * nc, 0.0);
+        if (!inherited) {
+            front.stride = nc;
+            front.values.assign(static_cast<std::size_t>(nr) * nc, 0.0);
+        }
+        double* const values = front.values.data() + static_cast<std::size_t>(front.origin) * (front.stride+1);
         auto row_position = [&](int id) {
             return static_cast<int>(std::lower_bound(front.rows.begin(), front.rows.end(), id) - front.rows.begin());
         };
         auto column_position = [&](int id) {
             return static_cast<int>(std::lower_bound(front.columns.begin(), front.columns.end(), id) - front.columns.begin());
         };
-        auto at = [&](int r, int c) -> double& { return front.values[static_cast<std::size_t>(r) * nc + c]; };
+        auto at = [&](int r, int c) -> double& { return values[static_cast<std::size_t>(r) * front.stride + c]; };
 
         // Insert every original full entry once at min(row,column), in scaled coordinates
         for (std::size_t p = input.ptr[owner]; p < input.ptr[owner + 1]; ++p) {
@@ -149,14 +170,16 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 
         // Extend-add child residuals, including previously postponed candidate variables
         for (int child = symbolic.first_child[owner]; child != -1; child = symbolic.next_child[child]) {
+            if (inherited && child == child_to_reuse) { continue; }
             auto& source = contributions[child];
             std::vector<int> rows;
             std::vector<int> columns;
             for (int id : source.rows) { rows.push_back(row_position(id)); }
             for (int id : source.columns) { columns.push_back(column_position(id)); }
             for (std::size_t r = 0; r < rows.size(); ++r) {
+                const std::size_t offset = (r + source.origin) * source.stride + source.origin;
                 for (std::size_t c = 0; c < columns.size(); ++c) {
-                    at(rows[r], columns[c]) += source.values[r * columns.size() + c];
+                    at(rows[r], columns[c]) += source.values[offset + c];
                 }
             }
             source = NumericFront{};
@@ -301,7 +324,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             // contiguous and the kernel restores the full symmetric mirror.
             if (dense_update) {
                 dense::symmetric_pivot_update(
-                    nc,
+                    front.stride,
                     size,
                     static_cast<int>(lower_positions.size()),
                     lower_positions.data(),
@@ -310,7 +333,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     active_columns.data(),
                     update_upper.data(),
                     update_upper.data()+nc,
-                    front.values.data()
+                    values
                 );
             } else {
                 // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
@@ -345,8 +368,25 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 if (front.rows[r] <= owner) { ++delays[owner]; }
             }
             for (int c : active_columns) { output.columns.push_back(front.columns[c]); }
-            output.values.reserve(active_rows.size() * active_columns.size());
-            for (int r : active_rows) { for (int c : active_columns) { output.values.push_back(at(r, c)); } }
+            // Move contiguous suffixes on exact links. Compact when half the
+            // physical rows have been eliminated to bound retained storage.
+            const int parent = symbolic.parent[owner];
+            if (symmetric && symbolic.reuse_child.size() == static_cast<std::size_t>(n) &&
+                symbolic.reuse_child[parent] == owner && !active_rows.empty() &&
+                active_rows.size() == static_cast<std::size_t>(nr-active_rows.front()) &&
+                active_rows.front() + front.origin <= front.stride/2 &&
+                std::equal(output.rows.begin(), output.rows.end(),
+                           symbolic.row.begin() + symbolic.ptr[parent], symbolic.row.begin() + symbolic.ptr[parent+1])) {
+                output.stride = front.stride;
+                output.origin = front.origin + active_rows.front();
+                output.values = std::move(front.values);
+            } else {
+                output.stride = static_cast<int>(active_columns.size());
+                output.values.reserve(active_rows.size() * active_columns.size());
+                for (int r : active_rows) {
+                    for (int c : active_columns) { output.values.push_back(at(r, c)); }
+                }
+            }
         }
     };
 

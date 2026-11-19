@@ -14,12 +14,13 @@
 namespace mf::dense {
 
 // Subtract lower[row] * upper[column] from sorted active lower-triangle entries.
-// Rows/columns are distinct local indices in [0,dimension); lower has row_count
-// entries and upper arrays use full local column indexing. Rank lies in [1,2];
-// upper1 is ignored for rank one. Mirror every updated off-diagonal entry and
-// reject nonfinite results. Pivot data and inactive entries remain unchanged.
+// Rows and columns are sorted, distinct local indices. The physical row stride
+// may exceed the live width of an inherited front. The lower array has row_count
+// entries and upper arrays use local column indexing. Rank lies in [1,2].
+// Mirror updated off-diagonal entries and reject nonfinite results. An existing
+// OpenMP team can share the update for sufficiently large active fronts.
 void symmetric_pivot_update(
-    int                          dimension,
+    int                          stride,
     int                          rank,
     int                          row_count,
     const int*                   rows,

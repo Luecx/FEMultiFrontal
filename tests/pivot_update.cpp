@@ -74,6 +74,52 @@ int main() {
             }
         }
 
+        // Compare task updates with the serial kernel on a strided inherited
+        // front. The padded columns and inactive rows must stay untouched.
+        {
+            constexpr int live_width = 1025;
+            constexpr int stride = live_width + 19;
+            std::vector<int> active;
+            std::vector<std::array<double,2>> lower;
+            std::vector<double> upper0(live_width), upper1(live_width);
+            for (int i = 0; i < live_width; ++i) {
+                if (i % 17 == 5) { continue; }
+                active.push_back(i);
+                const double a = std::sin(0.07*i);
+                const double b = std::cos(0.13*i);
+                lower.push_back({a,b});
+                upper0[i] = b;
+                upper1[i] = a;
+            }
+            std::vector<double> serial(static_cast<std::size_t>(live_width)*stride, 2.0);
+            auto parallel = serial;
+            const int count = static_cast<int>(active.size());
+            auto update = [&](double* values) {
+                mf::dense::symmetric_pivot_update(
+                    stride, 2, count, active.data(), lower.data(), count, active.data(),
+                    upper0.data(), upper1.data(), values
+                );
+            };
+            update(serial.data());
+#ifdef _OPENMP
+#pragma omp parallel num_threads(4)
+#pragma omp single
+#endif
+            { update(parallel.data()); }
+            for (std::size_t i = 0; i < serial.size(); ++i) {
+                if (!(std::abs(serial[i]-parallel[i]) <= 1e-14)) {
+                    throw std::runtime_error("Parallel strided pivot update differs from serial");
+                }
+            }
+            for (int r = 0; r < live_width; ++r) {
+                for (int c = live_width; c < stride; ++c) {
+                    if (parallel[static_cast<std::size_t>(r)*stride+c] != 2.0) {
+                        throw std::runtime_error("Pivot update wrote into inactive storage");
+                    }
+                }
+            }
+        }
+
         // Check both scalar boundaries and the strict lower SIMD tile interior
         for (int rank : {1,2}) {
             for (int first_row : {0,4}) {
