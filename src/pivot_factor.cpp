@@ -31,7 +31,8 @@ namespace mf {
  * @brief Owned dynamic Schur block passed from a numerical front to its parent.
  *
  * Row/column sets may differ after LU pivoting, even though this square system
- * retains equal counts. Values are row-major and include delayed candidates.
+ * retains equal counts. Symmetric fronts store the packed lower triangle.
+ * LU fronts store independent rows and columns in a full row-major buffer.
  * An exact symmetric suffix may keep its original stride and diagonal origin
  * across a chain of fronts. The logical index sets describe only live entries.
  * A panel of accepted scalar pivots may accompany that same buffer. Its
@@ -176,20 +177,26 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         widths[owner] = std::max(nr, nc);
         if (!inherited) {
             front.stride = nc;
-            front.values.assign(static_cast<std::size_t>(nr) * nc, 0.0);
+            const auto rows = static_cast<std::size_t>(nr);
+            front.values.assign(symmetric ? rows*(rows+1)/2 : rows*nc, 0.0);
         }
-        double* const values = front.values.data() + static_cast<std::size_t>(front.origin) * (front.stride+1);
+        double* const values = front.values.data();
         auto row_position = [&](int id) {
             return static_cast<int>(std::lower_bound(front.rows.begin(), front.rows.end(), id) - front.rows.begin());
         };
         auto column_position = [&](int id) {
             return static_cast<int>(std::lower_bound(front.columns.begin(), front.columns.end(), id) - front.columns.begin());
         };
-        auto at = [&](int r, int c) -> double& { return values[static_cast<std::size_t>(r) * front.stride + c]; };
+        auto at = [&](int r, int c) -> double& {
+            if (symmetric) {
+                const auto row = static_cast<std::size_t>(front.origin + std::max(r,c));
+                return values[row*(row+1)/2 + front.origin + std::min(r,c)];
+            }
+            return values[static_cast<std::size_t>(r)*front.stride+c];
+        };
 
         // Only the owner is eligible when a pending panel arrives. Bring its
         // row and column up to date before adding the owner's original entries.
-        // The lower triangle determines both halves, as for immediate updates.
         if (!front.pending_lower.empty()) {
             for (std::size_t base = 0; base < front.pending_lower.size(); base += front.stride) {
                 const double upper = front.pending_upper[base+front.origin];
@@ -200,7 +207,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 #else
                     at(r,0) -= lower*upper+0.0;
 #endif
-                    if (r != 0) { at(0,r) = at(r,0); }
                     if (!std::isfinite(at(r,0))) { throw std::runtime_error("Nonfinite pivoted Schur panel column"); }
                 }
             }
@@ -233,8 +239,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         auto assembly_row = [&](int id) { return positions ? (*positions)[id] : row_position(id); };
         auto assembly_column = [&](int id) { return positions ? (*positions)[id] : column_position(id); };
 
-        // Assemble both symmetric positions directly from lower CSC. Preserve
-        // the per-entry scaling order used by the full input representation.
+        // Assemble the stored lower triangle directly from lower CSC. Scale
+        // each value in the same order as the original lower-half assembly.
         if (symmetric) {
             const int pivot = assembly_row(owner);
             for (auto p = lower_start[owner]; p < input.ptr[owner+1]; ++p) {
@@ -242,7 +248,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 const int local = assembly_row(r);
                 const double value = input.value[p];
                 at(local,pivot) += (value*row_scale[r])*column_scale[owner];
-                if (r != owner) { at(pivot,local) += (value*row_scale[owner])*column_scale[r]; }
             }
         } else {
             // Insert every original full entry once at min(row,column), in scaled coordinates
@@ -268,9 +273,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
             const auto& local_columns = symmetric ? rows : columns;
             for (std::size_t r = 0; r < rows.size(); ++r) {
-                const std::size_t offset = (r + source.origin) * source.stride + source.origin;
-                for (std::size_t c = 0; c < local_columns.size(); ++c) {
-                    at(rows[r], local_columns[c]) += source.values[offset + c];
+                const auto source_row = r + source.origin;
+                const auto base = symmetric ? source_row*(source_row+1)/2 : source_row*source.stride;
+                const auto count = symmetric ? r+1 : local_columns.size();
+                for (std::size_t c = 0; c < count; ++c) {
+                    at(rows[r], local_columns[c]) += source.values[base + source.origin + c];
                 }
             }
             source = NumericFront{};
@@ -312,18 +319,12 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (symmetric) {
                 // Only diagonal candidates can become scalar LDLT pivots.
                 // Check the coupling maxima only for a diagonal that can win.
-                // Keep separate maxima because scaling may round the two
-                // halves differently before the first symmetric update.
                 for (int r : eligible_rows) {
                     const double magnitude = std::abs(at(r,r));
                     if (!(magnitude > best)) { continue; }
-                    double row_max = 0.0;
-                    double column_max = 0.0;
-                    for (int c : active_columns) {
-                        row_max    = std::max(row_max,    std::abs(at(r,c)));
-                        column_max = std::max(column_max, std::abs(at(c,r)));
-                    }
-                    if (magnitude >= pivot_tolerance*row_max && magnitude >= pivot_tolerance*column_max) {
+                    double maximum = 0.0;
+                    for (int c : active_columns) { maximum = std::max(maximum, std::abs(at(r,c))); }
+                    if (magnitude >= pivot_tolerance*maximum) {
                         best = magnitude;
                         pivot_rows[0] = pivot_columns[0] = r;
                     }
@@ -466,7 +467,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 
             if (!defer && dense_update) {
                 dense::symmetric_pivot_update(
-                    front.stride,
+                    front.origin,
                     size,
                     static_cast<int>(lower_positions.size()),
                     lower_positions.data(),
@@ -485,7 +486,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     for (int c : active_columns) {
                         if (symmetric && c > r) { continue; }
                         at(r, c) -= lower[0] * upper[c][0] + lower[1] * upper[c][1];
-                        if (symmetric && r != c) { at(c, r) = at(r, c); }
                         if (!std::isfinite(at(r, c))) { throw std::runtime_error("Nonfinite pivoted Schur update"); }
                     }
                 }
@@ -532,9 +532,13 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             } else {
                 flush_pending();
                 output.stride = static_cast<int>(active_columns.size());
-                output.values.reserve(active_rows.size() * active_columns.size());
-                for (int r : active_rows) {
-                    for (int c : active_columns) { output.values.push_back(at(r, c)); }
+                const auto rows = active_rows.size();
+                output.values.reserve(symmetric ? rows*(rows+1)/2 : rows*active_columns.size());
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const auto count = symmetric ? r+1 : active_columns.size();
+                    for (std::size_t c = 0; c < count; ++c) {
+                        output.values.push_back(at(active_rows[r],active_columns[c]));
+                    }
                 }
             }
         }

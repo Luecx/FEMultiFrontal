@@ -4,7 +4,7 @@
  *
  * Scalar lower-triangle corrections supply the reference for signed scalar D
  * and indefinite 2-by-2 D blocks. Tests cover SIMD boundaries, active-index
- * holes, zero multipliers, symmetric mirrors and untouched inactive entries.
+ * holes, zero multipliers and untouched entries in packed storage.
  */
 #include "dense_pivot.h"
 
@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <vector>
 
-/** Compare all stored entries, not only the updated lower triangle. */
+/** Compare the packed lower triangle, including inactive entries. */
 int main() {
     try {
         int cases = 0;
@@ -43,23 +43,22 @@ int main() {
                                 upper1[i] = 2.0*l0-0.5*l1;
                             }
                         }
-                        std::vector<double> expected(static_cast<std::size_t>(n)*n);
+                        std::vector<double> expected(static_cast<std::size_t>(n)*(n+1)/2);
                         for (int r = 0; r < n; ++r) {
-                            for (int c = 0; c < n; ++c) { expected[r*n+c] = std::cos(0.09*(r+c)); }
+                            for (int c = 0; c <= r; ++c) { expected[r*(r+1)/2+c] = std::cos(0.09*(r+c)); }
                         }
                         auto actual = expected;
 
-                        // Follow the original pivot loop, including its mirror
+                        // Evaluate the reference update in the lower triangle
                         for (std::size_t p = 0; p < rows.size(); ++p) {
                             const int r = rows[p];
                             for (int c : columns) {
                                 if (c > r) { continue; }
-                                expected[r*n+c] -= lower[p][0]*upper0[c] + lower[p][1]*upper1[c];
-                                if (r != c) { expected[c*n+r] = expected[r*n+c]; }
+                                expected[r*(r+1)/2+c] -= lower[p][0]*upper0[c] + lower[p][1]*upper1[c];
                             }
                         }
                         mf::dense::symmetric_pivot_update(
-                            n, rank, static_cast<int>(rows.size()), rows.data(), lower.data(),
+                            0, rank, static_cast<int>(rows.size()), rows.data(), lower.data(),
                             static_cast<int>(columns.size()), columns.data(), upper0.data(), upper1.data(), actual.data()
                         );
                         for (std::size_t i = 0; i < actual.size(); ++i) {
@@ -74,11 +73,13 @@ int main() {
             }
         }
 
-        // Compare task updates with the serial kernel on a strided inherited
-        // front. The padded columns and inactive rows must stay untouched.
+        // Compare task updates with the serial kernel on an inherited suffix.
+        // Rows and columns outside the live suffix must stay untouched.
         {
             constexpr int live_width = 1025;
-            constexpr int stride = live_width + 19;
+            constexpr int origin = 19;
+            constexpr int end = origin + live_width;
+            constexpr int width = end + 7;
             std::vector<int> active;
             std::vector<std::array<double,2>> lower;
             std::vector<double> upper0(live_width), upper1(live_width);
@@ -91,12 +92,12 @@ int main() {
                 upper0[i] = b;
                 upper1[i] = a;
             }
-            std::vector<double> serial(static_cast<std::size_t>(live_width)*stride, 2.0);
+            std::vector<double> serial(static_cast<std::size_t>(width)*(width+1)/2, 2.0);
             auto parallel = serial;
             const int count = static_cast<int>(active.size());
             auto update = [&](double* values) {
                 mf::dense::symmetric_pivot_update(
-                    stride, 2, count, active.data(), lower.data(), count, active.data(),
+                    origin, 2, count, active.data(), lower.data(), count, active.data(),
                     upper0.data(), upper1.data(), values
                 );
             };
@@ -108,12 +109,13 @@ int main() {
             { update(parallel.data()); }
             for (std::size_t i = 0; i < serial.size(); ++i) {
                 if (!(std::abs(serial[i]-parallel[i]) <= 1e-14)) {
-                    throw std::runtime_error("Parallel strided pivot update differs from serial");
+                    throw std::runtime_error("Parallel packed pivot update differs from serial");
                 }
             }
-            for (int r = 0; r < live_width; ++r) {
-                for (int c = live_width; c < stride; ++c) {
-                    if (parallel[static_cast<std::size_t>(r)*stride+c] != 2.0) {
+            for (int r = 0; r < width; ++r) {
+                for (int c = 0; c <= r; ++c) {
+                    if ((c < origin || r >= end) &&
+                        parallel[static_cast<std::size_t>(r)*(r+1)/2+c] != 2.0) {
                         throw std::runtime_error("Pivot update wrote into inactive storage");
                     }
                 }
@@ -126,10 +128,10 @@ int main() {
         {
             constexpr int origin = 13, end = 333, stride = 349, pivots = 16;
             std::vector<double> lower(pivots*stride), upper(pivots*stride);
-            std::vector<double> expected(stride*stride, 3.25);
+            std::vector<double> expected(stride*(stride+1)/2, 3.25);
             auto actual = expected;
             std::vector<int> active;
-            for (int i = origin; i < end; ++i) { active.push_back(i); }
+            for (int i = 0; i < end-origin; ++i) { active.push_back(i); }
             std::vector<std::array<double,2>> multiplier(active.size());
             for (int k = 0; k < pivots; ++k) {
                 for (int i = origin; i < end; ++i) {
@@ -139,8 +141,8 @@ int main() {
                     multiplier[i-origin] = {value,0.0};
                 }
                 mf::dense::symmetric_pivot_update(
-                    stride, 1, end-origin, active.data(), multiplier.data(), end-origin, active.data(),
-                    upper.data()+k*stride, nullptr, expected.data()
+                    origin, 1, end-origin, active.data(), multiplier.data(), end-origin, active.data(),
+                    upper.data()+k*stride+origin, nullptr, expected.data()
                 );
             }
 #ifdef _OPENMP
@@ -162,13 +164,13 @@ int main() {
                     constexpr int n = 12;
                     std::vector<int> columns(n), rows(4);
                     std::vector<std::array<double, 2>> lower(4, {1e308,1e308});
-                    std::vector<double> upper(n,large), values(n*n,0.0);
+                    std::vector<double> upper(n,large), values(n*(n+1)/2,0.0);
                     for (int i = 0; i < n; ++i) { columns[i] = i; }
                     for (int i = 0; i < 4; ++i) { rows[i] = first_row+i; }
                     bool rejected = false;
                     try {
                         mf::dense::symmetric_pivot_update(
-                            n, rank, 4, rows.data(), lower.data(), n, columns.data(),
+                            0, rank, 4, rows.data(), lower.data(), n, columns.data(),
                             upper.data(), rank == 1 ? nullptr : upper.data(), values.data()
                         );
                     } catch (const std::runtime_error&) { rejected = true; }
@@ -180,7 +182,7 @@ int main() {
         try { mf::dense::symmetric_pivot_update(0,0,0,nullptr,nullptr,0,nullptr,nullptr,nullptr,nullptr); }
         catch (const std::runtime_error&) { rejected = true; }
         if (!rejected) { throw std::runtime_error("Unsupported pivot rank accepted"); }
-        std::cout << "PASS: " << cases << " symmetric pivot updates, mirrors, holes, tails and nonfinite rejection\n";
+        std::cout << "PASS: " << cases << " packed symmetric pivot updates, holes, tails and nonfinite rejection\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
