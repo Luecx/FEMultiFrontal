@@ -156,6 +156,34 @@ int main() {
         }
     };
 
+    // Cursor validation must catch a missing counterpart in either half,
+    // as well as a counterpart whose value differs.
+    for (const auto& off_diagonal : {std::pair{0.0,1.0}, std::pair{1.0,0.0}, std::pair{1.0,2.0}}) {
+        mf::GeneralMatrix input;
+        input.n = 2;
+        const double a[2][2] = {{4.0,off_diagonal.first},{off_diagonal.second,4.0}};
+        input.ptr.push_back(0);
+        for (int c = 0; c < 2; ++c) {
+            for (int r = 0; r < 2; ++r) {
+                if (a[r][c] == 0.0) { continue; }
+                input.row.push_back(r);
+                input.value.push_back(a[r][c]);
+            }
+            input.ptr.push_back(input.row.size());
+        }
+        mf::PivotFactor factor;
+        bool rejected = false;
+        try {
+            factor.factorize(input, mf::Symbolic::analyze(input.ordering_graph()));
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).find("canonical symmetric") != std::string::npos;
+        }
+        if (!rejected || factor.ready) {
+            ++failures;
+            std::cerr << "FAIL: LDLT accepted noncanonical symmetric input\n";
+        }
+    }
+
     // Finite well-conditioned and ill-conditioned symmetric positive operators
     check("well_spd", 3, {4,-1,0,-1,4,-1,0,-1,4}, true, 3);
     std::vector<double> hilbert(64);

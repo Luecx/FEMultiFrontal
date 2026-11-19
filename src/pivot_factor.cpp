@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 
 #ifdef _OPENMP
@@ -78,33 +79,56 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     row_scale.assign(n, 0.0);
     column_scale.assign(n, 0.0);
 
-    // Build row access to original entries and independently measure both scales
-    std::vector<std::size_t> row_ptr(static_cast<std::size_t>(n) + 1, 0);
-    for (int c = 0; c < n; ++c) {
-        for (std::size_t p = input.ptr[c]; p < input.ptr[c + 1]; ++p) {
-            const int r = input.row[p];
-            ++row_ptr[r + 1];
-            row_scale[r] = std::max(row_scale[r], std::abs(input.value[p]));
-            column_scale[c] = std::max(column_scale[c], std::abs(input.value[p]));
-            if (symmetric) {
-                const auto begin = input.row.begin() + input.ptr[r];
-                const auto end   = input.row.begin() + input.ptr[r + 1];
-                const auto other = std::lower_bound(begin, end, c);
-                if (other == end || *other != c || input.value[other - input.row.begin()] != input.value[p]) {
+    std::vector<std::size_t> lower_start;
+    std::vector<std::size_t> row_ptr;
+    std::vector<int> row_columns;
+    memory::Values row_values;
+    if (symmetric) {
+        // Match transposed entries with monotone cursors. As lower columns
+        // arrive in order, their counterparts are the next upper entries.
+        // Retain the lower start per column for direct assembly.
+        lower_start = input.ptr;
+        for (int c = 0; c < n; ++c) {
+            for (auto p = lower_start[c]; p < input.ptr[c+1]; ++p) {
+                const int r = input.row[p];
+                const double value = input.value[p];
+                if (r < c || (r == c && std::isnan(value))) {
                     throw std::runtime_error("LDLT requires canonical symmetric values; use from_symmetric");
                 }
+                if (r > c) {
+                    auto& mirror = lower_start[r];
+                    if (mirror >= input.ptr[r+1] || input.row[mirror] != c || input.value[mirror] != value) {
+                        throw std::runtime_error("LDLT requires canonical symmetric values; use from_symmetric");
+                    }
+                    ++mirror;
+                }
+                const double magnitude = std::abs(value);
+                row_scale[r] = std::max(row_scale[r], magnitude);
+                row_scale[c] = std::max(row_scale[c], magnitude);
             }
         }
-    }
-    std::partial_sum(row_ptr.begin(), row_ptr.end(), row_ptr.begin());
-    std::vector<int> row_columns(input.row.size());
-    memory::Values row_values(input.value.size());
-    auto next = row_ptr;
-    for (int c = 0; c < n; ++c) {
-        for (std::size_t p = input.ptr[c]; p < input.ptr[c + 1]; ++p) {
-            const auto q = next[input.row[p]]++;
-            row_columns[q] = c;
-            row_values[q] = input.value[p];
+        column_scale = row_scale;
+    } else {
+        // LU requires independent row access and separate scaling in each space
+        row_ptr.assign(static_cast<std::size_t>(n)+1, 0);
+        for (int c = 0; c < n; ++c) {
+            for (auto p = input.ptr[c]; p < input.ptr[c+1]; ++p) {
+                const int r = input.row[p];
+                ++row_ptr[r+1];
+                row_scale[r] = std::max(row_scale[r], std::abs(input.value[p]));
+                column_scale[c] = std::max(column_scale[c], std::abs(input.value[p]));
+            }
+        }
+        std::partial_sum(row_ptr.begin(), row_ptr.end(), row_ptr.begin());
+        row_columns.resize(input.row.size());
+        row_values.resize(input.value.size());
+        auto next = row_ptr;
+        for (int c = 0; c < n; ++c) {
+            for (auto p = input.ptr[c]; p < input.ptr[c+1]; ++p) {
+                const auto q = next[input.row[p]]++;
+                row_columns[q] = c;
+                row_values[q] = input.value[p];
+            }
         }
     }
     for (int i = 0; i < n; ++i) {
@@ -119,6 +143,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     std::vector<std::size_t> widths(n, 0);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
+    std::vector<std::vector<int>> worker_positions(symmetric ? threads : 0);
     auto process = [&](int owner) {
         // An exact unary match can consume a child buffer directly. Delayed
         // rows can change the index set, so check the actual outgoing IDs.
@@ -192,14 +217,43 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             front.pending_upper.clear();
         };
 
-        // Insert every original full entry once at min(row,column), in scaled coordinates
-        for (std::size_t p = input.ptr[owner]; p < input.ptr[owner + 1]; ++p) {
-            const int r = input.row[p];
-            if (r >= owner) { at(row_position(r), column_position(owner)) += (input.value[p] * row_scale[r]) * column_scale[owner]; }
+        // The worker map is used only during assembly, before any taskloop
+        // can suspend this front and run another front on the same worker.
+        std::vector<int>* positions = nullptr;
+        if (symmetric && nr >= 16) {
+            int worker = 0;
+#ifdef _OPENMP
+            worker = omp_get_thread_num();
+#endif
+            auto& map = worker_positions[worker];
+            if (map.empty()) { map.resize(n); }
+            for (int i = 0; i < nr; ++i) { map[front.rows[i]] = i; }
+            positions = &map;
         }
-        for (std::size_t p = row_ptr[owner]; p < row_ptr[owner + 1]; ++p) {
-            const int c = row_columns[p];
-            if (c > owner) { at(row_position(owner), column_position(c)) += (row_values[p] * row_scale[owner]) * column_scale[c]; }
+        auto assembly_row = [&](int id) { return positions ? (*positions)[id] : row_position(id); };
+        auto assembly_column = [&](int id) { return positions ? (*positions)[id] : column_position(id); };
+
+        // Assemble both symmetric positions directly from lower CSC. Preserve
+        // the per-entry scaling order used by the full input representation.
+        if (symmetric) {
+            const int pivot = assembly_row(owner);
+            for (auto p = lower_start[owner]; p < input.ptr[owner+1]; ++p) {
+                const int r = input.row[p];
+                const int local = assembly_row(r);
+                const double value = input.value[p];
+                at(local,pivot) += (value*row_scale[r])*column_scale[owner];
+                if (r != owner) { at(pivot,local) += (value*row_scale[owner])*column_scale[r]; }
+            }
+        } else {
+            // Insert every original full entry once at min(row,column), in scaled coordinates
+            for (std::size_t p = input.ptr[owner]; p < input.ptr[owner + 1]; ++p) {
+                const int r = input.row[p];
+                if (r >= owner) { at(assembly_row(r), assembly_column(owner)) += (input.value[p] * row_scale[r]) * column_scale[owner]; }
+            }
+            for (std::size_t p = row_ptr[owner]; p < row_ptr[owner + 1]; ++p) {
+                const int c = row_columns[p];
+                if (c > owner) { at(assembly_row(owner), assembly_column(c)) += (row_values[p] * row_scale[owner]) * column_scale[c]; }
+            }
         }
 
         // Extend-add child residuals, including previously postponed candidate variables
@@ -208,12 +262,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             auto& source = contributions[child];
             std::vector<int> rows;
             std::vector<int> columns;
-            for (int id : source.rows) { rows.push_back(row_position(id)); }
-            for (int id : source.columns) { columns.push_back(column_position(id)); }
+            for (int id : source.rows) { rows.push_back(assembly_row(id)); }
+            if (!symmetric) {
+                for (int id : source.columns) { columns.push_back(assembly_column(id)); }
+            }
+            const auto& local_columns = symmetric ? rows : columns;
             for (std::size_t r = 0; r < rows.size(); ++r) {
                 const std::size_t offset = (r + source.origin) * source.stride + source.origin;
-                for (std::size_t c = 0; c < columns.size(); ++c) {
-                    at(rows[r], columns[c]) += source.values[offset + c];
+                for (std::size_t c = 0; c < local_columns.size(); ++c) {
+                    at(rows[r], local_columns[c]) += source.values[offset + c];
                 }
             }
             source = NumericFront{};
@@ -235,33 +292,60 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 
         // Only original IDs that have reached this front are fully summed candidates
         while (!active_rows.empty() && !active_columns.empty()) {
-            std::vector<int> eligible_rows;
-            std::vector<int> eligible_columns;
-            for (int r : active_rows) { if (front.rows[r] <= owner) { eligible_rows.push_back(r); } }
-            for (int c : active_columns) { if (front.columns[c] <= owner) { eligible_columns.push_back(c); } }
+            // Active IDs stay sorted after pivot removal. Eligible variables
+            // occupy a prefix, so pivot search needs no temporary index lists.
+            const auto eligible_end = std::upper_bound(active_rows.begin(), active_rows.end(), owner,
+                [&](int id, int local) { return id < front.rows[local]; });
+            const std::span<const int> eligible_rows(active_rows.begin(), eligible_end);
+            auto eligible_columns = eligible_rows;
+            if (!symmetric) {
+                const auto end = std::upper_bound(active_columns.begin(), active_columns.end(), owner,
+                    [&](int id, int local) { return id < front.columns[local]; });
+                eligible_columns = std::span<const int>(active_columns.begin(), end);
+            }
             if (eligible_rows.empty() || eligible_columns.empty()) { break; }
-            std::vector<double> row_max(nr, 0.0);
-            std::vector<double> column_max(nc, 0.0);
-            for (int r : eligible_rows) {
-                for (int c : active_columns) { row_max[r] = std::max(row_max[r], std::abs(at(r, c))); }
-            }
-            for (int c : eligible_columns) {
-                for (int r : active_rows) { column_max[c] = std::max(column_max[c], std::abs(at(r, c))); }
-            }
             int pivot_rows[2] = {-1, -1};
             int pivot_columns[2] = {-1, -1};
             int size = 1;
             double best = rank_tolerance;
 
-            // Scalar threshold pivots control both row and column multiplier growth
-            for (int r : eligible_rows) {
+            if (symmetric) {
+                // Only diagonal candidates can become scalar LDLT pivots.
+                // Check the coupling maxima only for a diagonal that can win.
+                // Keep separate maxima because scaling may round the two
+                // halves differently before the first symmetric update.
+                for (int r : eligible_rows) {
+                    const double magnitude = std::abs(at(r,r));
+                    if (!(magnitude > best)) { continue; }
+                    double row_max = 0.0;
+                    double column_max = 0.0;
+                    for (int c : active_columns) {
+                        row_max    = std::max(row_max,    std::abs(at(r,c)));
+                        column_max = std::max(column_max, std::abs(at(c,r)));
+                    }
+                    if (magnitude >= pivot_tolerance*row_max && magnitude >= pivot_tolerance*column_max) {
+                        best = magnitude;
+                        pivot_rows[0] = pivot_columns[0] = r;
+                    }
+                }
+            } else {
+                // General pivots compete independently in row and column space
+                std::vector<double> row_max(nr, 0.0);
+                std::vector<double> column_max(nc, 0.0);
+                for (int r : eligible_rows) {
+                    for (int c : active_columns) { row_max[r] = std::max(row_max[r], std::abs(at(r,c))); }
+                }
                 for (int c : eligible_columns) {
-                    if (symmetric && front.rows[r] != front.columns[c]) { continue; }
-                    const double value = std::abs(at(r, c));
-                    if (value > best && value >= pivot_tolerance * row_max[r] && value >= pivot_tolerance * column_max[c]) {
-                        best = value;
-                        pivot_rows[0] = r;
-                        pivot_columns[0] = c;
+                    for (int r : active_rows) { column_max[c] = std::max(column_max[c], std::abs(at(r,c))); }
+                }
+                for (int r : eligible_rows) {
+                    for (int c : eligible_columns) {
+                        const double value = std::abs(at(r,c));
+                        if (value > best && value >= pivot_tolerance*row_max[r] && value >= pivot_tolerance*column_max[c]) {
+                            best = value;
+                            pivot_rows[0] = r;
+                            pivot_columns[0] = c;
+                        }
                     }
                 }
             }
