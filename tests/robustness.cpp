@@ -90,9 +90,15 @@ int main() {
                 const long double anorm = *std::max_element(row_norm.begin(), row_norm.end());
                 const double residual = std::sqrt(r2 / std::max(b2, 1e-300L));
                 const double backward = rinf / std::max(anorm * xinf + binf, 1e-300L);
-                const bool pass = !incompatible && factor.rank == expected_rank &&
+                bool pass = !incompatible && factor.rank == expected_rank &&
                                   std::isfinite(residual) && residual < 1e-8 && backward < 1e-8;
-                if (!pass || (name == "forced_2x2" && factor.two_by_two_pivots == 0)) { ++failures; }
+                if (name.rfind("forced_2x2",0) == 0 && factor.two_by_two_pivots == 0) { pass = false; }
+                if (name.rfind("delayed_2x2",0) == 0 &&
+                    (factor.two_by_two_pivots == 0 || factor.delayed_candidates == 0)) { pass = false; }
+                if (name == "forced_2x2_dense" &&
+                    (factor.positive_directions != n/2 || factor.negative_directions != n/2)) { pass = false; }
+                if (name == "dense_null6" && factor.negative_directions != 0) { pass = false; }
+                if (!pass) { ++failures; }
                 std::cout << "case=" << name << " mode=" << (symmetric ? "ldlt" : "lu")
                           << " threads=" << threads << " status=" << (pass ? "PASS" : "FAIL")
                           << " n=" << n << " rank=" << factor.rank << " expected_rank=" << expected_rank
@@ -162,6 +168,61 @@ int main() {
     check("unsymmetric_swaps", 3, {0,2,0,1,0,3,4,1,5}, false, 3);
     check("unsymmetric_scaled", 2, {1e-10,2e-10,-1,2}, false, 2);
     check("unsymmetric_singular", 3, {1,2,3,2,4,6,0,1,1}, false, 2);
+
+    // Dense fronts exceed the SIMD cutoff and force an indefinite 2-by-2 block
+    {
+        constexpr int n = 96;
+        std::vector<double> dense(n*n);
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                dense[r*n+c] = r == c ? (r < 2 ? 0.0 : (r%2 ? 2.0 : -2.0)) : 0.001*std::cos(0.1*(r+c));
+            }
+        }
+        dense[1] = dense[n] = 1.0;
+        check("forced_2x2_dense",n,dense,true,n);
+
+        // A strong future coupling postpones variable zero while several
+        // intervening scalar pivots create holes in a still-large active front.
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                dense[r*n+c] = r == c ? ((r == 0 || r == 10) ? 0.0 : (r%2 ? 2.0 : -2.0)) : 0.001*std::cos(0.1*(r+c));
+            }
+        }
+        dense[10] = dense[10*n] = 1.0;
+        check("delayed_2x2_dense",n,dense,true,n);
+
+        // A full-column-rank dyadic B gives A=B*B^T exactly rank n-6.
+        // Its leading triangular block stays well conditioned during elimination.
+        constexpr int rank = n-6;
+        std::vector<double> basis(n*rank,0.0);
+        for (int r = 0; r < n; ++r) {
+            for (int k = 0; k < rank; ++k) {
+                if (r < rank) { basis[r*rank+k] = r == k ? 1.0 : r > k ? 1.0/64 : 0.0; }
+                else { basis[r*rank+k] = (1+(r+k)%3)/32.0; }
+            }
+        }
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                double value = 0.0;
+                for (int k = 0; k < rank; ++k) { value += basis[r*rank+k]*basis[c*rank+k]; }
+                dense[r*n+c] = value;
+            }
+        }
+        check("dense_null6",n,dense,true,n-6);
+        check("incompatible_dense_null6",n,dense,true,n-6,true);
+
+        // Ill-conditioned full-rank SPD data must retain small finite pivots
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                double value = r == c ? 1e-8 : 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    value += std::sin(0.13*r+0.7*k)*std::sin(0.13*c+0.7*k);
+                }
+                dense[r*n+c] = value;
+            }
+        }
+        check("ill_conditioned96_spd",n,dense,true,n);
+    }
 
     // Six axial bars of a free tetrahedron have six rigid-body null directions
     std::vector<double> tetra(144, 0.0);

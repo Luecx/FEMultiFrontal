@@ -20,7 +20,7 @@ BUILD_DIR := build/$(VARIANT)
 
 LIB_SOURCES := $(filter-out src/main.cpp,$(wildcard src/*.cpp))
 LIB_OBJECTS := $(LIB_SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)
-TEST_OBJECTS := $(BUILD_DIR)/tests/check.o $(BUILD_DIR)/tests/robustness.o
+TEST_OBJECTS := $(BUILD_DIR)/tests/check.o $(BUILD_DIR)/tests/robustness.o $(BUILD_DIR)/tests/pivot_update.o
 OBJECTS := $(LIB_OBJECTS) $(BUILD_DIR)/main.o $(TEST_OBJECTS)
 
 .PHONY: all check test clean
@@ -35,6 +35,9 @@ $(BUILD_DIR)/tests/check: $(LIB_OBJECTS) $(BUILD_DIR)/tests/check.o
 $(BUILD_DIR)/tests/robustness: $(LIB_OBJECTS) $(BUILD_DIR)/tests/robustness.o
 	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
+$(BUILD_DIR)/tests/pivot_update: $(LIB_OBJECTS) $(BUILD_DIR)/tests/pivot_update.o
+	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
 $(BUILD_DIR)/%.o: src/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
@@ -43,9 +46,10 @@ $(BUILD_DIR)/tests/%.o: tests/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-check: $(BUILD_DIR)/tests/check $(BUILD_DIR)/tests/robustness
+check: $(BUILD_DIR)/tests/check $(BUILD_DIR)/tests/robustness $(BUILD_DIR)/tests/pivot_update
 	./$(BUILD_DIR)/tests/check
 	./$(BUILD_DIR)/tests/robustness
+	./$(BUILD_DIR)/tests/pivot_update
 
 test: check
 

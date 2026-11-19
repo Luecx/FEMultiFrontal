@@ -9,6 +9,7 @@
  * choices and symmetric two-variable pivots.
  */
 #include "pivot_factor.h"
+#include "dense_pivot.h"
 
 #include <algorithm>
 #include <atomic>
@@ -165,6 +166,16 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         std::iota(active_rows.begin(), active_rows.end(), 0);
         std::iota(active_columns.begin(), active_columns.end(), 0);
 
+        // Reuse local positions and contiguous pivot-row coefficients only for
+        // sufficiently large symmetric fronts. LU keeps its independent path.
+        const bool dense_update = symmetric && nc >= 64;
+        std::vector<int> lower_positions;
+        std::vector<double> update_upper;
+        if (dense_update) {
+            lower_positions.reserve(nr);
+            update_upper.resize(2*static_cast<std::size_t>(nc));
+        }
+
         // Only original IDs that have reached this front are fully summed candidates
         while (!active_rows.empty() && !active_columns.empty()) {
             std::vector<int> eligible_rows;
@@ -239,6 +250,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (pivot_rows[0] == -1) { break; }
 
             // Store the accepted pivot and its normalized lower multipliers
+            lower_positions.clear();
             PivotBlock block;
             block.size = size;
             for (int p = 0; p < size; ++p) {
@@ -259,13 +271,19 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 const std::array<double, 2> lower = size == 1 ? std::array<double, 2>{x / det, 0.0} :
                     std::array<double, 2>{(x * d - y * b) / det, (y * a - x * b) / det};
                 if (lower[0] != 0.0 || lower[1] != 0.0) {
+                    if (dense_update) { lower_positions.push_back(r); }
                     block.lower_rows.push_back(front.rows[r]);
                     block.lower_values.push_back(lower);
                 }
             }
-            std::vector<std::array<double, 2>> upper(nc);
+            std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
             for (int c : active_columns) {
-                upper[c] = {at(pivot_rows[0], c), size == 2 ? at(pivot_rows[1], c) : 0.0};
+                if (dense_update) {
+                    update_upper[c] = at(pivot_rows[0], c);
+                    if (size == 2) { update_upper[nc+c] = at(pivot_rows[1], c); }
+                } else {
+                    upper[c] = {at(pivot_rows[0], c), size == 2 ? at(pivot_rows[1], c) : 0.0};
+                }
                 if (!symmetric && c != pivot_columns[0] && (upper[c][0] != 0.0 || upper[c][1] != 0.0)) {
                     block.upper_columns.push_back(front.columns[c]);
                     block.upper_values.push_back(upper[c]);
@@ -278,15 +296,33 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
             }), active_columns.end());
 
-            // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
-            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                const int r = row_position(block.lower_rows[p]);
-                const auto lower = block.lower_values[p];
-                for (int c : active_columns) {
-                    if (symmetric && c > r) { continue; }
-                    at(r, c) -= lower[0] * upper[c][0] + lower[1] * upper[c][1];
-                    if (symmetric && r != c) { at(c, r) = at(r, c); }
-                    if (!std::isfinite(at(r, c))) { throw std::runtime_error("Nonfinite pivoted Schur update"); }
+            // Complete this pivot's Schur correction before selecting another.
+            // Local positions avoid repeated searches; coefficient arrays are
+            // contiguous and the kernel restores the full symmetric mirror.
+            if (dense_update) {
+                dense::symmetric_pivot_update(
+                    nc,
+                    size,
+                    static_cast<int>(lower_positions.size()),
+                    lower_positions.data(),
+                    block.lower_values.data(),
+                    static_cast<int>(active_columns.size()),
+                    active_columns.data(),
+                    update_upper.data(),
+                    update_upper.data()+nc,
+                    front.values.data()
+                );
+            } else {
+                // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
+                for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+                    const int r = row_position(block.lower_rows[p]);
+                    const auto lower = block.lower_values[p];
+                    for (int c : active_columns) {
+                        if (symmetric && c > r) { continue; }
+                        at(r, c) -= lower[0] * upper[c][0] + lower[1] * upper[c][1];
+                        if (symmetric && r != c) { at(c, r) = at(r, c); }
+                        if (!std::isfinite(at(r, c))) { throw std::runtime_error("Nonfinite pivoted Schur update"); }
+                    }
                 }
             }
             records[owner].push_back(std::move(block));
