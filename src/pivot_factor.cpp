@@ -337,9 +337,14 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         const bool dense_update = symmetric && nc >= 64;
         std::vector<int> lower_positions;
         std::vector<double> update_upper;
+        // Pivot-row scratch is reused across all pivots of this front.
+        // Only LU and small symmetric fronts need the scalar update storage.
+        std::vector<std::array<double, 2>> upper;
         if (dense_update) {
             lower_positions.reserve(nr);
             update_upper.resize(2*static_cast<std::size_t>(nc));
+        } else {
+            upper.resize(nc);
         }
 
         // Only original IDs that have reached this front are fully summed candidates
@@ -463,7 +468,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     block.lower_values.push_back(lower);
                 }
             }
-            std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
+
             for (int c : active_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
