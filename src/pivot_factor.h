@@ -12,6 +12,8 @@
 #include "symbolic.h"
 
 #include <array>
+#include <memory>
+#include <memory_resource>
 
 namespace mf {
 
@@ -24,14 +26,18 @@ namespace mf {
  * coupling; symmetric substitution instead uses D and the transpose of L.
  */
 struct PivotBlock {
+    explicit PivotBlock(std::pmr::memory_resource* resource = std::pmr::get_default_resource())
+        : lower_rows(resource), lower_values(resource),
+          upper_columns(resource), upper_values(resource) {}
+
     int size = 1;
     std::array<int, 2> rows{-1, -1};
     std::array<int, 2> columns{-1, -1};
     std::array<double, 4> diagonal{};
-    std::vector<int> lower_rows;
-    std::vector<std::array<double, 2>> lower_values;
-    std::vector<int> upper_columns;
-    std::vector<std::array<double, 2>> upper_values;
+    std::pmr::vector<int> lower_rows;
+    std::pmr::vector<std::array<double, 2>> lower_values;
+    std::pmr::vector<int> upper_columns;
+    std::pmr::vector<std::array<double, 2>> upper_values;
 };
 
 /**
@@ -47,6 +53,8 @@ struct PivotBlock {
  * a basic solution with free scaled coordinates zero, not a minimum-norm solution.
  * Inconsistent loads fail an independent residual check against the original A.
  */
+struct FastSpdState;
+
 struct PivotFactor {
     enum class Kind { Symmetric, General };
 
@@ -55,6 +63,10 @@ struct PivotFactor {
     double rank_tolerance  = 1e-12;
     double pivot_tolerance = 0.1;
     int    threads         = 1;
+
+    // Fast-state lifetime must extend beyond the PMR-backed pivot blocks.
+    // Kept before blocks so destruction releases blocks before their arena.
+    std::shared_ptr<FastSpdState> fast_spd;
 
     // Accepted factors and threshold-based diagnostics
     std::vector<PivotBlock> blocks;
