@@ -145,6 +145,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
     std::vector<std::vector<int>> worker_positions(symmetric ? threads : 0);
+    std::vector<std::vector<double>> worker_columns(symmetric ? threads : 0);
     auto process = [&](int owner) {
         // An exact unary match can consume a child buffer directly. Delayed
         // rows can change the index set, so check the actual outgoing IDs.
@@ -198,17 +199,32 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         // Only the owner is eligible when a pending panel arrives. Bring its
         // row and column up to date before adding the owner's original entries.
         if (!front.pending_lower.empty()) {
+            int worker = 0;
+#ifdef _OPENMP
+            worker = omp_get_thread_num();
+#endif
+            // Gather and scatter the packed column once. Each correction
+            // between them streams contiguous coefficients and scratch.
+            auto& column = worker_columns[worker];
+            column.resize(nr);
+            for (int r = 0; r < nr; ++r) { column[r] = at(r,0); }
             for (std::size_t base = 0; base < front.pending_lower.size(); base += front.stride) {
                 const double upper = front.pending_upper[base+front.origin];
+                const double* lower = front.pending_lower.data()+base+front.origin;
                 for (int r = 0; r < nr; ++r) {
-                    const double lower = front.pending_lower[base+front.origin+r];
 #if defined(__FMA__)
-                    at(r,0) -= std::fma(lower, upper, 0.0);
+                    column[r] -= std::fma(lower[r], upper, 0.0);
 #else
-                    at(r,0) -= lower*upper+0.0;
+                    column[r] -= lower[r]*upper+0.0;
 #endif
-                    if (!std::isfinite(at(r,0))) { throw std::runtime_error("Nonfinite pivoted Schur panel column"); }
                 }
+            }
+            // A nonfinite intermediate cannot become finite under subsequent subtractions
+            for (int r = 0; r < nr; ++r) {
+                if (!std::isfinite(column[r])) {
+                    throw std::runtime_error("Nonfinite pivoted Schur panel column");
+                }
+                at(r,0) = column[r];
             }
         }
         // The owner column is already current. Flush only the untouched suffix.
@@ -271,13 +287,42 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (!symmetric) {
                 for (int id : source.columns) { columns.push_back(assembly_column(id)); }
             }
-            const auto& local_columns = symmetric ? rows : columns;
-            for (std::size_t r = 0; r < rows.size(); ++r) {
-                const auto source_row = r + source.origin;
-                const auto base = symmetric ? source_row*(source_row+1)/2 : source_row*source.stride;
-                const auto count = symmetric ? r+1 : local_columns.size();
-                for (std::size_t c = 0; c < count; ++c) {
-                    at(rows[r], local_columns[c]) += source.values[base + source.origin + c];
+            if (symmetric) {
+                // The child-to-parent map is increasing. Build contiguous
+                // spans once, then apply their prefixes to each packed row.
+                std::vector<std::size_t> run_ends;
+                if (rows.size() >= 32) {
+                    for (std::size_t c = 1; c < rows.size(); ++c) {
+                        if (rows[c] != rows[c-1]+1) { run_ends.push_back(c); }
+                    }
+                    run_ends.push_back(rows.size());
+                }
+                for (std::size_t r = 0; r < rows.size(); ++r) {
+                    const auto source_row = r+source.origin;
+                    const auto target_row = static_cast<std::size_t>(rows[r])+front.origin;
+                    const double* from = source.values.data()+source_row*(source_row+1)/2+source.origin;
+                    double* to = values+target_row*(target_row+1)/2+front.origin;
+                    if (run_ends.empty()) {
+                        for (std::size_t c = 0; c <= r; ++c) { to[rows[c]] += from[c]; }
+                        continue;
+                    }
+                    std::size_t start = 0;
+                    for (const auto end : run_ends) {
+                        const auto stop = std::min(end,r+1);
+                        double* destination = to+rows[start];
+                        for (std::size_t k = 0; k < stop-start; ++k) {
+                            destination[k] += from[start+k];
+                        }
+                        start = stop;
+                        if (start > r) { break; }
+                    }
+                }
+            } else {
+                for (std::size_t r = 0; r < rows.size(); ++r) {
+                    const auto base = r*source.stride;
+                    for (std::size_t c = 0; c < columns.size(); ++c) {
+                        at(rows[r],columns[c]) += source.values[base+c];
+                    }
                 }
             }
             source = NumericFront{};
