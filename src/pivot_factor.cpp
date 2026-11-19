@@ -10,6 +10,7 @@
  */
 #include "pivot_factor.h"
 #include "dense_pivot.h"
+#include "factor.h"
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -135,6 +137,89 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     for (int i = 0; i < n; ++i) {
         row_scale[i]    = row_scale[i] > 0.0 ? 1.0 / std::sqrt(row_scale[i]) : 1.0;
         column_scale[i] = column_scale[i] > 0.0 ? 1.0 / std::sqrt(column_scale[i]) : 1.0;
+    }
+
+    // Experimental optimistic path: solve well-behaved symmetric systems with
+    // existing amalgamated SPD panels. Convert Cholesky columns back to unit L
+    // and D, preserving PivotFactor's block representation and solve method.
+    // A failed SPD factorization, a rank-small pivot or a threshold-unstable
+    // diagonal must fall through to the original delayed 1x1/2x2 LDLT path.
+    if (symmetric && n >= 1024) {
+        Matrix fast_input;
+        fast_input.n = n;
+        fast_input.ptr.reserve(static_cast<std::size_t>(n) + 1);
+        fast_input.ptr.push_back(0);
+        fast_input.row.reserve(input.row.size() / 2 + n);
+        fast_input.value.reserve(input.value.size() / 2 + n);
+        for (int c = 0; c < n; ++c) {
+            for (std::size_t p = lower_start[c]; p < input.ptr[c + 1]; ++p) {
+                const int r = input.row[p];
+                fast_input.row.push_back(r);
+                fast_input.value.push_back((input.value[p] * row_scale[r]) * column_scale[c]);
+            }
+            fast_input.ptr.push_back(fast_input.row.size());
+        }
+
+        Factor fast_factor;
+        fast_factor.threads = threads;
+        bool accepted = true;
+        try {
+            fast_factor.factorize(fast_input, symbolic);
+        } catch (const std::runtime_error& error) {
+            const std::string_view message(error.what());
+            if (message.find("Nonpositive/nonfinite SPD pivot at permuted index") == 0) {
+                accepted = false;
+            } else {
+                throw;
+            }
+        }
+        if (accepted) {
+            std::vector<PivotBlock> fast_blocks;
+            fast_blocks.reserve(n);
+            double fast_minimum = std::numeric_limits<double>::infinity();
+            for (int c = 0; c < n; ++c) {
+                const auto begin = symbolic.ptr[c];
+                const auto end = symbolic.ptr[c + 1];
+                const double chol_diagonal = fast_factor.value[begin];
+                const double d = chol_diagonal * chol_diagonal;
+                double maximum_off_diagonal = 0.0;
+                for (std::size_t p = begin + 1; p < end; ++p) {
+                    maximum_off_diagonal = std::max(maximum_off_diagonal, std::abs(fast_factor.value[p]));
+                }
+                // S[i,i]=diag^2, S[j,i]=L_chol[j,i]*diag.
+                // Verify the original scalar threshold policy before accepting.
+                if (!(d > rank_tolerance) || !std::isfinite(d) ||
+                    !(chol_diagonal >= pivot_tolerance * maximum_off_diagonal)) {
+                    accepted = false;
+                    break;
+                }
+                fast_minimum = std::min(fast_minimum, d);
+                PivotBlock block;
+                block.rows[0] = block.columns[0] = c;
+                block.diagonal[0] = d;
+                const std::size_t off_diagonal = end - begin - 1;
+                block.lower_rows.reserve(off_diagonal);
+                block.lower_values.reserve(off_diagonal);
+                for (std::size_t p = begin + 1; p < end; ++p) {
+                    const double multiplier = fast_factor.value[p] / chol_diagonal;
+                    if (multiplier != 0.0) {
+                        block.lower_rows.push_back(symbolic.row[p]);
+                        block.lower_values.push_back({multiplier, 0.0});
+                    }
+                }
+                fast_blocks.push_back(std::move(block));
+            }
+            if (accepted) {
+                blocks = std::move(fast_blocks);
+                rank = positive_directions = n;
+                negative_directions = two_by_two_pivots = 0;
+                delayed_candidates = 0;
+                maximum_front = symbolic.max_front;
+                minimum_pivot = fast_minimum;
+                ready = true;
+                return;
+            }
+        }
     }
 
     // Dynamic payloads and accepted records have one writer per original front
