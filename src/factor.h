@@ -47,10 +47,9 @@ struct Factor {
     std::size_t         inherited_fronts        = 0;
     int                 update_block_size_used = 0;
 
-    // Maximum exact pivot group and Schur update rank. Zero selects the measured
-    // thread-count heuristic: 32 through 4 workers, 64 through 8, 128 through 32,
-    // otherwise 256. Values in [1,256] explicitly override the automatic choice.
-    int         update_block_size = 0;
+    // Maximum exact pivot group and Schur update rank, independent of thread
+    // count. The common default is 128; explicit widths lie in [1,256].
+    int         update_block_size = 128;
     SchurKernel schur_kernel      = SchurKernel::Packed;
 
     // One OpenMP team serves subtree tasks and large Schur tiles. Profiling

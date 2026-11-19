@@ -16,7 +16,8 @@ namespace mf::dense {
 // begins at local front index one; each column j contains size-j valid values.
 void add_packed_panel(int size, int width, double* const* columns, const double* packed, int origin);
 
-// Factor the leading width-by-width SPD block. Width lies in [1,256]. inverse
+// Factor the leading width-by-width SPD block. Width lies in [1,256]. Large
+// blocks use blocked updates and the existing OpenMP team when available. inverse
 // receives width reciprocal diagonal values. Return -1 on success, otherwise
 // the local nonpositive/nonfinite pivot index; minimum tracks tested pivots.
 int factor_pivot_block(int width, double* const* columns, double* inverse, double& minimum);

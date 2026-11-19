@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -101,8 +102,79 @@ int main(int, char** argv) {
             }
         }
 
-        // Automatic widths must match explicit factorizations at each worker
-        // boundary, and remain automatic when one Factor is reused with a new team.
+        // Reconstruct known dense Cholesky blocks across internal panel and
+        // SIMD boundaries. The rectangular suffix must remain untouched.
+        for (int width : {31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256}) {
+            const int size = width + 9;
+            std::vector<std::vector<double>> expected(width), original(width), values(width);
+            std::vector<double*> columns(width);
+            for (int c = 0; c < width; ++c) {
+                expected[c].resize(width-c);
+                for (int r = c; r < width; ++r) {
+                    expected[c][r-c] = r == c ? 2.0+0.001*c : 0.002*std::sin(0.13*r+0.07*c);
+                }
+            }
+            for (int c = 0; c < width; ++c) {
+                original[c].resize(size-c, -123.0);
+                for (int r = c; r < width; ++r) {
+                    double value = 0.0;
+                    for (int p = 0; p <= c; ++p) { value += expected[p][r-p]*expected[p][c-p]; }
+                    original[c][r-c] = value;
+                }
+                values[c] = original[c];
+                columns[c] = values[c].data();
+            }
+            for (int workers : {1, 4}) {
+#ifndef _OPENMP
+                if (workers != 1) { continue; }
+#endif
+                for (int c = 0; c < width; ++c) { std::copy(original[c].begin(), original[c].end(), values[c].begin()); }
+                double inverse[256];
+                double minimum;
+                int bad = -2;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(workers)
+#pragma omp single
+                { bad = mf::dense::factor_pivot_block(width, columns.data(), inverse, minimum); }
+#else
+                bad = mf::dense::factor_pivot_block(width, columns.data(), inverse, minimum);
+#endif
+                if (bad != -1 || std::abs(minimum-4.0) > 1e-12) {
+                    throw std::runtime_error("Blocked pivot factorization changed its SPD diagnostics");
+                }
+                for (int c = 0; c < width; ++c) {
+                    if (std::abs(inverse[c]-1.0/expected[c][0]) > 1e-14) {
+                        throw std::runtime_error("Blocked pivot inverse diagonal mismatch");
+                    }
+                    for (int r = c; r < size; ++r) {
+                        const double reference = r < width ? expected[c][r-c] : original[c][r-c];
+                        if (!std::isfinite(values[c][r-c]) || std::abs(values[c][r-c]-reference) > 1e-12) {
+                            throw std::runtime_error("Blocked pivot reconstruction or suffix guard failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        // SPD failures must retain the global pivot index across a panel boundary
+        for (double diagonal : {-1.0, 0.0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+            constexpr int width = 65;
+            std::vector<std::vector<double>> values(width);
+            std::vector<double*> columns(width);
+            for (int c = 0; c < width; ++c) {
+                values[c].assign(width-c, 0.0);
+                values[c][0] = c == 32 ? diagonal : 2.0;
+                columns[c] = values[c].data();
+            }
+            double inverse[width];
+            double minimum;
+            if (mf::dense::factor_pivot_block(width, columns.data(), inverse, minimum) != 32) {
+                throw std::runtime_error("Blocked pivot failure index mismatch");
+            }
+        }
+
+        // The default grouping must stay at 128 when a Factor is reused with
+        // different worker counts. Explicit widths retain identical arithmetic.
         {
             mf::Matrix matrix;
             matrix.n = 129;
@@ -118,53 +190,48 @@ int main(int, char** argv) {
             std::vector<double> exact(matrix.n);
             for (int i = 0; i < matrix.n; ++i) { exact[i] = std::sin(0.13*i) + 1.0; }
             const auto rhs = matrix.multiply(exact);
-            mf::Factor automatic;
-            const std::pair<int, int> settings[] = {
-                {1, 32}, {4, 32}, {5, 64}, {8, 64},
-                {9, 128}, {32, 128}, {33, 256}, {64, 256}
-            };
-            for (const auto& [workers, expected] : settings) {
+            mf::Factor fixed;
+            constexpr int expected = 128;
+            for (int workers : {1, 2, 4, 8, 16, 32, 64}) {
 #ifdef _OPENMP
                 if (workers > std::min(omp_get_num_procs(), omp_get_thread_limit())) { continue; }
 #else
                 if (workers != 1) { continue; }
 #endif
-                automatic.threads = workers;
-                automatic.factorize(matrix, symbolic);
-                if (automatic.update_block_size != 0) {
-                    throw std::runtime_error("Automatic batch choice overwrote the requested mode");
+                fixed.threads = workers;
+                fixed.factorize(matrix, symbolic);
+                if (fixed.update_block_size != expected) {
+                    throw std::runtime_error("Default batch width changed with thread count");
                 }
-                // OpenMP may legally reduce a requested team under runtime limits.
-                if (automatic.threads_used != workers) { continue; }
-                if (automatic.update_block_size_used != expected) {
-                    throw std::runtime_error("Automatic batch choice missed a thread boundary");
+                if (fixed.update_block_size_used != expected) {
+                    throw std::runtime_error("Default batch width changed under a runtime limit");
                 }
                 mf::Factor explicit_width;
                 explicit_width.update_block_size = expected;
                 explicit_width.factorize(matrix, symbolic);
                 if (explicit_width.update_block_size_used != expected ||
-                    automatic.assembled_fronts != explicit_width.assembled_fronts ||
-                    automatic.merged_pivots != explicit_width.merged_pivots) {
-                    throw std::runtime_error("Automatic and explicit front plans differ");
+                    fixed.assembled_fronts != explicit_width.assembled_fronts ||
+                    fixed.merged_pivots != explicit_width.merged_pivots) {
+                    throw std::runtime_error("Default and explicit front plans differ");
                 }
-                for (std::size_t i = 0; i < automatic.value.size(); ++i) {
-                    if (std::abs(automatic.value[i]-explicit_width.value[i]) > 1e-13) {
-                        throw std::runtime_error("Automatic and explicit factors differ");
+                for (std::size_t i = 0; i < fixed.value.size(); ++i) {
+                    if (std::abs(fixed.value[i]-explicit_width.value[i]) > 1e-13) {
+                        throw std::runtime_error("Default and explicit factors differ");
                     }
                 }
-                const auto solution = automatic.solve(symbolic, rhs);
+                const auto solution = fixed.solve(symbolic, rhs);
                 for (int i = 0; i < matrix.n; ++i) {
                     if (std::abs(solution[i]-exact[i]) > 1e-12) {
-                        throw std::runtime_error("Automatic batch solve changed the solution");
+                        throw std::runtime_error("Fixed batch solve changed the solution");
                     }
                 }
             }
-            for (int invalid : {-1, 257}) {
-                automatic.update_block_size = invalid;
+            for (int invalid : {-1, 0, 257}) {
+                fixed.update_block_size = invalid;
                 bool rejected = false;
-                try { automatic.factorize(matrix, symbolic); }
+                try { fixed.factorize(matrix, symbolic); }
                 catch (const std::runtime_error&) { rejected = true; }
-                if (!rejected || !automatic.value.empty()) {
+                if (!rejected || !fixed.value.empty()) {
                     throw std::runtime_error("Invalid batch size retained a usable factor");
                 }
             }
@@ -712,7 +779,7 @@ int main(int, char** argv) {
         if (!rejected) { throw std::runtime_error("Parallel indefinite matrix accepted"); }
         if (!factor.value.empty()) { throw std::runtime_error("Failed parallel factor retained numerical entries"); }
 #endif
-        std::cout << "PASS: dense/2D/3D/disconnected reconstruction, all built orderings, automatic batches, update blocks 1/8/32/64/128/256, AVX tails/origins, import, SPD rejection\n";
+        std::cout << "PASS: dense/2D/3D/disconnected reconstruction, all built orderings, fixed default batches, update blocks 1/8/32/64/128/256, AVX tails/origins, import, SPD rejection\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -109,48 +109,38 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
         }
     };
 
-    // Validate the requested width; zero retains automatic selection on every
-    // factorization, including calls that change the requested thread count.
-    if (update_block_size < 0 || update_block_size > 256) {
-        throw std::runtime_error("Schur update block size must be 0 (automatic) or in [1, 256]");
+    // Keep one numerical grouping policy for every worker count
+    if (update_block_size < 1 || update_block_size > 256) {
+        throw std::runtime_error("Schur update block size must be in [1, 256]");
     }
-    const int n = matrix.n;
+    const int n          = matrix.n;
+    const int block_size = update_block_size;
     std::vector<int> front_first(n, -1);
     std::vector<int> front_width(n, 0);
-    int block_size = 0;
+    update_block_size_used = block_size;
+    assembled_fronts      = 0;
+    merged_pivots         = 0;
 
-    assembled_fronts = 0;
-    merged_pivots    = 0;
-    finish_phase(Memory);
-
-    // Build exact chain groups only after the actual worker count is known.
-    // A merge crosses no branch and adds no fill: the parent has exactly the
-    // child's trailing pattern. The measured policy is a default, not a claim
-    // that thread count alone determines an optimal width for every matrix.
-    auto build_fronts = [&](int workers) {
-        block_size = update_block_size;
-        if (block_size == 0) {
-            block_size = workers <= 4 ? 32 : workers <= 8 ? 64 : workers <= 32 ? 128 : 256;
-        }
-        update_block_size_used = block_size;
-        for (int first = 0; first < n; ++first) {
-            if (front_first[first] != -1) { continue; }
-            int head  = first;
-            int width = 1;
+    // Exact chain groups cross no branch and add no fill: each parent has
+    // exactly its only child's trailing pattern. The fixed cap changes neither
+    // with requested workers nor with a runtime-reduced OpenMP team.
+    for (int first = 0; first < n; ++first) {
+        if (front_first[first] != -1) { continue; }
+        int head  = first;
+        int width = 1;
+        front_first[head] = first;
+        while (width < block_size) {
+            const int parent = symbolic.parent[head];
+            if (parent == -1 || symbolic.reuse_child[parent] != head) { break; }
+            head = parent;
             front_first[head] = first;
-            while (width < block_size) {
-                const int parent = symbolic.parent[head];
-                if (parent == -1 || symbolic.reuse_child[parent] != head) { break; }
-                head = parent;
-                front_first[head] = first;
-                ++width;
-            }
-            front_width[head] = width;
-            ++assembled_fronts;
-            merged_pivots += width - 1;
+            ++width;
         }
-        finish_phase(Other);
-    };
+        front_width[head] = width;
+        ++assembled_fronts;
+        merged_pivots += width - 1;
+    }
+    finish_phase(Other);
 
     // Prepare persistent factors and transient dense contribution ownership
     value.resize(symbolic.row.size());
@@ -425,7 +415,6 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 
     if constexpr (!Parallel) {
         // Preserve the original increasing-column execution in the one-thread path
-        build_fronts(1);
         run_nodes(nullptr, n);
     } else {
 #ifdef _OPENMP
@@ -471,7 +460,6 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 #pragma omp single
             {
                 threads_used = omp_get_num_threads();
-                build_fronts(threads_used);
 #pragma omp taskgroup
                 {
                     for (int root : symbolic.roots) {

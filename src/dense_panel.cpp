@@ -3,7 +3,8 @@
  * @brief Assembles and factorizes exact multifrontal pivot panels.
  *
  * A 4-by-4 transpose reads contribution rows contiguously and writes contiguous
- * CSC segments. Scalar POTRF handles the small diagonal block. AVX2 TRSM holds
+ * CSC segments. Blocked POTRF handles the leading SPD block with task-parallel
+ * rank updates above the small scalar base case. AVX2 TRSM holds
  * eight rows and four pivot columns in registers, reusing each previous factor
  * vector across four updates. The trailing Schur operation is implemented by
  * the existing dense kernels in the neighboring module. Grouped forward
@@ -17,6 +18,9 @@
 #include <limits>
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
 #endif
 
 namespace mf::dense {
@@ -89,7 +93,7 @@ void add_packed_panel(int size, int width, double* const* columns, const double*
  * only leading-block entries, and publishes reciprocal diagonals for TRSM.
  * No pivot replacement or diagonal shift is introduced on an SPD failure.
  */
-int factor_pivot_block(int width, double* const* columns, double* inverse, double& minimum) {
+static int factor_pivot_block_base(int width, double* const* columns, double* inverse, double& minimum) {
     // Factor the small dense leading block without touching the suffix yet
     minimum = std::numeric_limits<double>::infinity();
     for (int j = 0; j < width; ++j) {
@@ -107,6 +111,72 @@ int factor_pivot_block(int width, double* const* columns, double* inverse, doubl
             for (int p = 0; p < j; ++p) { value -= columns[p][r-p]*columns[p][j-p]; }
             columns[j][r-j] = value*inverse[j];
         }
+    }
+    return -1;
+}
+
+/**
+ * Factor the leading SPD block through small POTRF/TRSM panels and rank updates.
+ *
+ * A 32-column base case preserves the established small-front path. Larger
+ * leading blocks use vectorized right-looking updates. When a multifrontal
+ * worker team exists, disjoint trailing columns become tasks; the implicit
+ * taskgroup completes before the next dependent diagonal panel starts. The
+ * rectangular front suffix remains untouched and belongs to solve_panel.
+ *
+ * Return -1 on success, or the first nonpositive/nonfinite pivot relative to
+ * the full leading block. Minimum contains tested Schur diagonal pivots.
+ */
+int factor_pivot_block(int width, double* const* columns, double* inverse, double& minimum) {
+    // Small pivots need neither additional panels nor task scheduling
+    constexpr int block_size = 32;
+    if (width <= block_size) { return factor_pivot_block_base(width, columns, inverse, minimum); }
+    minimum = std::numeric_limits<double>::infinity();
+    for (int first = 0; first < width; first += block_size) {
+        const int count = std::min(block_size, width-first);
+        const int end   = first + count;
+
+        // Factor the already updated diagonal panel, then solve its leading
+        // rectangular rows. Previous panels have applied all their corrections.
+        double panel_minimum;
+        const int bad = factor_pivot_block_base(count, columns+first, inverse+first, panel_minimum);
+        minimum = std::min(minimum, panel_minimum);
+        if (bad != -1) { return first+bad; }
+        solve_panel(width-first, count, columns+first, inverse+first);
+
+        // Each output column owns a disjoint lower-triangle range. Pivot
+        // columns and coefficients are immutable throughout this rank update.
+        auto update_column = [&](int c) {
+            int r = c;
+#if defined(__AVX2__) && defined(__FMA__)
+            for (; r+4 <= width; r += 4) {
+                __m256d values = _mm256_loadu_pd(columns[c]+r-c);
+                for (int p = first; p < end; ++p) {
+                    values = _mm256_fnmadd_pd(
+                        _mm256_loadu_pd(columns[p]+r-p),
+                        _mm256_set1_pd(columns[p][c-p]),
+                        values
+                    );
+                }
+                _mm256_storeu_pd(columns[c]+r-c, values);
+            }
+#endif
+            for (; r < width; ++r) {
+                double value = columns[c][r-c];
+                for (int p = first; p < end; ++p) { value -= columns[p][r-p]*columns[p][c-p]; }
+                columns[c][r-c] = value;
+            }
+        };
+#ifdef _OPENMP
+        // At least eight column tasks amortize creation and completion costs.
+        // Taskloop retains this panel's stack state until every task finishes.
+        if (width-end >= 64 && omp_in_parallel() && omp_get_num_threads() > 1) {
+#pragma omp taskloop grainsize(8) shared(update_column)
+            for (int c = end; c < width; ++c) { update_column(c); }
+            continue;
+        }
+#endif
+        for (int c = end; c < width; ++c) { update_column(c); }
     }
     return -1;
 }
