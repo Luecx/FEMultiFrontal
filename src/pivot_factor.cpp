@@ -221,6 +221,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
             const std::size_t arena_bytes = off_diagonal * pair_bytes + slack;
             auto state = std::make_shared<FastSpdState>(arena_bytes, std::move(fast_factor), symbolic);
+            // Publish arena ownership before constructing blocks, including
+            // exceptional exits from reserve/push_back in the conversion loop.
+            fast_spd = state;
             blocks.reserve(n);
             for (int c : symbolic.postorder) {
                 const auto begin = symbolic.ptr[c];
@@ -241,7 +244,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
                 blocks.push_back(std::move(block));
             }
-            fast_spd = std::move(state);
             rank = positive_directions = n;
             negative_directions = two_by_two_pivots = 0;
             delayed_candidates = 0;
