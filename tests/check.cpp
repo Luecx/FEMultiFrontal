@@ -101,6 +101,75 @@ int main(int, char** argv) {
             }
         }
 
+        // Automatic widths must match explicit factorizations at each worker
+        // boundary, and remain automatic when one Factor is reused with a new team.
+        {
+            mf::Matrix matrix;
+            matrix.n = 129;
+            matrix.ptr.push_back(0);
+            for (int c = 0; c < matrix.n; ++c) {
+                for (int r = c; r < matrix.n; ++r) {
+                    matrix.row.push_back(r);
+                    matrix.value.push_back(r == c ? 4.0 : -0.001);
+                }
+                matrix.ptr.push_back(matrix.row.size());
+            }
+            const auto symbolic = mf::Symbolic::analyze(matrix);
+            std::vector<double> exact(matrix.n);
+            for (int i = 0; i < matrix.n; ++i) { exact[i] = std::sin(0.13*i) + 1.0; }
+            const auto rhs = matrix.multiply(exact);
+            mf::Factor automatic;
+            const std::pair<int, int> settings[] = {
+                {1, 32}, {4, 32}, {5, 64}, {8, 64},
+                {9, 128}, {32, 128}, {33, 256}, {64, 256}
+            };
+            for (const auto& [workers, expected] : settings) {
+#ifdef _OPENMP
+                if (workers > std::min(omp_get_num_procs(), omp_get_thread_limit())) { continue; }
+#else
+                if (workers != 1) { continue; }
+#endif
+                automatic.threads = workers;
+                automatic.factorize(matrix, symbolic);
+                if (automatic.update_block_size != 0) {
+                    throw std::runtime_error("Automatic batch choice overwrote the requested mode");
+                }
+                // OpenMP may legally reduce a requested team under runtime limits.
+                if (automatic.threads_used != workers) { continue; }
+                if (automatic.update_block_size_used != expected) {
+                    throw std::runtime_error("Automatic batch choice missed a thread boundary");
+                }
+                mf::Factor explicit_width;
+                explicit_width.update_block_size = expected;
+                explicit_width.factorize(matrix, symbolic);
+                if (explicit_width.update_block_size_used != expected ||
+                    automatic.assembled_fronts != explicit_width.assembled_fronts ||
+                    automatic.merged_pivots != explicit_width.merged_pivots) {
+                    throw std::runtime_error("Automatic and explicit front plans differ");
+                }
+                for (std::size_t i = 0; i < automatic.value.size(); ++i) {
+                    if (std::abs(automatic.value[i]-explicit_width.value[i]) > 1e-13) {
+                        throw std::runtime_error("Automatic and explicit factors differ");
+                    }
+                }
+                const auto solution = automatic.solve(symbolic, rhs);
+                for (int i = 0; i < matrix.n; ++i) {
+                    if (std::abs(solution[i]-exact[i]) > 1e-12) {
+                        throw std::runtime_error("Automatic batch solve changed the solution");
+                    }
+                }
+            }
+            for (int invalid : {-1, 257}) {
+                automatic.update_block_size = invalid;
+                bool rejected = false;
+                try { automatic.factorize(matrix, symbolic); }
+                catch (const std::runtime_error&) { rejected = true; }
+                if (!rejected || !automatic.value.empty()) {
+                    throw std::runtime_error("Invalid batch size retained a usable factor");
+                }
+            }
+        }
+
         // A nearly low-rank dense SPD operator stresses deferred column
         // corrections while requiring a small original-system residual despite
         // conditioning that can amplify forward error.
@@ -277,7 +346,7 @@ int main(int, char** argv) {
                 const auto rhs = matrix.multiply(exact);
                 std::vector<double> permuted_rhs(n);
                 for (int i = 0; i < n; ++i) { permuted_rhs[i] = rhs[order[i]]; }
-                for (int block_size : {1, 8, 32, 64}) {
+                for (int block_size : {1, 8, 32, 64, 128, 256}) {
                     factor.update_block_size = block_size;
                     factor.factorize(permuted, symbolic);
                     for (double elapsed : factor.phase_seconds) {
@@ -643,7 +712,7 @@ int main(int, char** argv) {
         if (!rejected) { throw std::runtime_error("Parallel indefinite matrix accepted"); }
         if (!factor.value.empty()) { throw std::runtime_error("Failed parallel factor retained numerical entries"); }
 #endif
-        std::cout << "PASS: dense/2D/3D/disconnected reconstruction, all built orderings, update blocks 1/8/32/64, AVX tails/origins, import, SPD rejection\n";
+        std::cout << "PASS: dense/2D/3D/disconnected reconstruction, all built orderings, automatic batches, update blocks 1/8/32/64/128/256, AVX tails/origins, import, SPD rejection\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -45,9 +45,12 @@ struct Factor {
     std::size_t         peak_contribution_bytes = 0;
     double              minimum_pivot          = 0.0;
     std::size_t         inherited_fronts        = 0;
+    int                 update_block_size_used = 0;
 
-    // Number of scalar trailing updates batched before touching the dense matrix
-    int         update_block_size = 32;
+    // Maximum exact pivot group and Schur update rank. Zero selects the measured
+    // thread-count heuristic: 32 through 4 workers, 64 through 8, 128 through 32,
+    // otherwise 256. Values in [1,256] explicitly override the automatic choice.
+    int         update_block_size = 0;
     SchurKernel schur_kernel      = SchurKernel::Packed;
 
     // One OpenMP team serves subtree tasks and large Schur tiles. Profiling

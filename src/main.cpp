@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
         // Parse the small standalone command line before opening the matrix
         if (argc < 2) {
             std::cerr << "Usage: mfsolve matrix.mtx [--repeat N] [--ordering nd|natural]"
-                         " [--update-block N]"
+                         " [--update-block N|auto]"
                          " [--schur-kernel baseline|packed|compare]"
                          " [--threads N] [--thread-sweep]"
                          " [--huge-pages]"
@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
         int         repeat       = 1;
         std::string ordering     = "nd";
         bool        analyze_only = false;
-        int         update_block = 32;
+        int         update_block = 0;
         double      reference_s  = 0.0;
         std::string profile_mode = "off";
         std::string schur_mode   = "packed";
@@ -73,7 +73,8 @@ int main(int argc, char** argv) {
             } else if (option == "--analyze-only") {
                 analyze_only = true;
             } else if (option == "--update-block" && i + 1 < argc) {
-                update_block = std::stoi(argv[++i]);
+                const std::string block = argv[++i];
+                update_block = block == "auto" ? 0 : std::stoi(block);
             } else if (option == "--reference-seconds" && i + 1 < argc) {
                 reference_s = std::stod(argv[++i]);
             } else if (option == "--profile-factor" && i + 1 < argc) {
@@ -90,7 +91,7 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Unknown/incomplete option: " + option);
             }
         }
-        if (repeat < 1 || update_block < 1 || update_block > 256 ||
+        if (repeat < 1 || update_block < 0 || update_block > 256 ||
             (ordering != "nd" && ordering != "natural")) {
             throw std::runtime_error("Invalid repeat, update block, or ordering method");
         }
@@ -225,7 +226,8 @@ int main(int argc, char** argv) {
             }
             const double residual = std::sqrt(residual_squared / rhs_squared);
             const double error    = std::sqrt(error_squared / exact_squared);
-            std::cout << "trial=" << trial + 1 << " update_block=" << update_block << " factor_s=" << seconds(factor_start, factor_end)
+            std::cout << "trial=" << trial + 1 << " update_block=" << factor.update_block_size_used
+                      << " update_block_mode=" << (update_block == 0 ? "auto" : "explicit") << " factor_s=" << seconds(factor_start, factor_end)
                       << " solve_s=" << seconds(factor_end, solve_end) << " numeric_total_s=" << totals.back()
                       << " relative_residual=" << residual << " relative_solution_error=" << error
                       << " peak_contribution_mib=" << factor.peak_contribution_bytes / 1048576.0

@@ -51,7 +51,8 @@ void Factor::factorize(const Matrix& matrix, const Symbolic& symbolic) {
 
     // Reset previous diagnostics without introducing clocks in the normal path
     phase_seconds.fill(0.0);
-    threads_used = 1;
+    threads_used           = 1;
+    update_block_size_used = 0;
     try {
 #ifdef _OPENMP
         if (threads > 1) {
@@ -108,36 +109,48 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
         }
     };
 
-    // Validate the only numerical tuning parameter before allocating buffers
-    if (update_block_size < 1 || update_block_size > 256) {
-        throw std::runtime_error("Schur update block size must be in [1, 256]");
+    // Validate the requested width; zero retains automatic selection on every
+    // factorization, including calls that change the requested thread count.
+    if (update_block_size < 0 || update_block_size > 256) {
+        throw std::runtime_error("Schur update block size must be 0 (automatic) or in [1, 256]");
     }
-    // Build exact chain groups from scalar symbolic index-set matches. A merge
-    // crosses no branch: the parent must have this child as its only child and
-    // exactly the child's trailing pattern. Group pivots are a prefix of the
-    // first front; no fill is added and no numerical values enter the decision.
     const int n = matrix.n;
     std::vector<int> front_first(n, -1);
     std::vector<int> front_width(n, 0);
+    int block_size = 0;
+
     assembled_fronts = 0;
     merged_pivots    = 0;
-    for (int first = 0; first < n; ++first) {
-        if (front_first[first] != -1) { continue; }
-        int head  = first;
-        int width = 1;
-        front_first[head] = first;
-        while (width < update_block_size) {
-            const int parent = symbolic.parent[head];
-            if (parent == -1 || symbolic.reuse_child[parent] != head) { break; }
-            head = parent;
-            front_first[head] = first;
-            ++width;
+    finish_phase(Memory);
+
+    // Build exact chain groups only after the actual worker count is known.
+    // A merge crosses no branch and adds no fill: the parent has exactly the
+    // child's trailing pattern. The measured policy is a default, not a claim
+    // that thread count alone determines an optimal width for every matrix.
+    auto build_fronts = [&](int workers) {
+        block_size = update_block_size;
+        if (block_size == 0) {
+            block_size = workers <= 4 ? 32 : workers <= 8 ? 64 : workers <= 32 ? 128 : 256;
         }
-        front_width[head] = width;
-        ++assembled_fronts;
-        merged_pivots += width - 1;
-    }
-    finish_phase(Other);
+        update_block_size_used = block_size;
+        for (int first = 0; first < n; ++first) {
+            if (front_first[first] != -1) { continue; }
+            int head  = first;
+            int width = 1;
+            front_first[head] = first;
+            while (width < block_size) {
+                const int parent = symbolic.parent[head];
+                if (parent == -1 || symbolic.reuse_child[parent] != head) { break; }
+                head = parent;
+                front_first[head] = first;
+                ++width;
+            }
+            front_width[head] = width;
+            ++assembled_fronts;
+            merged_pivots += width - 1;
+        }
+        finish_phase(Other);
+    };
 
     // Prepare persistent factors and transient dense contribution ownership
     value.resize(symbolic.row.size());
@@ -190,9 +203,9 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
         std::vector<double*> panel_columns;
         std::vector<const double*> update_columns;
         std::vector<double> schur_scratch;
-        panel_columns.reserve(update_block_size);
+        panel_columns.reserve(block_size);
         double inverse[256];
-        update_columns.reserve(update_block_size);
+        update_columns.reserve(block_size);
         double task_minimum = std::numeric_limits<double>::infinity();
         std::size_t task_inherited = 0;
         std::size_t task_huge_hints = prefer_huge_pages && memory::advise_huge_pages(position.data(), position.size() * sizeof(int));
@@ -412,6 +425,7 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 
     if constexpr (!Parallel) {
         // Preserve the original increasing-column execution in the one-thread path
+        build_fronts(1);
         run_nodes(nullptr, n);
     } else {
 #ifdef _OPENMP
@@ -457,6 +471,7 @@ void Factor::factorize_impl(const Matrix& matrix, const Symbolic& symbolic) {
 #pragma omp single
             {
                 threads_used = omp_get_num_threads();
+                build_fronts(threads_used);
 #pragma omp taskgroup
                 {
                     for (int root : symbolic.roots) {
