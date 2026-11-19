@@ -217,4 +217,108 @@ void symmetric_pivot_update(
     if (row_count > 0 && column_count > 0) { update_rows(0, row_count); }
 }
 
+/**
+ * Apply scalar pivot corrections to a contiguous live trailing front.
+ *
+ * Every entry sees the same series of rounded subtractions as in the immediate
+ * kernel. Each tile is read and mirrored once for the entire panel. A nonfinite
+ * intermediate cannot become finite under subsequent subtractions, so the
+ * final result suffices for validation. Tasks own disjoint lower tiles and
+ * their upper mirrors.
+ */
+void flush_scalar_pivot_updates(
+    int stride, int origin, int end, int count, const double* lower, const double* upper, double* values
+) {
+    if (count == 0 || origin >= end) { return; }
+    auto update_rows = [&](int first, int last) {
+        bool valid = true;
+        auto update_entry = [&](int r, int c) {
+            const auto offset = static_cast<std::size_t>(r)*stride+c;
+            double value = values[offset];
+            for (int k = 0; k < count; ++k) {
+                const auto base = static_cast<std::size_t>(k)*stride;
+#if defined(__FMA__)
+                value -= std::fma(lower[base+r], upper[base+c], 0.0);
+#else
+                value -= lower[base+r]*upper[base+c]+0.0;
+#endif
+            }
+            values[offset] = value;
+            if (r != c) { values[static_cast<std::size_t>(c)*stride+r] = value; }
+            valid &= std::isfinite(value);
+        };
+        int r = first;
+#if defined(__AVX2__) && defined(__FMA__)
+        const auto sign = _mm256_set1_pd(-0.0);
+        const auto maximum = _mm256_set1_pd(std::numeric_limits<double>::max());
+        for (; r+4 <= last; r += 4) {
+            int c = origin;
+            for (; c+4 <= r; c += 4) {
+                double* row = values+static_cast<std::size_t>(r)*stride+c;
+                auto y0 = _mm256_loadu_pd(row);
+                auto y1 = _mm256_loadu_pd(row+stride);
+                auto y2 = _mm256_loadu_pd(row+2*static_cast<std::size_t>(stride));
+                auto y3 = _mm256_loadu_pd(row+3*static_cast<std::size_t>(stride));
+                const auto zero = _mm256_setzero_pd();
+                for (int k = 0; k < count; ++k) {
+                    const auto base = static_cast<std::size_t>(k)*stride;
+                    const auto u = _mm256_loadu_pd(upper+base+c);
+                    y0 = _mm256_sub_pd(y0, _mm256_fmadd_pd(_mm256_set1_pd(lower[base+r]),   u, zero));
+                    y1 = _mm256_sub_pd(y1, _mm256_fmadd_pd(_mm256_set1_pd(lower[base+r+1]), u, zero));
+                    y2 = _mm256_sub_pd(y2, _mm256_fmadd_pd(_mm256_set1_pd(lower[base+r+2]), u, zero));
+                    y3 = _mm256_sub_pd(y3, _mm256_fmadd_pd(_mm256_set1_pd(lower[base+r+3]), u, zero));
+                }
+                _mm256_storeu_pd(row,y0);
+                _mm256_storeu_pd(row+stride,y1);
+                _mm256_storeu_pd(row+2*static_cast<std::size_t>(stride),y2);
+                _mm256_storeu_pd(row+3*static_cast<std::size_t>(stride),y3);
+                auto finite = [&](auto y) { return _mm256_cmp_pd(_mm256_andnot_pd(sign,y),maximum,_CMP_LE_OQ); };
+                valid &= _mm256_movemask_pd(_mm256_and_pd(_mm256_and_pd(finite(y0),finite(y1)),
+                                                          _mm256_and_pd(finite(y2),finite(y3)))) == 15;
+
+                // Transpose into contiguous stores in the upper triangle
+                const auto a = _mm256_unpacklo_pd(y0,y1);
+                const auto b = _mm256_unpackhi_pd(y0,y1);
+                const auto d = _mm256_unpacklo_pd(y2,y3);
+                const auto e = _mm256_unpackhi_pd(y2,y3);
+                double* mirror = values+static_cast<std::size_t>(c)*stride+r;
+                _mm256_storeu_pd(mirror,                                  _mm256_permute2f128_pd(a,d,0x20));
+                _mm256_storeu_pd(mirror+stride,                           _mm256_permute2f128_pd(b,e,0x20));
+                _mm256_storeu_pd(mirror+2*static_cast<std::size_t>(stride), _mm256_permute2f128_pd(a,d,0x31));
+                _mm256_storeu_pd(mirror+3*static_cast<std::size_t>(stride), _mm256_permute2f128_pd(b,e,0x31));
+            }
+            for (int i = r; i < r+4; ++i) {
+                for (int j = c; j <= i; ++j) { update_entry(i,j); }
+            }
+        }
+#endif
+        for (; r < last; ++r) {
+            for (int c = origin; c <= r; ++c) { update_entry(r,c); }
+        }
+        return valid;
+    };
+#if defined(_OPENMP) && defined(__AVX2__) && defined(__FMA__)
+    constexpr int products_per_task = 128*1024;
+    const auto width = static_cast<long long>(end-origin);
+    const auto work = width*width/2*count;
+    if (work >= 2*products_per_task && omp_in_parallel()) {
+        const int tiles = (end-origin)/4;
+        const int jobs = static_cast<int>(std::min<long long>({omp_get_num_threads(),tiles,work/products_per_task}));
+        if (jobs > 1) {
+            int invalid = 0;
+#pragma omp taskloop grainsize(1) shared(update_rows) reduction(|:invalid)
+            for (int job = 0; job < jobs; ++job) {
+                const int first = origin+4*static_cast<int>(tiles*std::sqrt(static_cast<double>(job)/jobs));
+                const int last = job+1 == jobs ? end :
+                    origin+4*static_cast<int>(tiles*std::sqrt(static_cast<double>(job+1)/jobs));
+                invalid |= !update_rows(first,last);
+            }
+            if (invalid) { throw std::runtime_error("Nonfinite pivoted Schur panel update"); }
+            return;
+        }
+    }
+#endif
+    if (!update_rows(origin,end)) { throw std::runtime_error("Nonfinite pivoted Schur panel update"); }
+}
+
 } // namespace mf::dense

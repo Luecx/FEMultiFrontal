@@ -120,6 +120,41 @@ int main() {
             }
         }
 
+        // Compare the full panel with a sequence of immediate scalar updates.
+        // A nonzero origin and an incomplete final tile cover the inherited
+        // storage layout. The test checks the complete buffer, including guards.
+        {
+            constexpr int origin = 13, end = 333, stride = 349, pivots = 16;
+            std::vector<double> lower(pivots*stride), upper(pivots*stride);
+            std::vector<double> expected(stride*stride, 3.25);
+            auto actual = expected;
+            std::vector<int> active;
+            for (int i = origin; i < end; ++i) { active.push_back(i); }
+            std::vector<std::array<double,2>> multiplier(active.size());
+            for (int k = 0; k < pivots; ++k) {
+                for (int i = origin; i < end; ++i) {
+                    const double value = std::sin(0.15*i+0.27*k)+1.25;
+                    lower[k*stride+i] = value;
+                    upper[k*stride+i] = (k%2 == 0 ? 0.5 : -0.5)*value;
+                    multiplier[i-origin] = {value,0.0};
+                }
+                mf::dense::symmetric_pivot_update(
+                    stride, 1, end-origin, active.data(), multiplier.data(), end-origin, active.data(),
+                    upper.data()+k*stride, nullptr, expected.data()
+                );
+            }
+#ifdef _OPENMP
+#pragma omp parallel num_threads(4)
+#pragma omp single
+#endif
+            {
+                mf::dense::flush_scalar_pivot_updates(
+                    stride, origin, end, pivots, lower.data(), upper.data(), actual.data()
+                );
+            }
+            if (actual != expected) { throw std::runtime_error("Schur panel changed the update order or bounds"); }
+        }
+
         // Check both scalar boundaries and the strict lower SIMD tile interior
         for (int rank : {1,2}) {
             for (int first_row : {0,4}) {

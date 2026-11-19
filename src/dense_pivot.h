@@ -4,8 +4,9 @@
  *
  * PivotFactor owns pivot selection, scaling and active index sets. This module
  * subtracts one accepted pivot's correction from the active lower triangle and
- * restores its mirror in the full row-major front. No updates are deferred, so
- * subsequent threshold and rank decisions observe the complete current matrix.
+ * restores its mirror in the full row-major front. The panel kernel applies
+ * a sequence of accepted scalar corrections to an inherited trailing front.
+ * PivotFactor materializes candidate entries before threshold tests.
  */
 #pragma once
 
@@ -30,6 +31,13 @@ void symmetric_pivot_update(
     const double*                upper0,
     const double*                upper1,
     double*                      values
+);
+
+// Complete a panel of accepted scalar LDLT corrections in acceptance order.
+// Each coefficient column spans the physical stride. The live suffix begins
+// at origin in both dimensions of the full row-major frontal buffer.
+void flush_scalar_pivot_updates(
+    int stride, int origin, int end, int count, const double* lower, const double* upper, double* values
 );
 
 } // namespace mf::dense

@@ -33,12 +33,16 @@ namespace mf {
  * retains equal counts. Values are row-major and include delayed candidates.
  * An exact symmetric suffix may keep its original stride and diagonal origin
  * across a chain of fronts. The logical index sets describe only live entries.
+ * A panel of accepted scalar pivots may accompany that same buffer. Its
+ * coefficient columns use the physical stride, and travel only on exact links.
  * Every buffer has one consuming parent; unrelated subtrees own disjoint blocks.
  */
 struct NumericFront {
     std::vector<int> rows;
     std::vector<int> columns;
     memory::Values values;
+    memory::Values pending_lower;
+    memory::Values pending_upper;
     int stride = 0;
     int origin = 0;
 };
@@ -157,6 +161,36 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             return static_cast<int>(std::lower_bound(front.columns.begin(), front.columns.end(), id) - front.columns.begin());
         };
         auto at = [&](int r, int c) -> double& { return values[static_cast<std::size_t>(r) * front.stride + c]; };
+
+        // Only the owner is eligible when a pending panel arrives. Bring its
+        // row and column up to date before adding the owner's original entries.
+        // The lower triangle determines both halves, as for immediate updates.
+        if (!front.pending_lower.empty()) {
+            for (std::size_t base = 0; base < front.pending_lower.size(); base += front.stride) {
+                const double upper = front.pending_upper[base+front.origin];
+                for (int r = 0; r < nr; ++r) {
+                    const double lower = front.pending_lower[base+front.origin+r];
+#if defined(__FMA__)
+                    at(r,0) -= std::fma(lower, upper, 0.0);
+#else
+                    at(r,0) -= lower*upper+0.0;
+#endif
+                    if (r != 0) { at(0,r) = at(r,0); }
+                    if (!std::isfinite(at(r,0))) { throw std::runtime_error("Nonfinite pivoted Schur panel column"); }
+                }
+            }
+        }
+        // The owner column is already current. Flush only the untouched suffix.
+        auto flush_pending = [&] {
+            if (front.pending_lower.empty()) { return; }
+            dense::flush_scalar_pivot_updates(
+                front.stride, front.origin+1, front.origin+nc,
+                static_cast<int>(front.pending_lower.size()/front.stride),
+                front.pending_lower.data(), front.pending_upper.data(), front.values.data()
+            );
+            front.pending_lower.clear();
+            front.pending_upper.clear();
+        };
 
         // Insert every original full entry once at min(row,column), in scaled coordinates
         for (std::size_t p = input.ptr[owner]; p < input.ptr[owner + 1]; ++p) {
@@ -319,10 +353,34 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
             }), active_columns.end());
 
-            // Complete this pivot's Schur correction before selecting another.
-            // Local positions avoid repeated searches; coefficient arrays are
-            // contiguous and the kernel restores the full symmetric mirror.
-            if (dense_update) {
+            // Defer only a dense scalar correction whose exact suffix can be
+            // handed to the next owner. Zero multipliers use the immediate
+            // path to preserve the original rule for mirroring skipped rows.
+            constexpr int panel_limit = 16;
+            const int parent = symbolic.parent[owner];
+            const bool defer = dense_update && size == 1 && pivot_rows[0] == 0 &&
+                lower_positions.size() == static_cast<std::size_t>(nc-1) &&
+                active_rows.size() == lower_positions.size() &&
+                front.rows[0] == owner && front.origin+1 <= front.stride/2 &&
+                parent != -1 && symbolic.reuse_child.size() == static_cast<std::size_t>(n) &&
+                symbolic.reuse_child[parent] == owner &&
+                std::equal(front.rows.begin()+1, front.rows.end(),
+                           symbolic.row.begin() + symbolic.ptr[parent], symbolic.row.begin() + symbolic.ptr[parent+1]);
+            if (defer) {
+                const auto base = front.pending_lower.size();
+                front.pending_lower.resize(base+front.stride);
+                front.pending_upper.resize(base+front.stride);
+                for (int r = 1; r < nc; ++r) {
+                    const auto index = base+front.origin+r;
+                    front.pending_lower[index] = block.lower_values[r-1][0];
+                    front.pending_upper[index] = update_upper[r];
+                }
+                if (front.pending_lower.size()/front.stride == panel_limit) { flush_pending(); }
+            } else {
+                flush_pending();
+            }
+
+            if (!defer && dense_update) {
                 dense::symmetric_pivot_update(
                     front.stride,
                     size,
@@ -335,7 +393,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     update_upper.data()+nc,
                     values
                 );
-            } else {
+            } else if (!defer) {
                 // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
                 for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
                     const int r = row_position(block.lower_rows[p]);
@@ -354,6 +412,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         // Delay unresolved candidates, or deflate only a numerically zero root block
         const bool root = symbolic.parent[owner] == -1;
         if (root) {
+            flush_pending();
             double maximum = 0.0;
             for (int r : active_rows) {
                 for (int c : active_columns) { maximum = std::max(maximum, std::abs(at(r, c))); }
@@ -379,8 +438,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                            symbolic.row.begin() + symbolic.ptr[parent], symbolic.row.begin() + symbolic.ptr[parent+1])) {
                 output.stride = front.stride;
                 output.origin = front.origin + active_rows.front();
-                output.values = std::move(front.values);
+                // A rejected pivot leaves the materialized owner in the front.
+                // Its delay changes the outgoing IDs, so pending panels only
+                // travel on the accepted-pivot branch with a positive offset.
+                if (active_rows.front() == 0) { flush_pending(); }
+                output.values        = std::move(front.values);
+                output.pending_lower = std::move(front.pending_lower);
+                output.pending_upper = std::move(front.pending_upper);
             } else {
+                flush_pending();
                 output.stride = static_cast<int>(active_columns.size());
                 output.values.reserve(active_rows.size() * active_columns.size());
                 for (int r : active_rows) {

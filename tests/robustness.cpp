@@ -17,6 +17,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,7 +38,7 @@ int main() {
     thread_counts.push_back(4);
 #endif
     auto check = [&](const std::string& name, int n, const std::vector<double>& dense,
-                     bool symmetric, int expected_rank, bool incompatible = false) {
+                     bool symmetric, int expected_rank, bool incompatible = false, bool natural = false) {
         // Build full CSC directly; no symmetrization can hide unsymmetric input
         mf::GeneralMatrix input;
         input.n = n;
@@ -51,7 +52,9 @@ int main() {
             }
             input.ptr.push_back(input.row.size());
         }
-        const auto order = mf::nested_dissection(input.ordering_graph());
+        std::vector<int> order(n);
+        if (natural) { std::iota(order.begin(), order.end(), 0); }
+        else { order = mf::nested_dissection(input.ordering_graph()); }
         const auto matrix = input.permute(order, order);
         std::vector<double> exact(n);
         for (int i = 0; i < n; ++i) { exact[i] = 1.0 + std::sin(0.7 * i); }
@@ -190,6 +193,18 @@ int main() {
         }
         dense[10] = dense[10*n] = 1.0;
         check("delayed_2x2_dense",n,dense,true,n);
+
+        // Natural ordering accepts five dense scalar pivots, then encounters
+        // the strong coupling. Delaying pivot five must flush the pending
+        // corrections before its front is assembled into a different index set.
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                dense[r*n+c] = r == c ? ((r == 5 || r == 10) ? 0.0 : (r%2 ? 2.0 : -2.0))
+                                      : 0.001*std::cos(0.1*(r+c));
+            }
+        }
+        dense[5*n+10] = dense[10*n+5] = 1.0;
+        check("delayed_2x2_after_scalar_panel", n, dense, true, n, false, true);
 
         // A full-column-rank dyadic B gives A=B*B^T exactly rank n-6.
         // Its leading triangular block stays well conditioned during elimination.
