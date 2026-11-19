@@ -58,6 +58,34 @@ struct FastSpdState;
 struct PivotFactor {
     enum class Kind { Symmetric, General };
 
+    PivotFactor() = default;
+    PivotFactor(const PivotFactor&) = default;
+    PivotFactor(PivotFactor&&) noexcept = default;
+
+    // Copy-and-swap is required: ordinary memberwise assignment could free
+    // the old PMR arena before replacing its still-live PivotBlock vectors.
+    PivotFactor& operator=(PivotFactor other) noexcept {
+        using std::swap;
+        swap(kind, other.kind);
+        swap(rank_tolerance, other.rank_tolerance);
+        swap(pivot_tolerance, other.pivot_tolerance);
+        swap(threads, other.threads);
+        swap(fast_spd, other.fast_spd);
+        swap(blocks, other.blocks);
+        swap(rank, other.rank);
+        swap(positive_directions, other.positive_directions);
+        swap(negative_directions, other.negative_directions);
+        swap(two_by_two_pivots, other.two_by_two_pivots);
+        swap(delayed_candidates, other.delayed_candidates);
+        swap(maximum_front, other.maximum_front);
+        swap(minimum_pivot, other.minimum_pivot);
+        swap(matrix, other.matrix);
+        swap(row_scale, other.row_scale);
+        swap(column_scale, other.column_scale);
+        swap(ready, other.ready);
+        return *this;
+    }
+
     // Numerical policy in equilibrated coordinates
     Kind   kind            = Kind::Symmetric;
     double rank_tolerance  = 1e-12;
