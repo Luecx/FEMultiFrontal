@@ -174,8 +174,10 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
         }
         if (accepted) {
-            std::vector<PivotBlock> fast_blocks;
-            fast_blocks.reserve(n);
+            // Keep blocks indexed by their pivot ID until all pivots are validated.
+            // The robust factor emits blocks in elimination-tree postorder, which
+            // is not generally the same as ascending permuted index order.
+            std::vector<PivotBlock> fast_blocks(n);
             double fast_minimum = std::numeric_limits<double>::infinity();
             for (int c = 0; c < n; ++c) {
                 const auto begin = symbolic.ptr[c];
@@ -207,10 +209,13 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                         block.lower_values.push_back({multiplier, 0.0});
                     }
                 }
-                fast_blocks.push_back(std::move(block));
+                fast_blocks[c] = std::move(block);
             }
             if (accepted) {
-                blocks = std::move(fast_blocks);
+                blocks.reserve(n);
+                for (int owner : symbolic.postorder) {
+                    blocks.push_back(std::move(fast_blocks[owner]));
+                }
                 rank = positive_directions = n;
                 negative_directions = two_by_two_pivots = 0;
                 delayed_candidates = 0;
