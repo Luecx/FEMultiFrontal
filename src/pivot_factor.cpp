@@ -14,10 +14,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <span>
@@ -87,6 +90,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 #endif
     const bool symmetric = kind == Kind::Symmetric;
     const int n = input.n;
+    // Opt-in wall-clock profiling of the outer LDLT SPD stages, including
+    // multithreaded factorization. No clocks or output in normal runs.
+    using ProfileClock = std::chrono::steady_clock;
+    const char* const timing_env = std::getenv("MF_LDLT_SPD_TIMINGS");
+    const bool time_spd = symmetric && n >= 1024 && timing_env && std::string_view(timing_env) != "0";
+    const auto scale_begin = time_spd ? ProfileClock::now() : ProfileClock::time_point{};
+    auto seconds = [](auto start, auto end) {
+        return std::chrono::duration<double>(end - start).count();
+    };
     matrix = &input;
     // Release the old blocks before their backing arena; fallback factorizations
     // must never retain a fast factor from an earlier SPD solve.
@@ -156,6 +168,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         column_scale[i] = column_scale[i] > 0.0 ? 1.0 / std::sqrt(column_scale[i]) : 1.0;
     }
 
+    const auto scaling_done = time_spd ? ProfileClock::now() : ProfileClock::time_point{};
+
     // Experimental optimistic path: use dense SPD panels for stable positive
     // scalar pivots, but retain the exact LDLT PivotBlock API and diagnostics.
     // The scalar pivot-policy validation runs before any permanent allocations.
@@ -174,6 +188,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
             fast_input.ptr.push_back(fast_input.row.size());
         }
+        const auto conversion_done = time_spd ? ProfileClock::now() : ProfileClock::time_point{};
 
         Factor fast_factor;
         fast_factor.threads = threads;
@@ -188,6 +203,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 throw;
             }
         }
+        const auto kernel_done = time_spd ? ProfileClock::now() : ProfileClock::time_point{};
         double fast_minimum = std::numeric_limits<double>::infinity();
         if (accepted) {
             for (int c = 0; c < n; ++c) {
@@ -208,6 +224,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 fast_minimum = std::min(fast_minimum, d);
             }
         }
+        const auto validation_done = time_spd ? ProfileClock::now() : ProfileClock::time_point{};
         if (accepted) {
             // Preserve public pivot IDs, 1x1 diagonals and postorder for
             // diagnostics, but don't duplicate the complete Cholesky L in
@@ -228,7 +245,32 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             maximum_front = symbolic.max_front;
             minimum_pivot = fast_minimum;
             ready = true;
+            if (time_spd) {
+                const auto metadata_done = ProfileClock::now();
+                std::cerr << "[ldlt-spd-timing] n=" << n
+                          << " threads=" << threads
+                          << " accepted=1"
+                          << " scaling_s=" << seconds(scale_begin, scaling_done)
+                          << " convert_csc_s=" << seconds(scaling_done, conversion_done)
+                          << " cholesky_factor_s=" << seconds(conversion_done, kernel_done)
+                          << " validate_s=" << seconds(kernel_done, validation_done)
+                          << " pivot_metadata_s=" << seconds(validation_done, metadata_done)
+                          << " total_s=" << seconds(scale_begin, metadata_done)
+                          << " factor_nnz=" << symbolic.row.size()
+                          << " assembled_fronts=" << state->factor.assembled_fronts
+                          << " merged_pivots=" << state->factor.merged_pivots
+                          << '\n';
+            }
             return;
+        }
+        if (time_spd) {
+            std::cerr << "[ldlt-spd-timing] n=" << n << " threads=" << threads
+                      << " accepted=0"
+                      << " scaling_s=" << seconds(scale_begin, scaling_done)
+                      << " convert_csc_s=" << seconds(scaling_done, conversion_done)
+                      << " cholesky_factor_s=" << seconds(conversion_done, kernel_done)
+                      << " validate_s=" << seconds(kernel_done, validation_done)
+                      << " fallback=robust_ldlt" << '\n';
         }
     }
 
