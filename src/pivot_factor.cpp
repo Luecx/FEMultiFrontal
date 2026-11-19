@@ -817,47 +817,48 @@ std::vector<double> PivotFactor::solve(const std::vector<double>& rhs) const {
         // instead of interpreting the same coefficients through PivotBlock.
         x = fast_spd->factor.solve(fast_spd->symbolic, y);
     } else {
+        // The general / rank-aware path retains its existing pivoted solve.
         for (const auto& block : blocks) {
-        const double a = y[block.rows[0]];
-        const double b = block.size == 2 ? y[block.rows[1]] : 0.0;
-        for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-            y[block.lower_rows[p]] -= block.lower_values[p][0] * a + block.lower_values[p][1] * b;
+            const double a = y[block.rows[0]];
+            const double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+                y[block.lower_rows[p]] -= block.lower_values[p][0] * a + block.lower_values[p][1] * b;
+            }
         }
-    }
 
-    // Back substitution uses D*L^T for symmetric factors and independent U for LU
+        // Back substitution uses D*L^T for symmetric factors and U for LU.
         x.assign(matrix->n, 0.0);
         for (auto item = blocks.rbegin(); item != blocks.rend(); ++item) {
-        const auto& block = *item;
-        double a = y[block.rows[0]];
-        double b = block.size == 2 ? y[block.rows[1]] : 0.0;
-        if (kind == Kind::General) {
-            for (std::size_t p = 0; p < block.upper_columns.size(); ++p) {
-                a -= block.upper_values[p][0] * x[block.upper_columns[p]];
-                b -= block.upper_values[p][1] * x[block.upper_columns[p]];
+            const auto& block = *item;
+            double a = y[block.rows[0]];
+            double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+            if (kind == Kind::General) {
+                for (std::size_t p = 0; p < block.upper_columns.size(); ++p) {
+                    a -= block.upper_values[p][0] * x[block.upper_columns[p]];
+                    b -= block.upper_values[p][1] * x[block.upper_columns[p]];
+                }
             }
-        }
-        if (block.size == 1) {
-            a /= block.diagonal[0];
-        } else {
-            const double scale = std::max({std::abs(block.diagonal[0]), std::abs(block.diagonal[1]), std::abs(block.diagonal[3])});
-            const double d0 = block.diagonal[0] / scale;
-            const double d1 = block.diagonal[3] / scale;
-            const double off = block.diagonal[1] / scale;
-            const double det = d0 * d1 - off * off;
-            const double first = a / scale;
-            const double second = b / scale;
-            a = (d1 * first - off * second) / det;
-            b = (d0 * second - off * first) / det;
-        }
-        if (kind == Kind::Symmetric) {
-            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                a -= block.lower_values[p][0] * x[block.lower_rows[p]];
-                b -= block.lower_values[p][1] * x[block.lower_rows[p]];
+            if (block.size == 1) {
+                a /= block.diagonal[0];
+            } else {
+                const double scale = std::max({std::abs(block.diagonal[0]), std::abs(block.diagonal[1]), std::abs(block.diagonal[3])});
+                const double d0 = block.diagonal[0] / scale;
+                const double d1 = block.diagonal[3] / scale;
+                const double off = block.diagonal[1] / scale;
+                const double det = d0 * d1 - off * off;
+                const double first = a / scale;
+                const double second = b / scale;
+                a = (d1 * first - off * second) / det;
+                b = (d0 * second - off * first) / det;
             }
-        }
-        x[block.columns[0]] = a;
-        if (block.size == 2) { x[block.columns[1]] = b; }
+            if (kind == Kind::Symmetric) {
+                for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+                    a -= block.lower_values[p][0] * x[block.lower_rows[p]];
+                    b -= block.lower_values[p][1] * x[block.lower_rows[p]];
+                }
+            }
+            x[block.columns[0]] = a;
+            if (block.size == 2) { x[block.columns[1]] = b; }
         }
     }
     for (int i = 0; i < matrix->n; ++i) { x[i] *= column_scale[i]; }
