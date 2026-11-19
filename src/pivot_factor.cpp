@@ -328,9 +328,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             source = NumericFront{};
         }
         std::vector<int> active_rows(nr);
-        std::vector<int> active_columns(nc);
         std::iota(active_rows.begin(), active_rows.end(), 0);
-        std::iota(active_columns.begin(), active_columns.end(), 0);
+        // Symmetric fronts have identical live row and column indices.
+        // Avoid a second allocation and a second compaction for each pivot.
+        std::vector<int> general_active_columns;
+        if (!symmetric) {
+            general_active_columns.resize(nc);
+            std::iota(general_active_columns.begin(), general_active_columns.end(), 0);
+        }
+        auto& active_columns = symmetric ? active_rows : general_active_columns;
 
         // Reuse local positions and contiguous pivot-row coefficients only for
         // sufficiently large symmetric fronts. LU keeps its independent path.
@@ -479,9 +485,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             active_rows.erase(std::remove_if(active_rows.begin(), active_rows.end(), [&](int r) {
                 return r == pivot_rows[0] || (size == 2 && r == pivot_rows[1]);
             }), active_rows.end());
-            active_columns.erase(std::remove_if(active_columns.begin(), active_columns.end(), [&](int c) {
-                return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
-            }), active_columns.end());
+            if (!symmetric) {
+                active_columns.erase(std::remove_if(active_columns.begin(), active_columns.end(), [&](int c) {
+                    return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
+                }), active_columns.end());
+            }
 
             // Defer only a dense scalar correction whose exact suffix can be
             // handed to the next owner. Zero multipliers use the immediate
