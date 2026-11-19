@@ -52,18 +52,16 @@ struct NumericFront {
     int origin = 0;
 };
 
-// Owns both the factored SPD columns and the pooled backing storage used by
-// PivotBlock's PMR vectors. The symbolic plan is copied so solve remains valid
-// even if the caller releases the input Symbolic after factorization.
+// Cholesky coefficients are the single numerical source of truth on the SPD
+// path. The arena is unused until a caller explicitly materializes the sparse
+// lower multipliers for introspection. Symbolic is owned for solve lifetime.
 struct FastSpdState {
-    std::unique_ptr<std::byte[]> storage;
     std::pmr::monotonic_buffer_resource arena;
     Factor factor;
     Symbolic symbolic;
 
-    FastSpdState(std::size_t bytes, Factor&& computed, const Symbolic& plan)
-        : storage(std::make_unique_for_overwrite<std::byte[]>(bytes)),
-          arena(storage.get(), bytes), factor(std::move(computed)), symbolic(plan) {}
+    FastSpdState(Factor&& computed, const Symbolic& plan)
+        : factor(std::move(computed)), symbolic(plan) {}
 };
 
 /**
@@ -94,6 +92,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     // must never retain a fast factor from an earlier SPD solve.
     blocks.clear();
     fast_spd.reset();
+    spd_blocks_materialized = false;
     rank = positive_directions = negative_directions = two_by_two_pivots = 0;
     delayed_candidates = maximum_front = 0;
     minimum_pivot = std::numeric_limits<double>::infinity();
@@ -210,39 +209,18 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
         }
         if (accepted) {
-            // A single allocation replaces two independent heap allocations
-            // per scalar pivot. Keep a small alignment allowance for each
-            // vector; excess allocations fall back to the PMR upstream.
-            const std::size_t off_diagonal = symbolic.row.size() - static_cast<std::size_t>(n);
-            const std::size_t pair_bytes = sizeof(int) + sizeof(std::array<double, 2>);
-            const std::size_t slack = static_cast<std::size_t>(n) * 16 + 64;
-            if (off_diagonal > (std::numeric_limits<std::size_t>::max() - slack) / pair_bytes) {
-                throw std::runtime_error("SPD pivot buffer size overflow");
-            }
-            const std::size_t arena_bytes = off_diagonal * pair_bytes + slack;
-            auto state = std::make_shared<FastSpdState>(arena_bytes, std::move(fast_factor), symbolic);
-            // Publish arena ownership before constructing blocks, including
-            // exceptional exits from reserve/push_back in the conversion loop.
+            // Preserve public pivot IDs, 1x1 diagonals and postorder for
+            // diagnostics, but don't duplicate the complete Cholesky L in
+            // per-pivot row/value vectors. The SPD solve already uses Factor.
+            auto state = std::make_shared<FastSpdState>(std::move(fast_factor), symbolic);
             fast_spd = state;
             blocks.reserve(n);
             for (int c : symbolic.postorder) {
-                const auto begin = symbolic.ptr[c];
-                const auto end = symbolic.ptr[c + 1];
-                const double chol_diagonal = state->factor.value[begin];
-                PivotBlock block(&state->arena);
+                blocks.emplace_back(&state->arena);
+                auto& block = blocks.back();
                 block.rows[0] = block.columns[0] = c;
+                const double chol_diagonal = state->factor.value[symbolic.ptr[c]];
                 block.diagonal[0] = chol_diagonal * chol_diagonal;
-                const auto size = end - begin - 1;
-                block.lower_rows.reserve(size);
-                block.lower_values.reserve(size);
-                for (std::size_t p = begin + 1; p < end; ++p) {
-                    const double multiplier = state->factor.value[p] / chol_diagonal;
-                    if (multiplier != 0.0) {
-                        block.lower_rows.push_back(symbolic.row[p]);
-                        block.lower_values.push_back({multiplier, 0.0});
-                    }
-                }
-                blocks.push_back(std::move(block));
             }
             rank = positive_directions = n;
             negative_directions = two_by_two_pivots = 0;
@@ -793,6 +771,35 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     }
     if (rank == 0) { minimum_pivot = 0.0; }
     ready = true;
+}
+
+/**
+ * Materialize sparse unit-L multipliers when a client needs the complete
+ * per-pivot LDLT representation rather than only pivot metadata. These
+ * coefficients remain unallocated for normal SPD factorization and solves.
+ */
+void PivotFactor::materialize_spd_blocks() {
+    if (!ready) { throw std::runtime_error("Pivot factors are not ready"); }
+    if (!fast_spd || spd_blocks_materialized) { return; }
+    const auto& symbolic = fast_spd->symbolic;
+    const auto& value = fast_spd->factor.value;
+    for (auto& block : blocks) {
+        const int c = block.rows[0];
+        const std::size_t begin = symbolic.ptr[c];
+        const std::size_t end = symbolic.ptr[c + 1];
+        const double diagonal = value[begin];
+        const std::size_t off_diagonal = end - begin - 1;
+        block.lower_rows.reserve(off_diagonal);
+        block.lower_values.reserve(off_diagonal);
+        for (std::size_t p = begin + 1; p < end; ++p) {
+            const double multiplier = value[p] / diagonal;
+            if (multiplier != 0.0) {
+                block.lower_rows.push_back(symbolic.row[p]);
+                block.lower_values.push_back({multiplier, 0.0});
+            }
+        }
+    }
+    spd_blocks_materialized = true;
 }
 
 /**

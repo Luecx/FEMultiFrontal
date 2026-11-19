@@ -72,6 +72,7 @@ struct PivotFactor {
         swap(threads, other.threads);
         swap(fast_spd, other.fast_spd);
         swap(blocks, other.blocks);
+        swap(spd_blocks_materialized, other.spd_blocks_materialized);
         swap(rank, other.rank);
         swap(positive_directions, other.positive_directions);
         swap(negative_directions, other.negative_directions);
@@ -96,8 +97,13 @@ struct PivotFactor {
     // Kept before blocks so destruction releases blocks before their arena.
     std::shared_ptr<FastSpdState> fast_spd;
 
-    // Accepted factors and threshold-based diagnostics
+    // Accepted factors and threshold-based diagnostics. For an accepted SPD
+    // fast path, blocks contain the pivot trace (rows, columns, diagonals),
+    // but multipliers are retained only in fast_spd->factor until explicitly
+    // requested with materialize_spd_blocks(). General/indefinite factor blocks
+    // are fully populated as before.
     std::vector<PivotBlock> blocks;
+    bool spd_blocks_materialized = false;
     int rank                 = 0;
     int positive_directions  = 0;
     int negative_directions  = 0;
@@ -114,6 +120,11 @@ struct PivotFactor {
 
     // Numerical assembly follows the supplied structural forest, retaining delayed IDs
     void factorize(const GeneralMatrix& input, const Symbolic& symbolic);
+
+    // Populate per-pivot lower rows and multipliers on demand for consumers
+    // that inspect the full LDLT factor. No-op for robust LDLT/LU.
+    // SPD solve and pivot diagnostics never require this materialization.
+    void materialize_spd_blocks();
 
     // Recover one basic solution and reject an incompatible original-system residual
     std::vector<double> solve(const std::vector<double>& rhs) const;
