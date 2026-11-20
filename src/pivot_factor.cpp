@@ -156,6 +156,16 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         double pivot = 0.0;
         double update = 0.0;
         double finish = 0.0;
+        double finish_root = 0.0;
+        double finish_index = 0.0;
+        double finish_reuse = 0.0;
+        double finish_copy = 0.0;
+        double flush_work = 0.0;
+        double flush_finish = 0.0;
+        std::size_t flush_calls = 0;
+        std::size_t finish_reuse_count = 0;
+        std::size_t finish_copy_count = 0;
+        std::size_t finish_root_count = 0;
         std::size_t scalar_pivots = 0;
         std::size_t block_pivots = 0;
         std::size_t deferred_pivots = 0;
@@ -258,9 +268,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 at(r,0) = column[r];
             }
         }
-        // The owner column is already current. Flush only the untouched suffix.
+        // Record flushes separately regardless of their call site. Timing is
+        // exclusive: the parent phase subtracts its flush time below.
         auto flush_pending = [&] {
             if (front.pending_lower.empty()) { return; }
+            const auto flush_start = profiling ? ProfileClock::now() : ProfileClock::time_point{};
             dense::flush_scalar_pivot_updates(
                 front.stride, front.origin+1, front.origin+nc,
                 static_cast<int>(front.pending_lower.size()/front.stride),
@@ -268,6 +280,10 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             );
             front.pending_lower.clear();
             front.pending_upper.clear();
+            if (profiling) {
+                phase->flush_work += elapsed(flush_start, ProfileClock::now());
+                ++phase->flush_calls;
+            }
         };
 
         // The worker map is used only during assembly, before any taskloop
@@ -542,6 +558,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 if (defer) { ++phase->deferred_pivots; }
             }
             const auto update_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
+            const double flush_before_update = profiling ? phase->flush_work : 0.0;
             if (defer) {
                 const auto base = front.pending_lower.size();
                 front.pending_lower.resize(base+front.stride);
@@ -582,13 +599,18 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
             }
             records[owner].push_back(std::move(block));
-            if (profiling) { phase->update += elapsed(update_begin, ProfileClock::now()); }
+            if (profiling) {
+                phase->update += elapsed(update_begin, ProfileClock::now()) - (phase->flush_work - flush_before_update);
+            }
         }
         if (profiling) { finish_begin = ProfileClock::now(); }
+        const double flush_before_finish = profiling ? phase->flush_work : 0.0;
 
         // Delay unresolved candidates, or deflate only a numerically zero root block
         const bool root = symbolic.parent[owner] == -1;
         if (root) {
+            const auto root_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
+            if (profiling) { ++phase->finish_root_count; }
             flush_pending();
             double maximum = 0.0;
             for (int r : active_rows) {
@@ -597,13 +619,20 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (maximum > rank_tolerance) {
                 throw std::runtime_error("Unresolved nonzero root block: reduce rank/pivot tolerance; rank is not certified");
             }
+            if (profiling) {
+                phase->finish_root += elapsed(root_begin, ProfileClock::now()) - (phase->flush_work - flush_before_finish);
+            }
         } else {
+            const auto index_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
             auto& output = contributions[owner];
             for (int r : active_rows) {
                 output.rows.push_back(front.rows[r]);
                 if (front.rows[r] <= owner) { ++delays[owner]; }
             }
             for (int c : active_columns) { output.columns.push_back(front.columns[c]); }
+            if (profiling) { phase->finish_index += elapsed(index_begin, ProfileClock::now()); }
+            const auto transfer_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
+            const double flush_before_transfer = profiling ? phase->flush_work : 0.0;
             // Move contiguous suffixes on exact links. Compact when half the
             // physical rows have been eliminated to bound retained storage.
             const int parent = symbolic.parent[owner];
@@ -622,6 +651,10 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 output.values        = std::move(front.values);
                 output.pending_lower = std::move(front.pending_lower);
                 output.pending_upper = std::move(front.pending_upper);
+                if (profiling) {
+                    ++phase->finish_reuse_count;
+                    phase->finish_reuse += elapsed(transfer_begin, ProfileClock::now()) - (phase->flush_work - flush_before_transfer);
+                }
             } else {
                 flush_pending();
                 output.stride = static_cast<int>(active_columns.size());
@@ -633,9 +666,17 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                         output.values.push_back(at(active_rows[r],active_columns[c]));
                     }
                 }
+                if (profiling) {
+                    ++phase->finish_copy_count;
+                    phase->finish_copy += elapsed(transfer_begin, ProfileClock::now()) - (phase->flush_work - flush_before_transfer);
+                }
             }
         }
-        if (profiling) { phase->finish += elapsed(finish_begin, ProfileClock::now()); }
+        if (profiling) {
+            const double flush_during_finish = phase->flush_work - flush_before_finish;
+            phase->flush_finish += flush_during_finish;
+            phase->finish += elapsed(finish_begin, ProfileClock::now()) - flush_during_finish;
+        }
     };
 
     // Schedule coarse independent subtrees; pivot selection remains local and deterministic
@@ -733,6 +774,16 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             sum.pivot += p.pivot;
             sum.update += p.update;
             sum.finish += p.finish;
+            sum.finish_root += p.finish_root;
+            sum.finish_index += p.finish_index;
+            sum.finish_reuse += p.finish_reuse;
+            sum.finish_copy += p.finish_copy;
+            sum.flush_work += p.flush_work;
+            sum.flush_finish += p.flush_finish;
+            sum.flush_calls += p.flush_calls;
+            sum.finish_reuse_count += p.finish_reuse_count;
+            sum.finish_copy_count += p.finish_copy_count;
+            sum.finish_root_count += p.finish_root_count;
             sum.scalar_pivots += p.scalar_pivots;
             sum.block_pivots += p.block_pivots;
             sum.deferred_pivots += p.deferred_pivots;
@@ -741,11 +792,18 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         std::fprintf(stderr,
             "FEMF_LDLT_PROFILE total_wall_s=%.9f prepass_wall_s=%.9f "
             "assembly_work_s=%.9f search_work_s=%.9f pivot_work_s=%.9f "
-            "update_work_s=%.9f finish_work_s=%.9f "
+            "update_excl_flush_work_s=%.9f finish_excl_flush_work_s=%.9f "
+            "flush_work_s=%.9f flush_finish_work_s=%.9f "
+            "finish_index_work_s=%.9f finish_reuse_work_s=%.9f "
+            "finish_copy_work_s=%.9f finish_root_work_s=%.9f "
+            "finish_reuse_count=%zu finish_copy_count=%zu finish_root_count=%zu flush_calls=%zu "
             "pivots_1x1=%zu pivots_2x2=%zu deferred_scalar=%zu "
             "threads=%d rank=%d nullity=%d\n",
             elapsed(factor_start, factor_end), elapsed(factor_start, prepass_end),
             sum.assembly, sum.search, sum.pivot, sum.update, sum.finish,
+            sum.flush_work, sum.flush_finish, sum.finish_index, sum.finish_reuse,
+            sum.finish_copy, sum.finish_root,
+            sum.finish_reuse_count, sum.finish_copy_count, sum.finish_root_count, sum.flush_calls,
             sum.scalar_pivots, sum.block_pivots, sum.deferred_pivots,
             threads, rank, n - rank);
     }
