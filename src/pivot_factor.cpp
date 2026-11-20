@@ -17,6 +17,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -138,6 +139,48 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     }
 
     // Dynamic payloads and accepted records have one writer per original front
+    // Bounded reuse of exclusively owned, 64-byte aligned frontal buffers.
+    std::mutex workspace_mutex;
+    std::vector<memory::Values> workspace_buffers;
+    std::size_t workspace_capacity = 0;
+    constexpr std::size_t workspace_limit = 16 * 1024 * 1024; // 128 MiB
+    constexpr std::size_t workspace_slots = 64;
+    auto acquire_values = [&](std::size_t count) -> memory::Values {
+        memory::Values buffer;
+        {
+            std::lock_guard<std::mutex> lock(workspace_mutex);
+            std::size_t best = workspace_buffers.size();
+            std::size_t capacity = std::numeric_limits<std::size_t>::max();
+            for (std::size_t i = 0; i < workspace_buffers.size(); ++i) {
+                const auto candidate = workspace_buffers[i].capacity();
+                if (candidate >= count && candidate < capacity) {
+                    best = i;
+                    capacity = candidate;
+                }
+            }
+            if (best < workspace_buffers.size()) {
+                workspace_capacity -= workspace_buffers[best].capacity();
+                buffer = std::move(workspace_buffers[best]);
+                if (best + 1 < workspace_buffers.size()) {
+                    workspace_buffers[best] = std::move(workspace_buffers.back());
+                }
+                workspace_buffers.pop_back();
+            }
+        }
+        buffer.assign(count, 0.0);
+        return buffer;
+    };
+    auto recycle_values = [&](memory::Values&& source) {
+        const auto capacity = source.capacity();
+        if (capacity == 0 || capacity > workspace_limit) { return; }
+        std::lock_guard<std::mutex> lock(workspace_mutex);
+        if (workspace_buffers.size() >= workspace_slots ||
+            capacity > workspace_limit - workspace_capacity) { return; }
+        source.clear();
+        workspace_capacity += capacity;
+        workspace_buffers.push_back(std::move(source));
+    };
+
     std::vector<NumericFront> contributions(n);
     std::vector<std::vector<PivotBlock>> records(n);
     std::vector<std::size_t> delays(n, 0);
@@ -179,7 +222,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         if (!inherited) {
             front.stride = nc;
             const auto rows = static_cast<std::size_t>(nr);
-            front.values.assign(symmetric ? rows*(rows+1)/2 : rows*nc, 0.0);
+            front.values = acquire_values(symmetric ? rows*(rows+1)/2 : rows*nc);
         }
         double* const values = front.values.data();
         auto row_position = [&](int id) {
@@ -325,12 +368,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     }
                 }
             }
+            recycle_values(std::move(source.values));
             source = NumericFront{};
         }
         std::vector<int> active_rows(nr);
-        std::vector<int> active_columns(nc);
+        // Symmetric active row and column sets are identical: one allocation.
+        std::vector<int> active_columns(symmetric ? 0 : nc);
         std::iota(active_rows.begin(), active_rows.end(), 0);
-        std::iota(active_columns.begin(), active_columns.end(), 0);
+        if (!symmetric) { std::iota(active_columns.begin(), active_columns.end(), 0); }
+        auto& live_columns = symmetric ? active_rows : active_columns;
 
         // Reuse local positions and contiguous pivot-row coefficients only for
         // sufficiently large symmetric fronts. LU keeps its independent path.
@@ -343,7 +389,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         }
 
         // Only original IDs that have reached this front are fully summed candidates
-        while (!active_rows.empty() && !active_columns.empty()) {
+        while (!active_rows.empty() && !live_columns.empty()) {
             // Active IDs stay sorted after pivot removal. Eligible variables
             // occupy a prefix, so pivot search needs no temporary index lists.
             const auto eligible_end = std::upper_bound(active_rows.begin(), active_rows.end(), owner,
@@ -351,9 +397,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             const std::span<const int> eligible_rows(active_rows.begin(), eligible_end);
             auto eligible_columns = eligible_rows;
             if (!symmetric) {
-                const auto end = std::upper_bound(active_columns.begin(), active_columns.end(), owner,
+                const auto end = std::upper_bound(live_columns.begin(), live_columns.end(), owner,
                     [&](int id, int local) { return id < front.columns[local]; });
-                eligible_columns = std::span<const int>(active_columns.begin(), end);
+                eligible_columns = std::span<const int>(live_columns.begin(), end);
             }
             if (eligible_rows.empty() || eligible_columns.empty()) { break; }
             int pivot_rows[2] = {-1, -1};
@@ -368,7 +414,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     const double magnitude = std::abs(at(r,r));
                     if (!(magnitude > best)) { continue; }
                     double maximum = 0.0;
-                    for (int c : active_columns) { maximum = std::max(maximum, std::abs(at(r,c))); }
+                    for (int c : live_columns) { maximum = std::max(maximum, std::abs(at(r,c))); }
                     if (magnitude >= pivot_tolerance*maximum) {
                         best = magnitude;
                         pivot_rows[0] = pivot_columns[0] = r;
@@ -379,7 +425,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 std::vector<double> row_max(nr, 0.0);
                 std::vector<double> column_max(nc, 0.0);
                 for (int r : eligible_rows) {
-                    for (int c : active_columns) { row_max[r] = std::max(row_max[r], std::abs(at(r,c))); }
+                    for (int c : live_columns) { row_max[r] = std::max(row_max[r], std::abs(at(r,c))); }
                 }
                 for (int c : eligible_columns) {
                     for (int r : active_rows) { column_max[c] = std::max(column_max[c], std::abs(at(r,c))); }
@@ -464,7 +510,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
             }
             std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
-            for (int c : active_columns) {
+            for (int c : live_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
                     if (size == 2) { update_upper[nc+c] = at(pivot_rows[1], c); }
@@ -479,9 +525,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             active_rows.erase(std::remove_if(active_rows.begin(), active_rows.end(), [&](int r) {
                 return r == pivot_rows[0] || (size == 2 && r == pivot_rows[1]);
             }), active_rows.end());
-            active_columns.erase(std::remove_if(active_columns.begin(), active_columns.end(), [&](int c) {
-                return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
-            }), active_columns.end());
+            if (!symmetric) {
+                live_columns.erase(std::remove_if(live_columns.begin(), live_columns.end(), [&](int c) {
+                    return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
+                }), live_columns.end());
+            }
 
             // Defer only a dense scalar correction whose exact suffix can be
             // handed to the next owner. Zero multipliers use the immediate
@@ -517,8 +565,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     static_cast<int>(lower_positions.size()),
                     lower_positions.data(),
                     block.lower_values.data(),
-                    static_cast<int>(active_columns.size()),
-                    active_columns.data(),
+                    static_cast<int>(live_columns.size()),
+                    live_columns.data(),
                     update_upper.data(),
                     update_upper.data()+nc,
                     values
@@ -528,7 +576,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
                     const int r = row_position(block.lower_rows[p]);
                     const auto lower = block.lower_values[p];
-                    for (int c : active_columns) {
+                    for (int c : live_columns) {
                         if (symmetric && c > r) { continue; }
                         at(r, c) -= lower[0] * upper[c][0] + lower[1] * upper[c][1];
                         if (!std::isfinite(at(r, c))) { throw std::runtime_error("Nonfinite pivoted Schur update"); }
@@ -544,7 +592,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             flush_pending();
             double maximum = 0.0;
             for (int r : active_rows) {
-                for (int c : active_columns) { maximum = std::max(maximum, std::abs(at(r, c))); }
+                for (int c : live_columns) { maximum = std::max(maximum, std::abs(at(r, c))); }
             }
             if (maximum > rank_tolerance) {
                 throw std::runtime_error("Unresolved nonzero root block: reduce rank/pivot tolerance; rank is not certified");
@@ -555,7 +603,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 output.rows.push_back(front.rows[r]);
                 if (front.rows[r] <= owner) { ++delays[owner]; }
             }
-            for (int c : active_columns) { output.columns.push_back(front.columns[c]); }
+            for (int c : live_columns) { output.columns.push_back(front.columns[c]); }
             // Move contiguous suffixes on exact links. Compact when half the
             // physical rows have been eliminated to bound retained storage.
             const int parent = symbolic.parent[owner];
@@ -585,26 +633,26 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 // compaction therefore cannot overwrite an unread entry.
                 flush_pending();
                 const auto rows = active_rows.size();
-                const auto columns = active_columns.size();
+                const auto columns = live_columns.size();
                 double* const data = front.values.data();
 
                 // For a contiguous trailing set, all columns of each output
                 // row form one physical span. A bulk forward copy avoids
                 // repeated index lookups and packed-triangle arithmetic.
                 const bool consecutive_columns = columns == 0 ||
-                    static_cast<std::size_t>(active_columns.back() - active_columns.front() + 1) == columns;
+                    static_cast<std::size_t>(live_columns.back() - live_columns.front() + 1) == columns;
                 if (symmetric) {
                     std::size_t dst = 0;
                     for (std::size_t r = 0; r < rows; ++r) {
                         const int source_row = active_rows[r];
                         if (consecutive_columns) {
-                            const double* const source = &at(source_row, active_columns.front());
+                            const double* const source = &at(source_row, live_columns.front());
                             // Destination never begins after the source.
                             std::copy_n(source, r+1, data+dst);
                             dst += r+1;
                         } else {
                             for (std::size_t c = 0; c <= r; ++c) {
-                                data[dst++] = at(source_row, active_columns[c]);
+                                data[dst++] = at(source_row, live_columns[c]);
                             }
                         }
                     }
@@ -614,12 +662,12 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     for (std::size_t r = 0; r < rows; ++r) {
                         const int source_row = active_rows[r];
                         if (consecutive_columns && columns != 0) {
-                            const double* const source = &at(source_row, active_columns.front());
+                            const double* const source = &at(source_row, live_columns.front());
                             std::copy_n(source, columns, data+dst);
                             dst += columns;
                         } else {
                             for (std::size_t c = 0; c < columns; ++c) {
-                                data[dst++] = at(source_row, active_columns[c]);
+                                data[dst++] = at(source_row, live_columns[c]);
                             }
                         }
                     }
