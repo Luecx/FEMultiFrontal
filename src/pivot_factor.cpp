@@ -743,7 +743,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             "assembly_work_s=%.9f search_work_s=%.9f pivot_work_s=%.9f "
             "update_work_s=%.9f finish_work_s=%.9f "
             "pivots_1x1=%zu pivots_2x2=%zu deferred_scalar=%zu "
-            "threads=%d rank=%d nullity=%d\\n",
+            "threads=%d rank=%d nullity=%d\n",
             elapsed(factor_start, factor_end), elapsed(factor_start, prepass_end),
             sum.assembly, sum.search, sum.pivot, sum.update, sum.finish,
             sum.scalar_pivots, sum.block_pivots, sum.deferred_pivots,
