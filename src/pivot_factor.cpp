@@ -588,25 +588,39 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 const auto columns = active_columns.size();
                 double* const data = front.values.data();
 
+                // For a contiguous trailing set, all columns of each output
+                // row form one physical span. A bulk forward copy avoids
+                // repeated index lookups and packed-triangle arithmetic.
+                const bool consecutive_columns = columns == 0 ||
+                    static_cast<std::size_t>(active_columns.back() - active_columns.front() + 1) == columns;
                 if (symmetric) {
-                    // A compact lower triangle has row lengths 1, 2, ..., m.
-                    // The at() accessor retains the original physical layout.
                     std::size_t dst = 0;
                     for (std::size_t r = 0; r < rows; ++r) {
                         const int source_row = active_rows[r];
-                        for (std::size_t c = 0; c <= r; ++c) {
-                            data[dst++] = at(source_row, active_columns[c]);
+                        if (consecutive_columns) {
+                            const double* const source = &at(source_row, active_columns.front());
+                            // Destination never begins after the source.
+                            std::copy_n(source, r+1, data+dst);
+                            dst += r+1;
+                        } else {
+                            for (std::size_t c = 0; c <= r; ++c) {
+                                data[dst++] = at(source_row, active_columns[c]);
+                            }
                         }
                     }
                     front.values.resize(rows*(rows+1)/2);
                 } else {
-                    // LU has independent row and column sets but the same
-                    // monotone source/destination ordering in row-major form.
                     std::size_t dst = 0;
                     for (std::size_t r = 0; r < rows; ++r) {
                         const int source_row = active_rows[r];
-                        for (std::size_t c = 0; c < columns; ++c) {
-                            data[dst++] = at(source_row, active_columns[c]);
+                        if (consecutive_columns && columns != 0) {
+                            const double* const source = &at(source_row, active_columns.front());
+                            std::copy_n(source, columns, data+dst);
+                            dst += columns;
+                        } else {
+                            for (std::size_t c = 0; c < columns; ++c) {
+                                data[dst++] = at(source_row, active_columns[c]);
+                            }
                         }
                     }
                     front.values.resize(rows*columns);
