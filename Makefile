@@ -4,7 +4,11 @@
 # OpenMP: make -j4 WITH_OPENMP=1 all check
 CXX      ?= g++
 CPPFLAGS += -Isrc
-CXXFLAGS ?= -O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic
+CXXFLAGS ?= -O3 -march=native -DNDEBUG -Wall -Wextra -Wpedantic
+# Conda and other toolchains may provide CXXFLAGS in the environment, which
+# disables the ?= defaults above. Always require C++20 for std::span, etc.
+# override also handles command-line CXXFLAGS supplied by benchmark scripts.
+override CXXFLAGS += -std=c++20
 LDFLAGS  ?=
 LDLIBS   ?=
 
