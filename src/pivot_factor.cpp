@@ -222,16 +222,23 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         for (int child = symbolic.first_child[first]; child != -1;
              child = symbolic.next_child[child]) {
             const auto& source = contributions[child];
+            // The child-to-front map is invariant over its entire packed
+            // triangle. Compute it once, not for every matrix entry.
+            std::vector<int> child_map;
+            child_map.reserve(source.rows.size());
+            for (const int id : source.rows) {
+                child_map.push_back(static_cast<int>(
+                    std::lower_bound(ids,ids+size,id)-ids));
+            }
             for (std::size_t r = 0; r < source.rows.size(); ++r) {
-                const int lr = static_cast<int>(
-                    std::lower_bound(ids,ids+size,source.rows[r])-ids);
+                const int lr = child_map[r];
                 const std::size_t pr = r+source.origin;
                 const double* const from = source.values.data()+
                     pr*(pr+1)/2+source.origin;
+                double* const to = front_values.data()+
+                    static_cast<std::size_t>(lr)*(lr+1)/2;
                 for (std::size_t c = 0; c <= r; ++c) {
-                    const int lc = static_cast<int>(
-                        std::lower_bound(ids,ids+size,source.rows[c])-ids);
-                    entry(lr,lc) += from[c];
+                    to[child_map[c]] += from[c];
                 }
             }
         }
@@ -253,17 +260,32 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 return false;
             }
             diagonal[j] = pivot;
-            double maximum = std::abs(pivot);
+
+            // Gather the packed panel column once. Process prior pivots as
+            // contiguous SAXPY-style vector updates (the same ascending k
+            // summation order, but no gather inside the k loop).
+            double* const target = multipliers.data()+col;
             for (int r = j+1; r < size; ++r) {
-                double value = entry(r,j);
-                for (int k = 0; k < j; ++k) {
-                    value -= (multipliers[static_cast<std::size_t>(k)*size+r]*
-                              diagonal[k])*
-                              multipliers[static_cast<std::size_t>(k)*size+j];
+                target[r] = entry(r,j);
+            }
+            for (int k = 0; k < j; ++k) {
+                const double* const previous = multipliers.data()+
+                    static_cast<std::size_t>(k)*size;
+                const double factor = diagonal[k]*previous[j];
+#if defined(_OPENMP)
+#pragma omp simd
+#endif
+                for (int r = j+1; r < size; ++r) {
+                    target[r] -= previous[r]*factor;
                 }
+            }
+            double maximum = std::abs(pivot);
+            const double inverse = 1.0/pivot;
+            for (int r = j+1; r < size; ++r) {
+                const double value = target[r];
                 if (!std::isfinite(value)) { return false; }
                 maximum = std::max(maximum,std::abs(value));
-                multipliers[col+r] = value/pivot;
+                target[r] = value*inverse;
             }
             if (std::abs(pivot) < pivot_tolerance*maximum) { return false; }
         }
