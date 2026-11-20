@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -154,6 +156,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     constexpr int chain_limit = 16;
     std::vector<int> chain_last(n, -1);
     std::vector<unsigned char> chain_absorbed(n, 0);
+    std::vector<unsigned char> chain_status(n, 0);
     if (symmetric) {
         for (int first = 0; first < n;) {
             int last = first;
@@ -328,11 +331,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 
     auto process = [&](int owner) {
         if (chain_absorbed[owner]) { return; }
-        if (chain_last[owner] != -1 && try_chain(owner,chain_last[owner])) {
-            for (int id = owner+1; id <= chain_last[owner]; ++id) {
-                chain_absorbed[id] = 1;
+        if (chain_last[owner] != -1) {
+            chain_status[owner] = 1;
+            if (try_chain(owner,chain_last[owner])) {
+                chain_status[owner] = 2;
+                for (int id = owner+1; id <= chain_last[owner]; ++id) {
+                    chain_absorbed[id] = 1;
+                }
+                return;
             }
-            return;
         }
         // An exact unary match can consume a child buffer directly. Delayed
         // rows can change the index set, so check the actual outgoing IDs.
@@ -909,6 +916,20 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     }
     if (rank == 0) { minimum_pivot = 0.0; }
     ready = true;
+    const char* const chain_report = std::getenv("FEMF_LDLT_CHAINS");
+    if (chain_report && chain_report[0] == '1' && chain_report[1] == '\0') {
+        std::size_t attempts = 0, accepted = 0, grouped_pivots = 0;
+        for (int owner = 0; owner < n; ++owner) {
+            if (chain_status[owner]) { ++attempts; }
+            if (chain_status[owner] == 2) {
+                ++accepted;
+                grouped_pivots += static_cast<std::size_t>(chain_last[owner]-owner+1);
+            }
+        }
+        std::fprintf(stderr,
+            "FEMF_LDLT_CHAINS attempted=%zu accepted=%zu grouped_pivots=%zu rank=%d nullity=%d\n",
+            attempts, accepted, grouped_pivots, rank, n-rank);
+    }
 }
 
 /**
