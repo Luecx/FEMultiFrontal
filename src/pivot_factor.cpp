@@ -441,6 +441,15 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             lower_positions.clear();
             PivotBlock block;
             block.size = size;
+            // Every active row can contribute at most one multiplier pair.
+            // Reserve once instead of repeatedly growing two separate vectors
+            // while processing a dense pivot. Small fronts keep their usual
+            // allocation behavior to avoid over-reserving sparse coefficients.
+            if (active_rows.size() >= 32) {
+                const auto maximum = active_rows.size() - static_cast<std::size_t>(size);
+                block.lower_rows.reserve(maximum);
+                block.lower_values.reserve(maximum);
+            }
             for (int p = 0; p < size; ++p) {
                 block.rows[p] = front.rows[pivot_rows[p]];
                 block.columns[p] = front.columns[pivot_columns[p]];
