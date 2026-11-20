@@ -534,7 +534,10 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             // Defer only a dense scalar correction whose exact suffix can be
             // handed to the next owner. Zero multipliers use the immediate
             // path to preserve the original rule for mirroring skipped rows.
-            constexpr int panel_limit = 16;
+            // Larger exact-chain panels amortize packed Schur sweeps.
+            // Keep a conservative ceiling; numerical pivot decisions are
+            // still made after materializing each candidate column.
+            constexpr int panel_limit = 32;
             const int parent = symbolic.parent[owner];
             const bool defer = dense_update && size == 1 && pivot_rows[0] == 0 &&
                 lower_positions.size() == static_cast<std::size_t>(nc-1) &&
