@@ -277,20 +277,30 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
         }
 
+        // Reuse child-index mappings across all extend-adds of this front.
+        // Multi-child fronts previously allocated these temporary vectors
+        // anew for every child contribution.
+        std::vector<int> mapped_rows;
+        std::vector<int> mapped_columns;
+        std::vector<std::size_t> run_ends;
         // Extend-add child residuals, including previously postponed candidate variables
         for (int child = symbolic.first_child[owner]; child != -1; child = symbolic.next_child[child]) {
             if (inherited && child == child_to_reuse) { continue; }
             auto& source = contributions[child];
-            std::vector<int> rows;
-            std::vector<int> columns;
-            for (int id : source.rows) { rows.push_back(assembly_row(id)); }
+            mapped_rows.clear();
+            mapped_columns.clear();
+            mapped_rows.reserve(source.rows.size());
+            for (int id : source.rows) { mapped_rows.push_back(assembly_row(id)); }
             if (!symmetric) {
-                for (int id : source.columns) { columns.push_back(assembly_column(id)); }
+                mapped_columns.reserve(source.columns.size());
+                for (int id : source.columns) { mapped_columns.push_back(assembly_column(id)); }
             }
+            const auto& rows = mapped_rows;
+            const auto& columns = mapped_columns;
             if (symmetric) {
                 // The child-to-parent map is increasing. Build contiguous
                 // spans once, then apply their prefixes to each packed row.
-                std::vector<std::size_t> run_ends;
+                run_ends.clear();
                 if (rows.size() >= 32) {
                     for (std::size_t c = 1; c < rows.size(); ++c) {
                         if (rows[c] != rows[c-1]+1) { run_ends.push_back(c); }
