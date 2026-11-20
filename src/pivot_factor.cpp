@@ -146,7 +146,191 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     std::exception_ptr failure;
     std::vector<std::vector<int>> worker_positions(symmetric ? threads : 0);
     std::vector<std::vector<double>> worker_columns(symmetric ? threads : 0);
+
+    // Amalgamate only exact consecutive unary chains. This is still a
+    // multifrontal tree: each group consumes its children's Schur blocks and
+    // publishes precisely one contribution to its parent. Unstable groups
+    // fall back to the existing dynamic pivoted scalar fronts.
+    constexpr int chain_limit = 16;
+    std::vector<int> chain_last(n, -1);
+    std::vector<unsigned char> chain_absorbed(n, 0);
+    if (symmetric) {
+        for (int first = 0; first < n;) {
+            int last = first;
+            const auto first_size = symbolic.ptr[first+1] - symbolic.ptr[first];
+            while (last-first+1 < chain_limit && last+1 < n &&
+                   symbolic.parent[last] == last+1 &&
+                   symbolic.reuse_child[last+1] == last &&
+                   static_cast<std::size_t>(last-first+1) < first_size &&
+                   symbolic.row[symbolic.ptr[first]+last-first+1] == last+1) {
+                ++last;
+            }
+            if (last > first) { chain_last[first] = last; }
+            first = last+1;
+        }
+    }
+
+    auto try_chain = [&](int first, int last) -> bool {
+        const int width = last-first+1;
+        const auto begin = symbolic.ptr[first];
+        const int size = static_cast<int>(symbolic.ptr[first+1] - begin);
+        if (size <= width || width < 2) { return false; }
+        const int* const ids = symbolic.row.data()+begin;
+
+        // Delayed IDs and pending panels change the frontal index set. Leave
+        // those cases to the original general 1x1/2x2 dynamic front algorithm.
+        // Do not consume any child before the complete group has passed checks.
+        for (int child = symbolic.first_child[first]; child != -1;
+             child = symbolic.next_child[child]) {
+            const auto& contribution = contributions[child];
+            if (!contribution.pending_lower.empty() ||
+                contribution.rows != contribution.columns) { return false; }
+            for (int id : contribution.rows) {
+                if (id <= first || !std::binary_search(ids, ids+size, id)) { return false; }
+            }
+        }
+
+        // Assemble this supernode from the original columns owned by the
+        // grouped scalar nodes and contributions from its children only.
+        // No global sparse update is performed: the result remains a packed
+        // local multifrontal matrix.
+        memory::Values front_values(static_cast<std::size_t>(size)*(size+1)/2, 0.0);
+        auto entry = [&](int r, int c) -> double& {
+            const int hi = std::max(r,c);
+            const int lo = std::min(r,c);
+            return front_values[static_cast<std::size_t>(hi)*(hi+1)/2+lo];
+        };
+        for (int c = first; c <= last; ++c) {
+            const int lc = c-first;
+            for (auto p = lower_start[c]; p < input.ptr[c+1]; ++p) {
+                const int r = input.row[p];
+                const auto where = std::lower_bound(ids,ids+size,r);
+                if (where == ids+size || *where != r) { return false; }
+                entry(static_cast<int>(where-ids),lc) +=
+                    (input.value[p]*row_scale[r])*column_scale[c];
+            }
+        }
+        for (int child = symbolic.first_child[first]; child != -1;
+             child = symbolic.next_child[child]) {
+            const auto& source = contributions[child];
+            for (std::size_t r = 0; r < source.rows.size(); ++r) {
+                const int lr = static_cast<int>(
+                    std::lower_bound(ids,ids+size,source.rows[r])-ids);
+                const std::size_t pr = r+source.origin;
+                const double* const from = source.values.data()+
+                    pr*(pr+1)/2+source.origin;
+                for (std::size_t c = 0; c <= r; ++c) {
+                    const int lc = static_cast<int>(
+                        std::lower_bound(ids,ids+size,source.rows[c])-ids);
+                    entry(lr,lc) += from[c];
+                }
+            }
+        }
+
+        // Factor only the pivot panel. Trailing entries remain untouched until
+        // a single rank-width Schur flush. The same threshold test is applied
+        // to every successively materialized pivot column. Every 1x1 pivot
+        // may be positive or negative; this is LDLT, not an SPD assumption.
+        std::vector<double> multipliers(static_cast<std::size_t>(size)*width,0.0);
+        double diagonal[chain_limit] = {};
+        for (int j = 0; j < width; ++j) {
+            const auto col = static_cast<std::size_t>(j)*size;
+            double pivot = entry(j,j);
+            for (int k = 0; k < j; ++k) {
+                const double lij = multipliers[static_cast<std::size_t>(k)*size+j];
+                pivot -= (lij*diagonal[k])*lij;
+            }
+            if (!std::isfinite(pivot) || std::abs(pivot) <= rank_tolerance) {
+                return false;
+            }
+            diagonal[j] = pivot;
+            double maximum = std::abs(pivot);
+            for (int r = j+1; r < size; ++r) {
+                double value = entry(r,j);
+                for (int k = 0; k < j; ++k) {
+                    value -= (multipliers[static_cast<std::size_t>(k)*size+r]*
+                              diagonal[k])*
+                              multipliers[static_cast<std::size_t>(k)*size+j];
+                }
+                if (!std::isfinite(value)) { return false; }
+                maximum = std::max(maximum,std::abs(value));
+                multipliers[col+r] = value/pivot;
+            }
+            if (std::abs(pivot) < pivot_tolerance*maximum) { return false; }
+        }
+
+        // Convert the accepted panel to the existing PivotBlock format. Lower
+        // multipliers refer to original *permuted* IDs so the current forward
+        // and backward solves keep working without a second factor format.
+        std::vector<PivotBlock> group_records;
+        group_records.reserve(width);
+        for (int j = 0; j < width; ++j) {
+            PivotBlock block;
+            block.rows[0] = block.columns[0] = ids[j];
+            block.diagonal[0] = diagonal[j];
+            const auto col = static_cast<std::size_t>(j)*size;
+            for (int r = j+1; r < size; ++r) {
+                const double lij = multipliers[col+r];
+                if (lij != 0.0) {
+                    block.lower_rows.push_back(ids[r]);
+                    block.lower_values.push_back({lij,0.0});
+                }
+            }
+            group_records.push_back(std::move(block));
+        }
+
+        // Apply the entire accepted panel to the local trailing Schur block
+        // using the pre-existing tiled, rank-k multifrontal kernel.
+        memory::Values lower(static_cast<std::size_t>(width)*size,0.0);
+        memory::Values upper(static_cast<std::size_t>(width)*size,0.0);
+        for (int j = 0; j < width; ++j) {
+            const auto base = static_cast<std::size_t>(j)*size;
+            for (int r = width; r < size; ++r) {
+                const double l = multipliers[base+r];
+                lower[base+r] = l;
+                upper[base+r] = l*diagonal[j];
+            }
+        }
+        dense::flush_scalar_pivot_updates(
+            size,width,size,width,lower.data(),upper.data(),front_values.data());
+
+        // Compact in place and transfer the single outgoing contribution to
+        // the parent of the LAST absorbed scalar node. Children are released
+        // only after successful panel factorization.
+        const int trailing = size-width;
+        auto& output = contributions[last];
+        output.rows.assign(ids+width,ids+size);
+        output.columns = output.rows;
+        std::size_t dest = 0;
+        for (int r = width; r < size; ++r) {
+            const auto from = static_cast<std::size_t>(r)*(r+1)/2+width;
+            for (int c = width; c <= r; ++c) {
+                front_values[dest++] = front_values[from+c-width];
+            }
+        }
+        front_values.resize(static_cast<std::size_t>(trailing)*(trailing+1)/2);
+        output.values = std::move(front_values);
+        output.origin = 0;
+        output.stride = trailing;
+        for (int child = symbolic.first_child[first]; child != -1;
+             child = symbolic.next_child[child]) {
+            contributions[child] = NumericFront{};
+        }
+        for (int j = 0; j < width; ++j) {
+            widths[first+j] = static_cast<std::size_t>(size-j);
+            records[first+j].push_back(std::move(group_records[j]));
+        }
+        return true;
+    };
+
     auto process = [&](int owner) {
+        if (chain_absorbed[owner]) { return; }
+        if (chain_last[owner] != -1 && try_chain(owner,chain_last[owner])) {
+            for (int id = owner+1; id <= chain_last[owner]; ++id) {
+                chain_absorbed[id] = 1;
+            }
+            return;
+        }
         // An exact unary match can consume a child buffer directly. Delayed
         // rows can change the index set, so check the actual outgoing IDs.
         NumericFront front;
