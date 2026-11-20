@@ -277,20 +277,30 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
         }
 
+        // Reuse child-index mappings across all extend-adds of this front.
+        // Multi-child fronts previously allocated these temporary vectors
+        // anew for every child contribution.
+        std::vector<int> mapped_rows;
+        std::vector<int> mapped_columns;
+        std::vector<std::size_t> run_ends;
         // Extend-add child residuals, including previously postponed candidate variables
         for (int child = symbolic.first_child[owner]; child != -1; child = symbolic.next_child[child]) {
             if (inherited && child == child_to_reuse) { continue; }
             auto& source = contributions[child];
-            std::vector<int> rows;
-            std::vector<int> columns;
-            for (int id : source.rows) { rows.push_back(assembly_row(id)); }
+            mapped_rows.clear();
+            mapped_columns.clear();
+            mapped_rows.reserve(source.rows.size());
+            for (int id : source.rows) { mapped_rows.push_back(assembly_row(id)); }
             if (!symmetric) {
-                for (int id : source.columns) { columns.push_back(assembly_column(id)); }
+                mapped_columns.reserve(source.columns.size());
+                for (int id : source.columns) { mapped_columns.push_back(assembly_column(id)); }
             }
+            const auto& rows = mapped_rows;
+            const auto& columns = mapped_columns;
             if (symmetric) {
                 // The child-to-parent map is increasing. Build contiguous
                 // spans once, then apply their prefixes to each packed row.
-                std::vector<std::size_t> run_ends;
+                run_ends.clear();
                 if (rows.size() >= 32) {
                     for (std::size_t c = 1; c < rows.size(); ++c) {
                         if (rows[c] != rows[c-1]+1) { run_ends.push_back(c); }
@@ -328,9 +338,10 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             source = NumericFront{};
         }
         std::vector<int> active_rows(nr);
-        std::vector<int> active_columns(nc);
+        std::vector<int> active_columns(symmetric ? 0 : nc);
         std::iota(active_rows.begin(), active_rows.end(), 0);
-        std::iota(active_columns.begin(), active_columns.end(), 0);
+        if (!symmetric) { std::iota(active_columns.begin(), active_columns.end(), 0); }
+        auto& live_columns = symmetric ? active_rows : active_columns;
 
         // Reuse local positions and contiguous pivot-row coefficients only for
         // sufficiently large symmetric fronts. LU keeps its independent path.
@@ -343,7 +354,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         }
 
         // Only original IDs that have reached this front are fully summed candidates
-        while (!active_rows.empty() && !active_columns.empty()) {
+        while (!active_rows.empty() && !live_columns.empty()) {
             // Active IDs stay sorted after pivot removal. Eligible variables
             // occupy a prefix, so pivot search needs no temporary index lists.
             const auto eligible_end = std::upper_bound(active_rows.begin(), active_rows.end(), owner,
@@ -351,9 +362,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             const std::span<const int> eligible_rows(active_rows.begin(), eligible_end);
             auto eligible_columns = eligible_rows;
             if (!symmetric) {
-                const auto end = std::upper_bound(active_columns.begin(), active_columns.end(), owner,
+                const auto end = std::upper_bound(live_columns.begin(), live_columns.end(), owner,
                     [&](int id, int local) { return id < front.columns[local]; });
-                eligible_columns = std::span<const int>(active_columns.begin(), end);
+                eligible_columns = std::span<const int>(live_columns.begin(), end);
             }
             if (eligible_rows.empty() || eligible_columns.empty()) { break; }
             int pivot_rows[2] = {-1, -1};
@@ -368,7 +379,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     const double magnitude = std::abs(at(r,r));
                     if (!(magnitude > best)) { continue; }
                     double maximum = 0.0;
-                    for (int c : active_columns) { maximum = std::max(maximum, std::abs(at(r,c))); }
+                    for (int c : live_columns) { maximum = std::max(maximum, std::abs(at(r,c))); }
                     if (magnitude >= pivot_tolerance*maximum) {
                         best = magnitude;
                         pivot_rows[0] = pivot_columns[0] = r;
@@ -379,7 +390,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 std::vector<double> row_max(nr, 0.0);
                 std::vector<double> column_max(nc, 0.0);
                 for (int r : eligible_rows) {
-                    for (int c : active_columns) { row_max[r] = std::max(row_max[r], std::abs(at(r,c))); }
+                    for (int c : live_columns) { row_max[r] = std::max(row_max[r], std::abs(at(r,c))); }
                 }
                 for (int c : eligible_columns) {
                     for (int r : active_rows) { column_max[c] = std::max(column_max[c], std::abs(at(r,c))); }
@@ -464,7 +475,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
             }
             std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
-            for (int c : active_columns) {
+            for (int c : live_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
                     if (size == 2) { update_upper[nc+c] = at(pivot_rows[1], c); }
@@ -479,9 +490,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             active_rows.erase(std::remove_if(active_rows.begin(), active_rows.end(), [&](int r) {
                 return r == pivot_rows[0] || (size == 2 && r == pivot_rows[1]);
             }), active_rows.end());
-            active_columns.erase(std::remove_if(active_columns.begin(), active_columns.end(), [&](int c) {
-                return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
-            }), active_columns.end());
+            if (!symmetric) {
+                live_columns.erase(std::remove_if(live_columns.begin(), live_columns.end(), [&](int c) {
+                    return c == pivot_columns[0] || (size == 2 && c == pivot_columns[1]);
+                }), live_columns.end());
+            }
 
             // Defer only a dense scalar correction whose exact suffix can be
             // handed to the next owner. Zero multipliers use the immediate
@@ -517,8 +530,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     static_cast<int>(lower_positions.size()),
                     lower_positions.data(),
                     block.lower_values.data(),
-                    static_cast<int>(active_columns.size()),
-                    active_columns.data(),
+                    static_cast<int>(live_columns.size()),
+                    live_columns.data(),
                     update_upper.data(),
                     update_upper.data()+nc,
                     values
@@ -528,7 +541,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
                     const int r = row_position(block.lower_rows[p]);
                     const auto lower = block.lower_values[p];
-                    for (int c : active_columns) {
+                    for (int c : live_columns) {
                         if (symmetric && c > r) { continue; }
                         at(r, c) -= lower[0] * upper[c][0] + lower[1] * upper[c][1];
                         if (!std::isfinite(at(r, c))) { throw std::runtime_error("Nonfinite pivoted Schur update"); }
@@ -544,7 +557,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             flush_pending();
             double maximum = 0.0;
             for (int r : active_rows) {
-                for (int c : active_columns) { maximum = std::max(maximum, std::abs(at(r, c))); }
+                for (int c : live_columns) { maximum = std::max(maximum, std::abs(at(r, c))); }
             }
             if (maximum > rank_tolerance) {
                 throw std::runtime_error("Unresolved nonzero root block: reduce rank/pivot tolerance; rank is not certified");
@@ -555,7 +568,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 output.rows.push_back(front.rows[r]);
                 if (front.rows[r] <= owner) { ++delays[owner]; }
             }
-            for (int c : active_columns) { output.columns.push_back(front.columns[c]); }
+            for (int c : live_columns) { output.columns.push_back(front.columns[c]); }
             // Move contiguous suffixes on exact links. Compact when half the
             // physical rows have been eliminated to bound retained storage.
             const int parent = symbolic.parent[owner];
@@ -575,16 +588,59 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 output.pending_lower = std::move(front.pending_lower);
                 output.pending_upper = std::move(front.pending_upper);
             } else {
+                // The source front has a single owner. Compact the surviving
+                // Schur block into the beginning of its own buffer instead
+                // of allocating a second matrix and copying into it.
+                //
+                // Active indices are increasing. Consequently the source
+                // address of every entry is >= its compact destination, and
+                // source addresses are visited in increasing order. Forward
+                // compaction therefore cannot overwrite an unread entry.
                 flush_pending();
-                output.stride = static_cast<int>(active_columns.size());
                 const auto rows = active_rows.size();
-                output.values.reserve(symmetric ? rows*(rows+1)/2 : rows*active_columns.size());
-                for (std::size_t r = 0; r < rows; ++r) {
-                    const auto count = symmetric ? r+1 : active_columns.size();
-                    for (std::size_t c = 0; c < count; ++c) {
-                        output.values.push_back(at(active_rows[r],active_columns[c]));
+                const auto columns = live_columns.size();
+                double* const data = front.values.data();
+
+                // For a contiguous trailing set, all columns of each output
+                // row form one physical span. A bulk forward copy avoids
+                // repeated index lookups and packed-triangle arithmetic.
+                const bool consecutive_columns = columns == 0 ||
+                    static_cast<std::size_t>(live_columns.back() - live_columns.front() + 1) == columns;
+                if (symmetric) {
+                    std::size_t dst = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const int source_row = active_rows[r];
+                        if (consecutive_columns) {
+                            const double* const source = &at(source_row, live_columns.front());
+                            // Destination never begins after the source.
+                            std::copy_n(source, r+1, data+dst);
+                            dst += r+1;
+                        } else {
+                            for (std::size_t c = 0; c <= r; ++c) {
+                                data[dst++] = at(source_row, live_columns[c]);
+                            }
+                        }
                     }
+                    front.values.resize(rows*(rows+1)/2);
+                } else {
+                    std::size_t dst = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const int source_row = active_rows[r];
+                        if (consecutive_columns && columns != 0) {
+                            const double* const source = &at(source_row, live_columns.front());
+                            std::copy_n(source, columns, data+dst);
+                            dst += columns;
+                        } else {
+                            for (std::size_t c = 0; c < columns; ++c) {
+                                data[dst++] = at(source_row, live_columns[c]);
+                            }
+                        }
+                    }
+                    front.values.resize(rows*columns);
                 }
+                output.stride = static_cast<int>(columns);
+                output.origin = 0;
+                output.values = std::move(front.values);
             }
         }
     };
