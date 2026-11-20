@@ -575,16 +575,59 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 output.pending_lower = std::move(front.pending_lower);
                 output.pending_upper = std::move(front.pending_upper);
             } else {
+                // The source front has a single owner. Compact the surviving
+                // Schur block into the beginning of its own buffer instead
+                // of allocating a second matrix and copying into it.
+                //
+                // Active indices are increasing. Consequently the source
+                // address of every entry is >= its compact destination, and
+                // source addresses are visited in increasing order. Forward
+                // compaction therefore cannot overwrite an unread entry.
                 flush_pending();
-                output.stride = static_cast<int>(active_columns.size());
                 const auto rows = active_rows.size();
-                output.values.reserve(symmetric ? rows*(rows+1)/2 : rows*active_columns.size());
-                for (std::size_t r = 0; r < rows; ++r) {
-                    const auto count = symmetric ? r+1 : active_columns.size();
-                    for (std::size_t c = 0; c < count; ++c) {
-                        output.values.push_back(at(active_rows[r],active_columns[c]));
+                const auto columns = active_columns.size();
+                double* const data = front.values.data();
+
+                // For a contiguous trailing set, all columns of each output
+                // row form one physical span. A bulk forward copy avoids
+                // repeated index lookups and packed-triangle arithmetic.
+                const bool consecutive_columns = columns == 0 ||
+                    static_cast<std::size_t>(active_columns.back() - active_columns.front() + 1) == columns;
+                if (symmetric) {
+                    std::size_t dst = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const int source_row = active_rows[r];
+                        if (consecutive_columns) {
+                            const double* const source = &at(source_row, active_columns.front());
+                            // Destination never begins after the source.
+                            std::copy_n(source, r+1, data+dst);
+                            dst += r+1;
+                        } else {
+                            for (std::size_t c = 0; c <= r; ++c) {
+                                data[dst++] = at(source_row, active_columns[c]);
+                            }
+                        }
                     }
+                    front.values.resize(rows*(rows+1)/2);
+                } else {
+                    std::size_t dst = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const int source_row = active_rows[r];
+                        if (consecutive_columns && columns != 0) {
+                            const double* const source = &at(source_row, active_columns.front());
+                            std::copy_n(source, columns, data+dst);
+                            dst += columns;
+                        } else {
+                            for (std::size_t c = 0; c < columns; ++c) {
+                                data[dst++] = at(source_row, active_columns[c]);
+                            }
+                        }
+                    }
+                    front.values.resize(rows*columns);
                 }
+                output.stride = static_cast<int>(columns);
+                output.origin = 0;
+                output.values = std::move(front.values);
             }
         }
     };
