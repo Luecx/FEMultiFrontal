@@ -10,19 +10,16 @@
  */
 #include "pivot_factor.h"
 #include "dense_pivot.h"
-#include "factor.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <cstddef>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
-#include <string_view>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -52,18 +49,6 @@ struct NumericFront {
     int origin = 0;
 };
 
-// Cholesky coefficients are the single numerical source of truth on the SPD
-// path. The arena is unused until a caller explicitly materializes the sparse
-// lower multipliers for introspection. Symbolic is owned for solve lifetime.
-struct FastSpdState {
-    std::pmr::monotonic_buffer_resource arena;
-    Factor factor;
-    Symbolic symbolic;
-
-    FastSpdState(Factor&& computed, const Symbolic& plan)
-        : factor(std::move(computed)), symbolic(plan) {}
-};
-
 /**
  * Assemble dynamic fronts and accept stable fully summed numerical pivots.
  *
@@ -88,11 +73,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     const bool symmetric = kind == Kind::Symmetric;
     const int n = input.n;
     matrix = &input;
-    // Release the old blocks before their backing arena; fallback factorizations
-    // must never retain a fast factor from an earlier SPD solve.
     blocks.clear();
-    fast_spd.reset();
-    spd_blocks_materialized = false;
     rank = positive_directions = negative_directions = two_by_two_pivots = 0;
     delayed_candidates = maximum_front = 0;
     minimum_pivot = std::numeric_limits<double>::infinity();
@@ -154,82 +135,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     for (int i = 0; i < n; ++i) {
         row_scale[i]    = row_scale[i] > 0.0 ? 1.0 / std::sqrt(row_scale[i]) : 1.0;
         column_scale[i] = column_scale[i] > 0.0 ? 1.0 / std::sqrt(column_scale[i]) : 1.0;
-    }
-
-    // Experimental optimistic path: use dense SPD panels for stable positive
-    // scalar pivots, but retain the exact LDLT PivotBlock API and diagnostics.
-    // The scalar pivot-policy validation runs before any permanent allocations.
-    if (symmetric && n >= 1024) {
-        Matrix fast_input;
-        fast_input.n = n;
-        fast_input.ptr.reserve(static_cast<std::size_t>(n) + 1);
-        fast_input.ptr.push_back(0);
-        fast_input.row.reserve(input.row.size() / 2 + n);
-        fast_input.value.reserve(input.value.size() / 2 + n);
-        for (int c = 0; c < n; ++c) {
-            for (std::size_t p = lower_start[c]; p < input.ptr[c + 1]; ++p) {
-                const int r = input.row[p];
-                fast_input.row.push_back(r);
-                fast_input.value.push_back((input.value[p] * row_scale[r]) * column_scale[c]);
-            }
-            fast_input.ptr.push_back(fast_input.row.size());
-        }
-
-        Factor fast_factor;
-        fast_factor.threads = threads;
-        bool accepted = true;
-        try {
-            fast_factor.factorize(fast_input, symbolic);
-        } catch (const std::runtime_error& error) {
-            const std::string_view message(error.what());
-            if (message.find("Nonpositive/nonfinite SPD pivot at permuted index") == 0) {
-                accepted = false;
-            } else {
-                throw;
-            }
-        }
-        double fast_minimum = std::numeric_limits<double>::infinity();
-        if (accepted) {
-            for (int c = 0; c < n; ++c) {
-                const auto begin = symbolic.ptr[c];
-                const auto end = symbolic.ptr[c + 1];
-                const double chol_diagonal = fast_factor.value[begin];
-                const double d = chol_diagonal * chol_diagonal;
-                double maximum_off_diagonal = 0.0;
-                for (std::size_t p = begin + 1; p < end; ++p) {
-                    maximum_off_diagonal = std::max(maximum_off_diagonal, std::abs(fast_factor.value[p]));
-                }
-                // S[i,i]=diag^2, S[j,i]=L_chol[j,i]*diag.
-                if (!(d > rank_tolerance) || !std::isfinite(d) ||
-                    !(chol_diagonal >= pivot_tolerance * maximum_off_diagonal)) {
-                    accepted = false;
-                    break;
-                }
-                fast_minimum = std::min(fast_minimum, d);
-            }
-        }
-        if (accepted) {
-            // Preserve public pivot IDs, 1x1 diagonals and postorder for
-            // diagnostics, but don't duplicate the complete Cholesky L in
-            // per-pivot row/value vectors. The SPD solve already uses Factor.
-            auto state = std::make_shared<FastSpdState>(std::move(fast_factor), symbolic);
-            fast_spd = state;
-            blocks.reserve(n);
-            for (int c : symbolic.postorder) {
-                blocks.emplace_back(&state->arena);
-                auto& block = blocks.back();
-                block.rows[0] = block.columns[0] = c;
-                const double chol_diagonal = state->factor.value[symbolic.ptr[c]];
-                block.diagonal[0] = chol_diagonal * chol_diagonal;
-            }
-            rank = positive_directions = n;
-            negative_directions = two_by_two_pivots = 0;
-            delayed_candidates = 0;
-            maximum_front = symbolic.max_front;
-            minimum_pivot = fast_minimum;
-            ready = true;
-            return;
-        }
     }
 
     // Dynamic payloads and accepted records have one writer per original front
@@ -774,35 +679,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
 }
 
 /**
- * Materialize sparse unit-L multipliers when a client needs the complete
- * per-pivot LDLT representation rather than only pivot metadata. These
- * coefficients remain unallocated for normal SPD factorization and solves.
- */
-void PivotFactor::materialize_spd_blocks() {
-    if (!ready) { throw std::runtime_error("Pivot factors are not ready"); }
-    if (!fast_spd || spd_blocks_materialized) { return; }
-    const auto& symbolic = fast_spd->symbolic;
-    const auto& value = fast_spd->factor.value;
-    for (auto& block : blocks) {
-        const int c = block.rows[0];
-        const std::size_t begin = symbolic.ptr[c];
-        const std::size_t end = symbolic.ptr[c + 1];
-        const double diagonal = value[begin];
-        const std::size_t off_diagonal = end - begin - 1;
-        block.lower_rows.reserve(off_diagonal);
-        block.lower_values.reserve(off_diagonal);
-        for (std::size_t p = begin + 1; p < end; ++p) {
-            const double multiplier = value[p] / diagonal;
-            if (multiplier != 0.0) {
-                block.lower_rows.push_back(symbolic.row[p]);
-                block.lower_values.push_back({multiplier, 0.0});
-            }
-        }
-    }
-    spd_blocks_materialized = true;
-}
-
-/**
  * Solve the numerical block factors and check the original unscaled equations.
  *
  * Unpivoted scaled variables are set to zero. A rank-deficient consistent
@@ -820,55 +696,48 @@ std::vector<double> PivotFactor::solve(const std::vector<double>& rhs) const {
         if (!std::isfinite(rhs[i])) { throw std::runtime_error("Nonfinite RHS"); }
         y[i] *= row_scale[i];
     }
-    std::vector<double> x;
-    if (fast_spd) {
-        // The SPD panels already hold the full Cholesky factor. Solve directly
-        // instead of interpreting the same coefficients through PivotBlock.
-        x = fast_spd->factor.solve(fast_spd->symbolic, y);
-    } else {
-        // The general / rank-aware path retains its existing pivoted solve.
-        for (const auto& block : blocks) {
-            const double a = y[block.rows[0]];
-            const double b = block.size == 2 ? y[block.rows[1]] : 0.0;
-            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                y[block.lower_rows[p]] -= block.lower_values[p][0] * a + block.lower_values[p][1] * b;
-            }
+    // Forward substitution for accepted 1x1 / 2x2 blocks.
+    for (const auto& block : blocks) {
+        const double a = y[block.rows[0]];
+        const double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+        for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+            y[block.lower_rows[p]] -= block.lower_values[p][0] * a + block.lower_values[p][1] * b;
         }
+    }
 
-        // Back substitution uses D*L^T for symmetric factors and U for LU.
-        x.assign(matrix->n, 0.0);
-        for (auto item = blocks.rbegin(); item != blocks.rend(); ++item) {
-            const auto& block = *item;
-            double a = y[block.rows[0]];
-            double b = block.size == 2 ? y[block.rows[1]] : 0.0;
-            if (kind == Kind::General) {
-                for (std::size_t p = 0; p < block.upper_columns.size(); ++p) {
-                    a -= block.upper_values[p][0] * x[block.upper_columns[p]];
-                    b -= block.upper_values[p][1] * x[block.upper_columns[p]];
-                }
+    // Back substitution uses D*L^T for symmetric factors and U for LU.
+    std::vector<double> x(matrix->n, 0.0);
+    for (auto item = blocks.rbegin(); item != blocks.rend(); ++item) {
+        const auto& block = *item;
+        double a = y[block.rows[0]];
+        double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+        if (kind == Kind::General) {
+            for (std::size_t p = 0; p < block.upper_columns.size(); ++p) {
+                a -= block.upper_values[p][0] * x[block.upper_columns[p]];
+                b -= block.upper_values[p][1] * x[block.upper_columns[p]];
             }
-            if (block.size == 1) {
-                a /= block.diagonal[0];
-            } else {
-                const double scale = std::max({std::abs(block.diagonal[0]), std::abs(block.diagonal[1]), std::abs(block.diagonal[3])});
-                const double d0 = block.diagonal[0] / scale;
-                const double d1 = block.diagonal[3] / scale;
-                const double off = block.diagonal[1] / scale;
-                const double det = d0 * d1 - off * off;
-                const double first = a / scale;
-                const double second = b / scale;
-                a = (d1 * first - off * second) / det;
-                b = (d0 * second - off * first) / det;
-            }
-            if (kind == Kind::Symmetric) {
-                for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                    a -= block.lower_values[p][0] * x[block.lower_rows[p]];
-                    b -= block.lower_values[p][1] * x[block.lower_rows[p]];
-                }
-            }
-            x[block.columns[0]] = a;
-            if (block.size == 2) { x[block.columns[1]] = b; }
         }
+        if (block.size == 1) {
+            a /= block.diagonal[0];
+        } else {
+            const double scale = std::max({std::abs(block.diagonal[0]), std::abs(block.diagonal[1]), std::abs(block.diagonal[3])});
+            const double d0 = block.diagonal[0] / scale;
+            const double d1 = block.diagonal[3] / scale;
+            const double off = block.diagonal[1] / scale;
+            const double det = d0 * d1 - off * off;
+            const double first = a / scale;
+            const double second = b / scale;
+            a = (d1 * first - off * second) / det;
+            b = (d0 * second - off * first) / det;
+        }
+        if (kind == Kind::Symmetric) {
+            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+                a -= block.lower_values[p][0] * x[block.lower_rows[p]];
+                b -= block.lower_values[p][1] * x[block.lower_rows[p]];
+            }
+        }
+        x[block.columns[0]] = a;
+        if (block.size == 2) { x[block.columns[1]] = b; }
     }
     for (int i = 0; i < matrix->n; ++i) { x[i] *= column_scale[i]; }
 
