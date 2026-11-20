@@ -338,6 +338,10 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         const bool dense_update = symmetric && nc >= 64;
         std::vector<int> lower_positions;
         std::vector<double> update_upper;
+        // Reuse the scalar-pivot upper coefficient scratch for every pivot
+        // accepted in this front. Only live columns are read, and each of
+        // those columns is overwritten before its first use.
+        std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
         if (dense_update) {
             lower_positions.reserve(nr);
             update_upper.resize(2*static_cast<std::size_t>(nc));
@@ -464,7 +468,6 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     block.lower_values.push_back(lower);
                 }
             }
-            std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
             for (int c : live_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
