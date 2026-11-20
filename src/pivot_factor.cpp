@@ -174,10 +174,13 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         const int width = last-first+1;
         const auto begin = symbolic.ptr[first];
         const int size = static_cast<int>(symbolic.ptr[first+1] - begin);
-        if (size <= width || width < 2) { return false; }
+        // Root deflation stays entirely with the original dynamic solver.
+        if (size <= width || width < 2 || symbolic.parent[last] == -1) { return false; }
         const int* const ids = symbolic.row.data()+begin;
 
-        // Delayed IDs and pending panels change the frontal index set. Leave
+        // Delayed IDs below this group's first owner and pending panels change
+        // the frontal index set. Ordinary child updates include the current
+        // owner; those are supported. Leave
         // those cases to the original general 1x1/2x2 dynamic front algorithm.
         // Do not consume any child before the complete group has passed checks.
         for (int child = symbolic.first_child[first]; child != -1;
@@ -186,7 +189,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (!contribution.pending_lower.empty() ||
                 contribution.rows != contribution.columns) { return false; }
             for (int id : contribution.rows) {
-                if (id <= first || !std::binary_search(ids, ids+size, id)) { return false; }
+                if (id < first || !std::binary_search(ids, ids+size, id)) { return false; }
             }
         }
 
