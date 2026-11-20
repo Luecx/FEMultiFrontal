@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -160,6 +161,26 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     std::vector<int> chain_last(n, -1);
     std::vector<unsigned char> chain_absorbed(n, 0);
     std::vector<unsigned char> chain_status(n, 0);
+    const bool chain_profile = [] {
+        const char* value = std::getenv("FEMF_LDLT_CHAIN_PROFILE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    using ChainClock = std::chrono::steady_clock;
+    std::atomic<long long> chain_assembly_ns{0};
+    std::atomic<long long> chain_panel_ns{0};
+    std::atomic<long long> chain_records_ns{0};
+    std::atomic<long long> chain_schur_ns{0};
+    std::atomic<long long> chain_finish_ns{0};
+    std::atomic<std::size_t> chain_success_count{0};
+    std::atomic<std::size_t> chain_trailing_entries{0};
+    auto profile_duration = [&](std::atomic<long long>& sum,
+                                ChainClock::time_point start,
+                                ChainClock::time_point finish) {
+        if (chain_profile) {
+            sum.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                finish-start).count(), std::memory_order_relaxed);
+        }
+    };
     if (symmetric) {
         for (int first = 0; first < n;) {
             int last = first;
@@ -199,6 +220,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
         }
 
+        const auto assembly_begin = chain_profile ? ChainClock::now() : ChainClock::time_point{};
         // Assemble this supernode from the original columns owned by the
         // grouped scalar nodes and contributions from its children only.
         // No global sparse update is performed: the result remains a packed
@@ -243,6 +265,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             }
         }
 
+        const auto panel_begin = chain_profile ? ChainClock::now() : ChainClock::time_point{};
+        profile_duration(chain_assembly_ns, assembly_begin, panel_begin);
         // Factor only the pivot panel. Trailing entries remain untouched until
         // a single rank-width Schur flush. The same threshold test is applied
         // to every successively materialized pivot column. Every 1x1 pivot
@@ -290,6 +314,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (std::abs(pivot) < pivot_tolerance*maximum) { return false; }
         }
 
+        const auto records_begin = chain_profile ? ChainClock::now() : ChainClock::time_point{};
+        profile_duration(chain_panel_ns, panel_begin, records_begin);
         // Convert the accepted panel to the existing PivotBlock format. Lower
         // multipliers refer to original *permuted* IDs so the current forward
         // and backward solves keep working without a second factor format.
@@ -310,6 +336,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             group_records.push_back(std::move(block));
         }
 
+        const auto schur_begin = chain_profile ? ChainClock::now() : ChainClock::time_point{};
+        profile_duration(chain_records_ns, records_begin, schur_begin);
         // Apply the entire accepted panel to the local trailing Schur block
         // using the pre-existing tiled, rank-k multifrontal kernel.
         memory::Values lower(static_cast<std::size_t>(width)*size,0.0);
@@ -325,6 +353,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         dense::flush_scalar_pivot_updates(
             size,width,size,width,lower.data(),upper.data(),front_values.data());
 
+        const auto finish_begin = chain_profile ? ChainClock::now() : ChainClock::time_point{};
+        profile_duration(chain_schur_ns, schur_begin, finish_begin);
         // Compact in place and transfer the single outgoing contribution to
         // the parent of the LAST absorbed scalar node. Children are released
         // only after successful panel factorization.
@@ -350,6 +380,14 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         for (int j = 0; j < width; ++j) {
             widths[first+j] = static_cast<std::size_t>(size-j);
             records[first+j].push_back(std::move(group_records[j]));
+        }
+        if (chain_profile) {
+            const auto finish = ChainClock::now();
+            profile_duration(chain_finish_ns, finish_begin, finish);
+            chain_success_count.fetch_add(1, std::memory_order_relaxed);
+            chain_trailing_entries.fetch_add(
+                static_cast<std::size_t>(trailing)*(trailing+1)/2,
+                std::memory_order_relaxed);
         }
         return true;
     };
@@ -941,6 +979,14 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     }
     if (rank == 0) { minimum_pivot = 0.0; }
     ready = true;
+    if (chain_profile) {
+        std::fprintf(stderr,
+            "FEMF_LDLT_CHAIN_PROFILE groups=%zu trailing_entries=%zu assembly_ms=%.6f panel_ms=%.6f records_ms=%.6f schur_ms=%.6f finish_ms=%.6f\n",
+            chain_success_count.load(), chain_trailing_entries.load(),
+            chain_assembly_ns.load()/1e6, chain_panel_ns.load()/1e6,
+            chain_records_ns.load()/1e6, chain_schur_ns.load()/1e6,
+            chain_finish_ns.load()/1e6);
+    }
     const char* const chain_report = std::getenv("FEMF_LDLT_CHAINS");
     if (chain_report && chain_report[0] == '1' && chain_report[1] == '\0') {
         std::size_t attempts = 0, accepted = 0, grouped_pivots = 0;
