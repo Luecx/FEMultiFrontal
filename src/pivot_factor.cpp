@@ -154,6 +154,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     // publishes precisely one contribution to its parent. Unstable groups
     // fall back to the existing dynamic pivoted scalar fronts.
     constexpr int chain_limit = 16;
+    // Short panels pay for an extra dense front assembly and speculative
+    // factorization without enough saved scalar-front transitions.
+    constexpr int minimum_chain_width = 8;
     std::vector<int> chain_last(n, -1);
     std::vector<unsigned char> chain_absorbed(n, 0);
     std::vector<unsigned char> chain_status(n, 0);
@@ -168,7 +171,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                    symbolic.row[symbolic.ptr[first]+last-first+1] == last+1) {
                 ++last;
             }
-            if (last > first) { chain_last[first] = last; }
+            if (last-first+1 >= minimum_chain_width) { chain_last[first] = last; }
             first = last+1;
         }
     }
