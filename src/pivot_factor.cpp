@@ -575,16 +575,45 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 output.pending_lower = std::move(front.pending_lower);
                 output.pending_upper = std::move(front.pending_upper);
             } else {
+                // The source front has a single owner. Compact the surviving
+                // Schur block into the beginning of its own buffer instead
+                // of allocating a second matrix and copying into it.
+                //
+                // Active indices are increasing. Consequently the source
+                // address of every entry is >= its compact destination, and
+                // source addresses are visited in increasing order. Forward
+                // compaction therefore cannot overwrite an unread entry.
                 flush_pending();
-                output.stride = static_cast<int>(active_columns.size());
                 const auto rows = active_rows.size();
-                output.values.reserve(symmetric ? rows*(rows+1)/2 : rows*active_columns.size());
-                for (std::size_t r = 0; r < rows; ++r) {
-                    const auto count = symmetric ? r+1 : active_columns.size();
-                    for (std::size_t c = 0; c < count; ++c) {
-                        output.values.push_back(at(active_rows[r],active_columns[c]));
+                const auto columns = active_columns.size();
+                double* const data = front.values.data();
+
+                if (symmetric) {
+                    // A compact lower triangle has row lengths 1, 2, ..., m.
+                    // The at() accessor retains the original physical layout.
+                    std::size_t dst = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const int source_row = active_rows[r];
+                        for (std::size_t c = 0; c <= r; ++c) {
+                            data[dst++] = at(source_row, active_columns[c]);
+                        }
                     }
+                    front.values.resize(rows*(rows+1)/2);
+                } else {
+                    // LU has independent row and column sets but the same
+                    // monotone source/destination ordering in row-major form.
+                    std::size_t dst = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const int source_row = active_rows[r];
+                        for (std::size_t c = 0; c < columns; ++c) {
+                            data[dst++] = at(source_row, active_columns[c]);
+                        }
+                    }
+                    front.values.resize(rows*columns);
                 }
+                output.stride = static_cast<int>(columns);
+                output.origin = 0;
+                output.values = std::move(front.values);
             }
         }
     };
