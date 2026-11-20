@@ -13,7 +13,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -60,6 +63,12 @@ struct NumericFront {
  * is assumed. A nonzero unresolved root is an error, not an invented nullmode.
  */
 void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic) {
+    // Optional local phase profiling. Never changes numeric decisions, and
+    // prints to stderr to preserve benchmark harness CSV on stdout.
+    using ProfileClock = std::chrono::steady_clock;
+    const auto profile_env = std::getenv("FEMF_PROFILE_LDLT");
+    const bool profiling = profile_env && profile_env[0] == '1' && profile_env[1] == '\0';
+    const auto factor_start = profiling ? ProfileClock::now() : ProfileClock::time_point{};
     // Validate mode, tolerances and the structural ownership contract
     ready = false;
     if (rank_tolerance <= 0.0 || !std::isfinite(rank_tolerance) || pivot_tolerance <= 0.0 ||
@@ -137,6 +146,26 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         column_scale[i] = column_scale[i] > 0.0 ? 1.0 / std::sqrt(column_scale[i]) : 1.0;
     }
 
+    // These per-owner records are independent even when task scheduling moves
+    // work between OpenMP threads. Values are *sum of front wall times*, not
+    // non-overlapping global wall durations; overlapping tasks may sum to more
+    // than the factorization's wall time.
+    struct PhaseRecord {
+        double assembly = 0.0;
+        double search = 0.0;
+        double pivot = 0.0;
+        double update = 0.0;
+        double finish = 0.0;
+        std::size_t scalar_pivots = 0;
+        std::size_t block_pivots = 0;
+        std::size_t deferred_pivots = 0;
+    };
+    std::vector<PhaseRecord> phases(profiling ? n : 0);
+    const auto prepass_end = profiling ? ProfileClock::now() : ProfileClock::time_point{};
+    const auto elapsed = [](auto from, auto to) {
+        return std::chrono::duration<double>(to - from).count();
+    };
+
     // Dynamic payloads and accepted records have one writer per original front
     std::vector<NumericFront> contributions(n);
     std::vector<std::vector<PivotBlock>> records(n);
@@ -147,6 +176,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     std::vector<std::vector<int>> worker_positions(symmetric ? threads : 0);
     std::vector<std::vector<double>> worker_columns(symmetric ? threads : 0);
     auto process = [&](int owner) {
+        const auto front_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
+        PhaseRecord* phase = profiling ? &phases[owner] : nullptr;
         // An exact unary match can consume a child buffer directly. Delayed
         // rows can change the index set, so check the actual outgoing IDs.
         NumericFront front;
@@ -343,7 +374,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         }
 
         // Only original IDs that have reached this front are fully summed candidates
+        const auto assembly_end = profiling ? ProfileClock::now() : ProfileClock::time_point{};
+        if (profiling) { phase->assembly += elapsed(front_begin, assembly_end); }
+        auto finish_begin = assembly_end;
         while (!active_rows.empty() && !active_columns.empty()) {
+            const auto search_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
             // Active IDs stay sorted after pivot removal. Eligible variables
             // occupy a prefix, so pivot search needs no temporary index lists.
             const auto eligible_end = std::upper_bound(active_rows.begin(), active_rows.end(), owner,
@@ -434,7 +469,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     }
                 }
             }
+            if (profiling) {
+                phase->search += elapsed(search_begin, ProfileClock::now());
+            }
             if (pivot_rows[0] == -1) { break; }
+            const auto pivot_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
 
             // Store the accepted pivot and its normalized lower multipliers
             lower_positions.clear();
@@ -496,6 +535,13 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 symbolic.reuse_child[parent] == owner &&
                 std::equal(front.rows.begin()+1, front.rows.end(),
                            symbolic.row.begin() + symbolic.ptr[parent], symbolic.row.begin() + symbolic.ptr[parent+1]);
+            if (profiling) {
+                phase->pivot += elapsed(pivot_begin, ProfileClock::now());
+                if (size == 1) { ++phase->scalar_pivots; }
+                else { ++phase->block_pivots; }
+                if (defer) { ++phase->deferred_pivots; }
+            }
+            const auto update_begin = profiling ? ProfileClock::now() : ProfileClock::time_point{};
             if (defer) {
                 const auto base = front.pending_lower.size();
                 front.pending_lower.resize(base+front.stride);
@@ -536,7 +582,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
             }
             records[owner].push_back(std::move(block));
+            if (profiling) { phase->update += elapsed(update_begin, ProfileClock::now()); }
         }
+        if (profiling) { finish_begin = ProfileClock::now(); }
 
         // Delay unresolved candidates, or deflate only a numerically zero root block
         const bool root = symbolic.parent[owner] == -1;
@@ -587,6 +635,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
             }
         }
+        if (profiling) { phase->finish += elapsed(finish_begin, ProfileClock::now()); }
     };
 
     // Schedule coarse independent subtrees; pivot selection remains local and deterministic
@@ -676,6 +725,30 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     }
     if (rank == 0) { minimum_pivot = 0.0; }
     ready = true;
+    if (profiling) {
+        PhaseRecord sum;
+        for (const auto& p : phases) {
+            sum.assembly += p.assembly;
+            sum.search += p.search;
+            sum.pivot += p.pivot;
+            sum.update += p.update;
+            sum.finish += p.finish;
+            sum.scalar_pivots += p.scalar_pivots;
+            sum.block_pivots += p.block_pivots;
+            sum.deferred_pivots += p.deferred_pivots;
+        }
+        const auto factor_end = ProfileClock::now();
+        std::fprintf(stderr,
+            "FEMF_LDLT_PROFILE total_wall_s=%.9f prepass_wall_s=%.9f "
+            "assembly_work_s=%.9f search_work_s=%.9f pivot_work_s=%.9f "
+            "update_work_s=%.9f finish_work_s=%.9f "
+            "pivots_1x1=%zu pivots_2x2=%zu deferred_scalar=%zu "
+            "threads=%d rank=%d nullity=%d\n",
+            elapsed(factor_start, factor_end), elapsed(factor_start, prepass_end),
+            sum.assembly, sum.search, sum.pivot, sum.update, sum.finish,
+            sum.scalar_pivots, sum.block_pivots, sum.deferred_pivots,
+            threads, rank, n - rank);
+    }
 }
 
 /**
