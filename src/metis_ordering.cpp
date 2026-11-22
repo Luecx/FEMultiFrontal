@@ -9,6 +9,8 @@
 #include "metis_ordering.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <string>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
