@@ -8,6 +8,7 @@
  */
 #include "factor.h"
 #include "ordering.h"
+#include "metis_ordering.h"
 #include "pivot_driver.h"
 
 #include <algorithm>
@@ -38,7 +39,7 @@ int main(int argc, char** argv) {
     try {
         // Parse the small standalone command line before opening the matrix
         if (argc < 2) {
-            std::cerr << "Usage: mfsolve matrix.mtx [--repeat N] [--ordering nd|natural]"
+            std::cerr << "Usage: mfsolve matrix.mtx [--repeat N] [--ordering nd|metis|natural]"
                          " [--update-block N]"
                          " [--schur-kernel baseline|packed|compare]"
                          " [--threads N] [--thread-sweep]"
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
             }
         }
         if (repeat < 1 || update_block < 1 || update_block > 256 ||
-            (ordering != "nd" && ordering != "natural")) {
+            (ordering != "nd" && ordering != "metis" && ordering != "natural")) {
             throw std::runtime_error("Invalid repeat, update block, or ordering method");
         }
         if (!std::isfinite(reference_s) || reference_s < 0.0) {
@@ -140,6 +141,8 @@ int main(int argc, char** argv) {
         std::vector<int> order(matrix.n);
         if (ordering == "nd") {
             order = mf::nested_dissection(matrix, thread_count);
+        } else if (ordering == "metis") {
+            order = mf::metis_nested_dissection(matrix);
         } else {
             std::iota(order.begin(), order.end(), 0);
         }
