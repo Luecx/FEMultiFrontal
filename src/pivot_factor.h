@@ -12,6 +12,7 @@
 #include "symbolic.h"
 
 #include <array>
+#include <cstddef>
 
 namespace mf {
 
@@ -32,6 +33,23 @@ struct PivotBlock {
     std::vector<std::array<double, 2>> lower_values;
     std::vector<int> upper_columns;
     std::vector<std::array<double, 2>> upper_values;
+};
+
+/**
+ * @brief Contiguous symmetric LDLT pivot metadata.
+ *
+ * The multipliers for a pivot occupy [lower_begin,lower_begin+lower_count)
+ * in packed_lower_rows and the corresponding values start at value_begin.
+ * Scalar pivots store one coefficient per row; 2x2 pivots store two.
+ * This avoids per-pivot heap allocations in the blocked LDLT path.
+ */
+struct PackedSymmetricPivot {
+    int size = 1;
+    std::array<int, 2> rows{-1, -1};
+    std::array<double, 4> diagonal{};
+    std::size_t lower_begin = 0;
+    std::size_t value_begin = 0;
+    std::size_t lower_count = 0;
 };
 
 /**
@@ -58,8 +76,14 @@ struct PivotFactor {
     // 1 selects the original scalar LDLT; >=2 enables blocked multifrontal LDLT.
     int    block_size      = 32;
 
-    // Accepted scalar/2x2 pivots and complete lower/upper coefficients.
+    // Legacy per-pivot representation for scalar LDLT and general LU.
     std::vector<PivotBlock> blocks;
+
+    // Blocked symmetric LDLT: contiguous metadata, row IDs, and multipliers.
+    // The one/two values per row depend on PackedSymmetricPivot::size.
+    std::vector<PackedSymmetricPivot> packed_blocks;
+    std::vector<int> packed_lower_rows;
+    std::vector<double> packed_lower_values;
     int rank                 = 0;
     int positive_directions  = 0;
     int negative_directions  = 0;

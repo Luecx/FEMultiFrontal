@@ -44,6 +44,14 @@ struct BlockFront {
     int stride = 0;
 };
 
+// One writer per front: scalar pivot headers and all multiplier entries are
+// appended into shared front-local arrays, with no allocations per pivot.
+struct FrontPivotRecords {
+    std::vector<PackedSymmetricPivot> blocks;
+    std::vector<int> lower_rows;
+    std::vector<double> lower_values;
+};
+
 // Each accepted scalar column of a 1x1/2x2 pivot is stored independently.
 // left and right are rank-major arrays with physical stride dim. Their product
 // reconstructs the Schur correction in the accepted pivot order.
@@ -247,6 +255,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     const int n = input.n;
     factor.matrix = &input;
     factor.blocks.clear();
+    factor.packed_blocks.clear();
+    factor.packed_lower_rows.clear();
+    factor.packed_lower_values.clear();
     factor.rank = factor.positive_directions = factor.negative_directions =
         factor.two_by_two_pivots = 0;
     factor.delayed_candidates = factor.maximum_front = 0;
@@ -303,7 +314,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     }
 
     std::vector<BlockFront> contributions(n);
-    std::vector<std::vector<PivotBlock>> records(n);
+    std::vector<FrontPivotRecords> records(n);
     std::vector<std::size_t> delays(n, 0), widths(n, 0), panels(n, 0), groups(n, 0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
@@ -319,6 +330,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             if (node == owner) { break; }
         }
         groups[owner] = 1;
+        records[owner].blocks.reserve(members.size());
 
         BlockFront front;
         const auto first = symbolic.row.begin() + symbolic.ptr[bottom];
@@ -494,10 +506,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
             if (pivots[0] == -1) { break; }
 
-            PivotBlock block;
+            PackedSymmetricPivot block;
             block.size = count;
+            auto& owner_records = records[owner];
+            block.lower_begin = owner_records.lower_rows.size();
+            block.value_begin = owner_records.lower_values.size();
             for (int p = 0; p < count; ++p) {
-                block.rows[p] = block.columns[p] = front.rows[pivots[p]];
+                block.rows[p] = front.rows[pivots[p]];
                 for (int q = 0; q < count; ++q) {
                     block.diagonal[2*p+q] = current(pivots[p],pivots[q]);
                 }
@@ -537,15 +552,17 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     const auto base = static_cast<std::size_t>(base_rank) * width;
                     panel.left[base+r] = lower[0];
                     if (count == 2) { panel.left[base+width+r] = lower[1]; }
-                    block.lower_rows.push_back(front.rows[r]);
-                    block.lower_values.push_back(lower);
+                    owner_records.lower_rows.push_back(front.rows[r]);
+                    owner_records.lower_values.push_back(lower[0]);
+                    if (count == 2) { owner_records.lower_values.push_back(lower[1]); }
                 }
             }
             panel.rank += count;
             active.erase(std::remove_if(active.begin(), active.end(), [&](int r) {
                 return r == pivots[0] || (count == 2 && r == pivots[1]);
             }),active.end());
-            records[owner].push_back(std::move(block));
+            block.lower_count = owner_records.lower_rows.size() - block.lower_begin;
+            owner_records.blocks.push_back(block);
         }
         flush();
 
@@ -655,12 +672,33 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     { for (int root : symbolic.roots) { visit(root,0); } }
     if (failure) { std::rethrow_exception(failure); }
 
+    // Build a single, contiguous factor representation in elimination order.
+    // Reserve once after all parallel fronts have finished to avoid reallocations
+    // and preserve the original symbolic postorder across independent subtrees.
+    std::size_t block_total = 0, row_total = 0, value_total = 0;
+    for (const auto& record : records) {
+        block_total += record.blocks.size();
+        row_total += record.lower_rows.size();
+        value_total += record.lower_values.size();
+    }
+    factor.packed_blocks.reserve(block_total);
+    factor.packed_lower_rows.reserve(row_total);
+    factor.packed_lower_values.reserve(value_total);
     for (int owner : symbolic.postorder) {
         factor.delayed_candidates += delays[owner];
         factor.maximum_front = std::max(factor.maximum_front, widths[owner]);
         factor.blocked_panels += panels[owner];
         factor.grouped_fronts += groups[owner];
-        for (auto& block : records[owner]) {
+        const auto& record = records[owner];
+        const std::size_t row_offset = factor.packed_lower_rows.size();
+        const std::size_t value_offset = factor.packed_lower_values.size();
+        factor.packed_lower_rows.insert(factor.packed_lower_rows.end(),
+                                        record.lower_rows.begin(), record.lower_rows.end());
+        factor.packed_lower_values.insert(factor.packed_lower_values.end(),
+                                          record.lower_values.begin(), record.lower_values.end());
+        for (auto block : record.blocks) {
+            block.lower_begin += row_offset;
+            block.value_begin += value_offset;
             factor.rank += block.size;
             if (block.size == 1) {
                 factor.minimum_pivot = std::min(
@@ -686,7 +724,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 factor.minimum_pivot = std::min({
                     factor.minimum_pivot,std::abs(large)*scale,std::abs(small)*scale});
             }
-            factor.blocks.push_back(std::move(block));
+            factor.packed_blocks.push_back(block);
         }
     }
     if (factor.rank == 0) { factor.minimum_pivot = 0.0; }

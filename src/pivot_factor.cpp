@@ -79,6 +79,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     const int n = input.n;
     matrix = &input;
     blocks.clear();
+    packed_blocks.clear();
+    packed_lower_rows.clear();
+    packed_lower_values.clear();
     rank = positive_directions = negative_directions = two_by_two_pivots = 0;
     delayed_candidates = maximum_front = 0;
     minimum_pivot = std::numeric_limits<double>::infinity();
@@ -701,48 +704,105 @@ std::vector<double> PivotFactor::solve(const std::vector<double>& rhs) const {
         if (!std::isfinite(rhs[i])) { throw std::runtime_error("Nonfinite RHS"); }
         y[i] *= row_scale[i];
     }
-    // Forward substitution for accepted 1x1 / 2x2 blocks.
-    for (const auto& block : blocks) {
-        const double a = y[block.rows[0]];
-        const double b = block.size == 2 ? y[block.rows[1]] : 0.0;
-        for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-            y[block.lower_rows[p]] -= block.lower_values[p][0] * a + block.lower_values[p][1] * b;
+    // The blocked symmetric path stores its factors as contiguous arrays,
+    // avoiding per-pivot vector allocations and reducing scalar-pivot storage.
+    if (!packed_blocks.empty()) {
+        for (const auto& block : packed_blocks) {
+            const double a = y[block.rows[0]];
+            if (block.size == 1) {
+                for (std::size_t p = 0; p < block.lower_count; ++p) {
+                    y[packed_lower_rows[block.lower_begin + p]] -=
+                        packed_lower_values[block.value_begin + p] * a;
+                }
+            } else {
+                const double b = y[block.rows[1]];
+                for (std::size_t p = 0; p < block.lower_count; ++p) {
+                    const auto v = block.value_begin + 2 * p;
+                    y[packed_lower_rows[block.lower_begin + p]] -=
+                        packed_lower_values[v] * a + packed_lower_values[v + 1] * b;
+                }
+            }
+        }
+    } else {
+        // Legacy scalar symmetric LDLT and general LU.
+        for (const auto& block : blocks) {
+            const double a = y[block.rows[0]];
+            const double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+                y[block.lower_rows[p]] -= block.lower_values[p][0] * a + block.lower_values[p][1] * b;
+            }
         }
     }
 
     // Back substitution uses D*L^T for symmetric factors and U for LU.
     std::vector<double> x(matrix->n, 0.0);
-    for (auto item = blocks.rbegin(); item != blocks.rend(); ++item) {
-        const auto& block = *item;
-        double a = y[block.rows[0]];
-        double b = block.size == 2 ? y[block.rows[1]] : 0.0;
-        if (kind == Kind::General) {
-            for (std::size_t p = 0; p < block.upper_columns.size(); ++p) {
-                a -= block.upper_values[p][0] * x[block.upper_columns[p]];
-                b -= block.upper_values[p][1] * x[block.upper_columns[p]];
+    if (!packed_blocks.empty()) {
+        for (auto item = packed_blocks.rbegin(); item != packed_blocks.rend(); ++item) {
+            const auto& block = *item;
+            double a = y[block.rows[0]];
+            double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+            if (block.size == 1) {
+                a /= block.diagonal[0];
+                for (std::size_t p = 0; p < block.lower_count; ++p) {
+                    a -= packed_lower_values[block.value_begin + p] *
+                         x[packed_lower_rows[block.lower_begin + p]];
+                }
+            } else {
+                const double scale = std::max({std::abs(block.diagonal[0]),
+                                               std::abs(block.diagonal[1]),
+                                               std::abs(block.diagonal[3])});
+                const double d0 = block.diagonal[0] / scale;
+                const double d1 = block.diagonal[3] / scale;
+                const double off = block.diagonal[1] / scale;
+                const double det = d0 * d1 - off * off;
+                const double first = a / scale;
+                const double second = b / scale;
+                a = (d1 * first - off * second) / det;
+                b = (d0 * second - off * first) / det;
+                for (std::size_t p = 0; p < block.lower_count; ++p) {
+                    const auto v = block.value_begin + 2 * p;
+                    const double tail = x[packed_lower_rows[block.lower_begin + p]];
+                    a -= packed_lower_values[v] * tail;
+                    b -= packed_lower_values[v + 1] * tail;
+                }
             }
+            x[block.rows[0]] = a;
+            if (block.size == 2) { x[block.rows[1]] = b; }
         }
-        if (block.size == 1) {
-            a /= block.diagonal[0];
-        } else {
-            const double scale = std::max({std::abs(block.diagonal[0]), std::abs(block.diagonal[1]), std::abs(block.diagonal[3])});
-            const double d0 = block.diagonal[0] / scale;
-            const double d1 = block.diagonal[3] / scale;
-            const double off = block.diagonal[1] / scale;
-            const double det = d0 * d1 - off * off;
-            const double first = a / scale;
-            const double second = b / scale;
-            a = (d1 * first - off * second) / det;
-            b = (d0 * second - off * first) / det;
-        }
-        if (kind == Kind::Symmetric) {
-            for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                a -= block.lower_values[p][0] * x[block.lower_rows[p]];
-                b -= block.lower_values[p][1] * x[block.lower_rows[p]];
+    } else {
+        // Legacy scalar symmetric LDLT and general LU.
+        for (auto item = blocks.rbegin(); item != blocks.rend(); ++item) {
+            const auto& block = *item;
+            double a = y[block.rows[0]];
+            double b = block.size == 2 ? y[block.rows[1]] : 0.0;
+            if (kind == Kind::General) {
+                for (std::size_t p = 0; p < block.upper_columns.size(); ++p) {
+                    a -= block.upper_values[p][0] * x[block.upper_columns[p]];
+                    b -= block.upper_values[p][1] * x[block.upper_columns[p]];
+                }
             }
+            if (block.size == 1) {
+                a /= block.diagonal[0];
+            } else {
+                const double scale = std::max({std::abs(block.diagonal[0]), std::abs(block.diagonal[1]), std::abs(block.diagonal[3])});
+                const double d0 = block.diagonal[0] / scale;
+                const double d1 = block.diagonal[3] / scale;
+                const double off = block.diagonal[1] / scale;
+                const double det = d0 * d1 - off * off;
+                const double first = a / scale;
+                const double second = b / scale;
+                a = (d1 * first - off * second) / det;
+                b = (d0 * second - off * first) / det;
+            }
+            if (kind == Kind::Symmetric) {
+                for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
+                    a -= block.lower_values[p][0] * x[block.lower_rows[p]];
+                    b -= block.lower_values[p][1] * x[block.lower_rows[p]];
+                }
+            }
+            x[block.columns[0]] = a;
+            if (block.size == 2) { x[block.columns[1]] = b; }
         }
-        x[block.columns[0]] = a;
-        if (block.size == 2) { x[block.columns[1]] = b; }
     }
     for (int i = 0; i < matrix->n; ++i) { x[i] *= column_scale[i]; }
 
