@@ -337,12 +337,14 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         const bool dense_update = symmetric && nc >= 64;
         std::vector<int> lower_positions;
         std::vector<double> update_upper;
-        // Retain local indices for scalar as well as dense symmetric updates.
-        if (symmetric) { lower_positions.reserve(nr); }
-        if (dense_update) { update_upper.resize(2*static_cast<std::size_t>(nc)); }
-        // Reuse small-front pivot-row coefficients across pivots in this front.
+        // Dense updates use local row positions. The small-front path below
+        // walks active_rows and lower_rows in sorted order without extra maps.
+        if (dense_update) {
+            lower_positions.reserve(nr);
+            update_upper.resize(2*static_cast<std::size_t>(nc));
+        }
+        // Allocate only if a pivot is accepted, then reuse across the front.
         std::vector<std::array<double, 2>> upper;
-        if (!dense_update) { upper.resize(nc); }
 
         // Only original IDs that have reached this front are fully summed candidates
         while (!active_rows.empty() && !active_columns.empty()) {
@@ -469,11 +471,12 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                         std::array<double, 2>{(x * d - y * b) / det, (y * a - x * b) / det};
                 }
                 if (lower[0] != 0.0 || lower[1] != 0.0) {
-                    if (symmetric) { lower_positions.push_back(r); }
+                    if (dense_update) { lower_positions.push_back(r); }
                     block.lower_rows.push_back(front.rows[r]);
                     block.lower_values.push_back(lower);
                 }
             }
+            if (!dense_update) { upper.resize(nc); }
             for (int c : active_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
@@ -535,9 +538,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 );
             } else if (!defer) {
                 // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
-                for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                    const int r = symmetric ? lower_positions[p] : row_position(block.lower_rows[p]);
-                    const auto lower = block.lower_values[p];
+                std::size_t p = 0;
+                for (int r : active_rows) {
+                    if (p == block.lower_rows.size()) { break; }
+                    if (front.rows[r] != block.lower_rows[p]) { continue; }
+                    const auto lower = block.lower_values[p++];
                     for (int c : active_columns) {
                         if (symmetric && c > r) { continue; }
                         at(r, c) -= lower[0] * upper[c][0] + lower[1] * upper[c][1];
