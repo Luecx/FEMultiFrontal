@@ -57,6 +57,8 @@ struct PivotFactor {
     int    threads         = 1;
     // 1 selects the original scalar LDLT; >=2 enables blocked multifrontal LDLT.
     int    block_size      = 32;
+    // 0 preserves the original grouping policy (same as block_size).
+    int    supernode_size  = 0;
 
     // Accepted scalar/2x2 pivots and complete lower/upper coefficients.
     std::vector<PivotBlock> blocks;
