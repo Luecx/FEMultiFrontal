@@ -266,6 +266,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         factor.two_by_two_pivots = 0;
     factor.delayed_candidates = factor.maximum_front = 0;
     factor.blocked_panels = factor.grouped_fronts = 0;
+    factor.fast_path_pivots = factor.fallback_searches = factor.relaxed_groups = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
