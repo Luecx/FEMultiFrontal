@@ -1,0 +1,21 @@
+name: Blocked LDLT
+on:
+  push:
+    branches: [perf/ldlt-blocked-multifrontal]
+  workflow_dispatch:
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run regression tests (single threaded)
+        run: |
+          make -j2 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
+      - name: Test scalar and blocked solver entry points
+        run: |
+          ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 1
+          ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32
+      - name: Compile and run OpenMP regressions
+        run: |
+          make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
