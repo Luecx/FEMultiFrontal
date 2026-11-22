@@ -75,6 +75,11 @@ struct PivotFactor {
     int    threads         = 1;
     // 1 selects the original scalar LDLT; >=2 enables blocked multifrontal LDLT.
     int    block_size      = 32;
+    // Independent performance switches permit exact A/B comparisons.
+    // The general LU and scalar LDLT paths are unaffected.
+    bool fast_pivoting = true;
+    bool tiled_schur = true;
+    bool relaxed_supernodes = true;
 
     // Legacy per-pivot representation for scalar LDLT and general LU.
     std::vector<PivotBlock> blocks;
@@ -92,6 +97,9 @@ struct PivotFactor {
     std::size_t maximum_front      = 0;
     std::size_t blocked_panels      = 0;
     std::size_t grouped_fronts     = 0;
+    std::size_t fast_path_pivots   = 0;
+    std::size_t fallback_searches  = 0;
+    std::size_t relaxed_groups     = 0;
     double minimum_pivot          = 0.0;
 
     // Matrix lifetime and scaling in equation and variable spaces
