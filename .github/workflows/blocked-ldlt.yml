@@ -1,7 +1,7 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [main, perf/ldlt-blocked-multifrontal]
+    branches: [main, perf/ldlt-blocked-multifrontal, perf/ldlt-reuse-pivot-coupling]
   pull_request:
     branches: [main]
   workflow_dispatch:
