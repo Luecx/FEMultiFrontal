@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile and run regression tests (single threaded)
         run: |
-          make -j2 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
+          make -j2 all check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
       - name: Test scalar and blocked solver entry points
         run: |
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 1
