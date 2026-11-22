@@ -57,6 +57,15 @@ struct PivotFactor {
     int    threads         = 1;
     // 1 selects the original scalar LDLT; >=2 enables blocked multifrontal LDLT.
     int    block_size      = 32;
+    // Optional breakdown of numerical factorization phases (per-front summed
+    // elapsed times; use threads=1 for comparison with wall-clock timings).
+    bool   profile_phases  = false;
+    double profile_assembly_s = 0.0;
+    double profile_search_s   = 0.0;
+    double profile_panel_s    = 0.0;
+    double profile_schur_s    = 0.0;
+    double profile_other_s    = 0.0;
+    double profile_fronts_s   = 0.0;
 
     // Accepted scalar/2x2 pivots and complete lower/upper coefficients.
     std::vector<PivotBlock> blocks;
