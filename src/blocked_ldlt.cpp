@@ -499,9 +499,14 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             // If it fails, preserve the original exhaustive threshold search
             // and 2x2 fallback without changing either acceptance criterion.
             if (factor.fast_pivoting) {
-                const int r = active.front();
-                const double magnitude = std::abs(current(r,r));
-                if (magnitude > factor.rank_tolerance) {
+                // A delayed near-zero candidate may remain at the beginning
+                // of active for many steps. Inspect a short lookahead instead
+                // of re-running the exhaustive search every such iteration.
+                const std::size_t lookahead = std::min<std::size_t>(eligible_count,8);
+                for (std::size_t i = 0; i < lookahead; ++i) {
+                    const int r = active[i];
+                    const double magnitude = std::abs(current(r,r));
+                    if (!(magnitude > factor.rank_tolerance)) { continue; }
                     double maximum = magnitude;
                     for (int c : active) {
                         maximum = std::max(maximum,std::abs(current(r,c)));
@@ -510,6 +515,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     if (magnitude >= factor.pivot_tolerance*maximum) {
                         pivots[0] = r;
                         ++fast_pivots[owner];
+                        break;
                     }
                 }
             }
