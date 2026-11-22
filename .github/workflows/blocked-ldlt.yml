@@ -1,7 +1,7 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [main, perf/ldlt-blocked-multifrontal, perf/ldlt-incremental-pivot-cache]
+    branches: [main, perf/ldlt-blocked-multifrontal, perf/ldlt-incremental-pivot-cache, perf/ldlt-ranked-pivot-screen]
   pull_request:
     branches: [main]
   workflow_dispatch:
