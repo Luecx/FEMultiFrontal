@@ -19,6 +19,10 @@ jobs:
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 1
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-legacy-pivot-order --ldlt-no-tiled-schur --ldlt-no-relaxed-supernodes
+      - name: Smoke-test reproducible LDLT A/B benchmark
+        run: |
+          python3 -m py_compile benchmarks/compare_ldlt_fastpath.py
+          python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
