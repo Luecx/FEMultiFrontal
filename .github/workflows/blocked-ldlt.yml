@@ -1,7 +1,7 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [main, perf/ldlt-blocked-multifrontal, perf/metis-ordering-benchmark]
+    branches: [main, perf/ldlt-blocked-multifrontal, perf/metis-ordering-benchmark, perf/ldlt-timing-diagnostics]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -29,6 +29,13 @@ jobs:
           ./build/native-metis/mfsolve tests/symmetric.mtx --ordering metis --repeat 2
           ./build/native-metis/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering metis --ldlt-block-size 16 --repeat 2
           ./build/native-metis/mfsolve tests/asymmetric.mtx --matrix-type general --ordering metis
+      - name: Verify per-factor timing diagnostics for both orderings
+        run: |
+          for ordering in nd metis; do
+            ./build/native-metis/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering "$ordering" --ldlt-block-size 16 --threads 1 --repeat 2 --diagnose-timing | tee /tmp/femf-diag.log
+            grep -q 'factor_thread_cpu_s=' /tmp/femf-diag.log
+            grep -q 'factor_involuntary_switches=' /tmp/femf-diag.log
+          done
       - name: Verify optional dependency is not required in default build
         run: |
           if ./build/native/mfsolve tests/symmetric.mtx --ordering metis --analyze-only; then
