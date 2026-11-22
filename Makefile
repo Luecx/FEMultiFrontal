@@ -8,13 +8,23 @@ CXXFLAGS ?= -O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic
 LDFLAGS  ?=
 LDLIBS   ?=
 
-# Keep serial and OpenMP objects separate so configuration changes never mix.
+# Keep serial, OpenMP and optional METIS objects separate by build variant.
+WITH_METIS ?= 0
 WITH_OPENMP ?= 0
 VARIANT     := native
 ifeq ($(WITH_OPENMP),1)
 VARIANT  := $(VARIANT)-omp
 CXXFLAGS += -fopenmp
 LDFLAGS  += -fopenmp
+endif
+ifeq ($(WITH_METIS),1)
+VARIANT := $(VARIANT)-metis
+CPPFLAGS += -DMF_WITH_METIS=1
+ifneq ($(CONDA_PREFIX),)
+CPPFLAGS += -I$(CONDA_PREFIX)/include
+LDFLAGS += -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
+endif
+LDLIBS += -lmetis
 endif
 BUILD_DIR := build/$(VARIANT)
 
