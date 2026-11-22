@@ -9,6 +9,7 @@
 #include "ldlt_schur.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -30,6 +31,9 @@ void rank_k_ldlt_tiled(int origin, int dim, const std::vector<int>& active,
     constexpr int NR = 8;
     const int count = static_cast<int>(active.size());
     const int tile_count = (count + MR - 1) / MR;
+    // OpenMP tasks must not throw across a task boundary. Workers record
+    // nonfinite output; the caller throws after the implicit taskgroup joins.
+    std::atomic<bool> nonfinite{false};
 
     auto update_tile = [&](int tile) {
         const int first = tile * MR;
@@ -57,7 +61,7 @@ void rank_k_ldlt_tiled(int origin, int dim, const std::vector<int>& active,
                         const std::size_t offset = static_cast<std::size_t>(p) * dim;
                         v -= left[offset + row[r]] * right[offset + col];
                     }
-                    if (!std::isfinite(v)) { throw std::runtime_error("Nonfinite LDLT Schur update"); }
+                    if (!std::isfinite(v)) { nonfinite.store(true,std::memory_order_relaxed); return; }
                     target[r][col] = v;
                 }
                 ++j;
@@ -84,7 +88,7 @@ void rank_k_ldlt_tiled(int origin, int dim, const std::vector<int>& active,
                 const __m256d check0 = _mm256_cmp_pd(_mm256_andnot_pd(sign,acc0[r]),limit,_CMP_LE_OQ);
                 const __m256d check1 = _mm256_cmp_pd(_mm256_andnot_pd(sign,acc1[r]),limit,_CMP_LE_OQ);
                 if (_mm256_movemask_pd(check0) != 15 || _mm256_movemask_pd(check1) != 15) {
-                    throw std::runtime_error("Nonfinite LDLT Schur update");
+                    nonfinite.store(true,std::memory_order_relaxed); return;
                 }
                 _mm256_storeu_pd(target[r]+col,acc0[r]);
                 _mm256_storeu_pd(target[r]+col+4,acc1[r]);
@@ -106,7 +110,7 @@ void rank_k_ldlt_tiled(int origin, int dim, const std::vector<int>& active,
                 }
             }
             for (int r = 0; r < row_count; ++r) {
-                if (!std::isfinite(values[r])) { throw std::runtime_error("Nonfinite LDLT Schur update"); }
+                if (!std::isfinite(values[r])) { nonfinite.store(true,std::memory_order_relaxed); return; }
                 target[r][col] = values[r];
             }
         }
@@ -121,7 +125,7 @@ void rank_k_ldlt_tiled(int origin, int dim, const std::vector<int>& active,
                     const std::size_t offset = static_cast<std::size_t>(p)*dim;
                     v -= left[offset+row[r]] * right[offset+col];
                 }
-                if (!std::isfinite(v)) { throw std::runtime_error("Nonfinite LDLT Schur update"); }
+                if (!std::isfinite(v)) { nonfinite.store(true,std::memory_order_relaxed); return; }
                 target[r][col] = v;
             }
         }
@@ -139,10 +143,16 @@ void rank_k_ldlt_tiled(int origin, int dim, const std::vector<int>& active,
             const int last = static_cast<int>(tile_count*std::sqrt(static_cast<double>(job+1)/jobs));
             for (int tile = first; tile < last; ++tile) { update_tile(tile); }
         }
+        if (nonfinite.load(std::memory_order_relaxed)) {
+            throw std::runtime_error("Nonfinite LDLT Schur update");
+        }
         return;
     }
 #endif
     for (int tile = 0; tile < tile_count; ++tile) { update_tile(tile); }
+    if (nonfinite.load(std::memory_order_relaxed)) {
+        throw std::runtime_error("Nonfinite LDLT Schur update");
+    }
 }
 
 } // namespace mf::dense
