@@ -416,8 +416,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
             for (int r : active) {
                 if (r == pivots[0] || (count == 2 && r == pivots[1])) { continue; }
-                const double x = current(r,pivots[0]) / scale;
-                const double y = count == 2 ? current(r,pivots[1]) / scale : 0.0;
+                // Symmetric pivot-to-row couplings were already evaluated
+                // above for the panel's right factor. Reuse them instead of
+                // recomputing current() and its rank-dependent dot product.
+                const double x = panel.right[base_rank * static_cast<std::size_t>(width) + r] / scale;
+                const double y = count == 2
+                    ? panel.right[(base_rank + 1) * static_cast<std::size_t>(width) + r] / scale
+                    : 0.0;
                 const std::array<double,2> lower = count == 1 ?
                     std::array<double,2>{x/det, 0.0} :
                     std::array<double,2>{(x*d-y*b)/det, (y*a-x*b)/det};
