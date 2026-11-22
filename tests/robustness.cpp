@@ -95,6 +95,37 @@ int main() {
                 const double backward = rinf / std::max(anorm * xinf + binf, 1e-300L);
                 bool pass = !incompatible && factor.rank == expected_rank &&
                                   std::isfinite(residual) && residual < 1e-8 && backward < 1e-8;
+                // Paired numerical regression on identical symbolic input:
+                // check rank/inertia and independent system residual for all
+                // symmetric cases, including 2x2, delays and FE-like grids.
+                if (symmetric && !incompatible && threads == 1) {
+                    mf::PivotFactor legacy;
+                    legacy.kind = mf::PivotFactor::Kind::Symmetric;
+                    legacy.fast_pivoting = false;
+                    legacy.tiled_schur = false;
+                    legacy.relaxed_supernodes = false;
+                    legacy.factorize(matrix,symbolic);
+                    const auto lx = legacy.solve(rhs);
+                    const auto lax = matrix.multiply(lx);
+                    long double lr2 = 0.0L, lb2 = 0.0L;
+                    for (int k = 0; k < n; ++k) {
+                        const long double d = static_cast<long double>(lax[k])-rhs[k];
+                        lr2 += d*d;
+                        lb2 += static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double lresidual = std::sqrt(lr2/std::max(lb2,1e-300L));
+                    const bool same_inertia = legacy.positive_directions == factor.positive_directions &&
+                        legacy.negative_directions == factor.negative_directions &&
+                        legacy.rank == factor.rank;
+                    if (!same_inertia || !std::isfinite(lresidual) || lresidual > 1e-8) {
+                        std::cerr << "legacy/optimized disagreement in " << name
+                                  << ": rank=" << legacy.rank << "/" << factor.rank
+                                  << " inertia+=" << legacy.positive_directions << "/" << factor.positive_directions
+                                  << " inertia-=" << legacy.negative_directions << "/" << factor.negative_directions
+                                  << " legacy_residual=" << lresidual << '\n';
+                        pass = false;
+                    }
+                }
                 if (name.rfind("forced_2x2",0) == 0 && factor.two_by_two_pivots == 0) { pass = false; }
                 // A supernode may eliminate a previously delayed scalar
                 // candidate in the same assembled panel instead of passing it
