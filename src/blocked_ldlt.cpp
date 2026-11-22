@@ -11,11 +11,15 @@
 #include "blocked_ldlt.h"
 #include "pivot_factor.h"
 #include "memory.h"
+#include "ldlt_schur.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <exception>
 #include <functional>
@@ -293,9 +297,10 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     }
     factor.column_scale = factor.row_scale;
 
-    // Collapse exact unary assembly-tree chains into supernodes without
-    // introducing any extra graph fill. The maximum width is a performance
-    // policy only: numerical pivot acceptance is still fully dynamic.
+    // Group exact links and cheaply amalgamate nearly identical unary fronts.
+    // Relaxed merges admit only a few additional structural rows; branching
+    // nodes are kept separate so all children are fully assembled first.
+    // The dense front below always unions the patterns of every member.
     std::vector<int> group_first(n, -1);
     std::vector<int> group_width(n, 0);
     for (int first = 0; first < n; ++first) {
@@ -305,7 +310,17 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         group_first[head] = first;
         while (count < factor.block_size) {
             const int parent = symbolic.parent[head];
-            if (parent == -1 || symbolic.reuse_child[parent] != head) { break; }
+            if (parent == -1) { break; }
+            const bool exact = symbolic.reuse_child[parent] == head;
+            if (!exact) {
+                const bool unary = symbolic.first_child[parent] == head &&
+                                   symbolic.next_child[head] == -1;
+                const int current_size = static_cast<int>(symbolic.ptr[head+1]-symbolic.ptr[head]);
+                const int next_size = static_cast<int>(symbolic.ptr[parent+1]-symbolic.ptr[parent]);
+                const int extra = next_size - (current_size-1);
+                if (!factor.relaxed_supernodes || !unary ||
+                    extra > std::max(4,current_size/32)) { break; }
+            }
             head = parent;
             group_first[head] = first;
             ++count;
@@ -316,6 +331,10 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<BlockFront> contributions(n);
     std::vector<FrontPivotRecords> records(n);
     std::vector<std::size_t> delays(n, 0), widths(n, 0), panels(n, 0), groups(n, 0);
+    std::vector<std::size_t> fast_pivots(n, 0), fallback_searches(n, 0), relaxed_groups(n, 0);
+    using Clock = std::chrono::steady_clock;
+    const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
+    std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
@@ -330,13 +349,21 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             if (node == owner) { break; }
         }
         groups[owner] = 1;
+        const auto started = profile ? Clock::now() : Clock::time_point{};
+        bool exact_group = true;
+        for (std::size_t k = 1; k < members.size(); ++k) {
+            if (symbolic.reuse_child[members[k]] != members[k-1]) {
+                exact_group = false;
+            }
+        }
+        relaxed_groups[owner] = !exact_group;
         records[owner].blocks.reserve(members.size());
 
         BlockFront front;
         const auto first = symbolic.row.begin() + symbolic.ptr[bottom];
         const auto last = symbolic.row.begin() + symbolic.ptr[bottom + 1];
         const int reusable = symbolic.reuse_child[bottom];
-        const bool inherited = reusable != -1 &&
+        const bool inherited = exact_group && reusable != -1 &&
             contributions[reusable].rows.size() == static_cast<std::size_t>(last - first) &&
             std::equal(first, last, contributions[reusable].rows.begin());
         if (inherited) {
@@ -344,6 +371,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             contributions[reusable] = BlockFront{};
         } else {
             front.rows.assign(first, last);
+            // A relaxed unary merge may introduce original parent-column rows
+            // absent from the bottom scalar front. Preserve the full union.
+            for (int member : members) {
+                const auto begin = symbolic.row.begin()+symbolic.ptr[member];
+                const auto end = symbolic.row.begin()+symbolic.ptr[member+1];
+                front.rows.insert(front.rows.end(),begin,end);
+            }
             for (int child = symbolic.first_child[bottom]; child != -1;
                  child = symbolic.next_child[child]) {
                 const auto& source = contributions[child];
@@ -411,6 +445,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             source = BlockFront{};
         }
 
+        if (profile) {
+            assembly_s[owner] += std::chrono::duration<double>(Clock::now()-started).count();
+        }
         std::vector<int> active(width);
         std::iota(active.begin(), active.end(), 0);
         PivotPanel panel(width, factor.block_size);
@@ -428,7 +465,16 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         };
         auto flush = [&] {
             if (panel.rank == 0) { return; }
-            rank_k_update(front.origin, width, active, panel, values);
+            const auto t = profile ? Clock::now() : Clock::time_point{};
+            if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
+                dense::rank_k_ldlt_tiled(front.origin, width, active, panel.rank,
+                                         panel.left.data(), panel.right.data(), values);
+            } else {
+                rank_k_update(front.origin, width, active, panel, values);
+            }
+            if (profile) {
+                schur_s[owner] += std::chrono::duration<double>(Clock::now()-t).count();
+            }
             ++panels[owner];
             panel.clear();
         };
@@ -442,20 +488,45 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             const auto eligible_count = static_cast<std::size_t>(eligible_end - active.begin());
             if (eligible_count == 0) { break; }
 
+            const auto search_started = profile ? Clock::now() : Clock::time_point{};
             int pivots[2] = {-1, -1};
             int count = 1;
-            double best = factor.rank_tolerance;
-            for (std::size_t i = 0; i < eligible_count; ++i) {
-                const int r = active[i];
+
+            // Most structural FE pivots need no global max-diagonal search.
+            // Test the first fully summed candidate against the ENTIRE active
+            // row (including delayed update variables), not only the panel.
+            // If it fails, preserve the original exhaustive threshold search
+            // and 2x2 fallback without changing either acceptance criterion.
+            if (factor.fast_pivoting) {
+                const int r = active.front();
                 const double magnitude = std::abs(current(r,r));
-                if (!(magnitude > best)) { continue; }
-                double maximum = 0.0;
-                for (int c : active) {
-                    maximum = std::max(maximum, std::abs(current(r,c)));
+                if (magnitude > factor.rank_tolerance) {
+                    double maximum = magnitude;
+                    for (int c : active) {
+                        maximum = std::max(maximum,std::abs(current(r,c)));
+                        if (magnitude < factor.pivot_tolerance*maximum) { break; }
+                    }
+                    if (magnitude >= factor.pivot_tolerance*maximum) {
+                        pivots[0] = r;
+                        ++fast_pivots[owner];
+                    }
                 }
-                if (magnitude >= factor.pivot_tolerance * maximum) {
-                    pivots[0] = r;
-                    best = magnitude;
+            }
+            if (pivots[0] == -1) {
+                ++fallback_searches[owner];
+                double best = factor.rank_tolerance;
+                for (std::size_t i = 0; i < eligible_count; ++i) {
+                    const int r = active[i];
+                    const double magnitude = std::abs(current(r,r));
+                    if (!(magnitude > best)) { continue; }
+                    double maximum = 0.0;
+                    for (int c : active) {
+                        maximum = std::max(maximum, std::abs(current(r,c)));
+                    }
+                    if (magnitude >= factor.pivot_tolerance * maximum) {
+                        pivots[0] = r;
+                        best = magnitude;
+                    }
                 }
             }
 
@@ -503,6 +574,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         }
                     }
                 }
+            }
+            if (profile) {
+                search_s[owner] += std::chrono::duration<double>(Clock::now()-search_started).count();
             }
             if (pivots[0] == -1) { break; }
 
@@ -605,6 +679,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 }
             }
         }
+        if (profile) {
+            front_s[owner] = std::chrono::duration<double>(Clock::now()-started).count();
+        }
     };
 
     // Retain independent-subtree task scheduling. Each front owns its factors
@@ -685,6 +762,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.packed_lower_rows.reserve(row_total);
     factor.packed_lower_values.reserve(value_total);
     for (int owner : symbolic.postorder) {
+        factor.fast_path_pivots += fast_pivots[owner];
+        factor.fallback_searches += fallback_searches[owner];
+        factor.relaxed_groups += relaxed_groups[owner];
         factor.delayed_candidates += delays[owner];
         factor.maximum_front = std::max(factor.maximum_front, widths[owner]);
         factor.blocked_panels += panels[owner];
@@ -728,6 +808,18 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
     }
     if (factor.rank == 0) { factor.minimum_pivot = 0.0; }
+    if (profile) {
+        auto sum = [](const std::vector<double>& xs) {
+            return std::accumulate(xs.begin(),xs.end(),0.0);
+        };
+        std::fprintf(stderr,
+            "FEMF_LDLT_PROFILE fronts=%zu relaxed=%zu fast_pivots=%zu fallback_searches=%zu "
+            "assembly_s=%.6f pivot_search_s=%.6f schur_s=%.6f total_front_s=%.6f "
+            "(phase sums overlap with parallel work)\n",
+            factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
+            factor.fallback_searches,sum(assembly_s),sum(search_s),
+            sum(schur_s),sum(front_s));
+    }
     factor.ready = true;
 }
 } // namespace mf
