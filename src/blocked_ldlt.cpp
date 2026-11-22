@@ -97,9 +97,40 @@ void rank_k_update(int origin, int dim, const std::vector<int>& active,
         const __m256d limit = _mm256_set1_pd(std::numeric_limits<double>::max());
         for (; j + 4 <= i + 1; ) {
             const int c = active[j];
-            // Long contiguous stretches are common in large separator fronts.
-            // Reuse each pivot broadcast across two adjacent AVX2 vectors,
-            // without changing pivot order or the scalar path for holes.
+            // Consume sixteen contiguous columns with four independent AVX2
+            // accumulators. This amortizes the pivot broadcast and rank-loop
+            // overhead on large fronts, retaining exact per-entry pivot order.
+            if (j + 16 <= i + 1 && active[j + 15] == c + 15) {
+                __m256d result0 = _mm256_loadu_pd(target + c);
+                __m256d result1 = _mm256_loadu_pd(target + c + 4);
+                __m256d result2 = _mm256_loadu_pd(target + c + 8);
+                __m256d result3 = _mm256_loadu_pd(target + c + 12);
+                for (int p = 0; p < panel.rank; ++p) {
+                    const std::size_t base = static_cast<std::size_t>(p) * dim;
+                    const __m256d l = _mm256_set1_pd(panel.left[base + r]);
+                    const double* const u = panel.right.data() + base + c;
+                    result0 = _mm256_sub_pd(result0, _mm256_mul_pd(l, _mm256_loadu_pd(u)));
+                    result1 = _mm256_sub_pd(result1, _mm256_mul_pd(l, _mm256_loadu_pd(u + 4)));
+                    result2 = _mm256_sub_pd(result2, _mm256_mul_pd(l, _mm256_loadu_pd(u + 8)));
+                    result3 = _mm256_sub_pd(result3, _mm256_mul_pd(l, _mm256_loadu_pd(u + 12)));
+                }
+                const __m256d finite0 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result0), limit, _CMP_LE_OQ);
+                const __m256d finite1 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result1), limit, _CMP_LE_OQ);
+                const __m256d finite2 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result2), limit, _CMP_LE_OQ);
+                const __m256d finite3 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result3), limit, _CMP_LE_OQ);
+                if (_mm256_movemask_pd(finite0) != 15 || _mm256_movemask_pd(finite1) != 15 ||
+                    _mm256_movemask_pd(finite2) != 15 || _mm256_movemask_pd(finite3) != 15) {
+                    throw std::runtime_error("Nonfinite blocked LDLT Schur update");
+                }
+                _mm256_storeu_pd(target + c, result0);
+                _mm256_storeu_pd(target + c + 4, result1);
+                _mm256_storeu_pd(target + c + 8, result2);
+                _mm256_storeu_pd(target + c + 12, result3);
+                j += 16;
+                continue;
+            }
+            // Eight/four-wide fallback preserves the previous kernel for
+            // shorter consecutive runs; holes retain scalar handling.
             if (j + 8 <= i + 1 && active[j + 7] == c + 7) {
                 __m256d result0 = _mm256_loadu_pd(target + c);
                 __m256d result1 = _mm256_loadu_pd(target + c + 4);
