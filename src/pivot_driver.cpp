@@ -10,6 +10,7 @@
 #include "pivot_driver.h"
 #include "pivot_factor.h"
 #include "ordering.h"
+#include "metis_ordering.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,8 +61,8 @@ int run_pivot_driver(int argc, char** argv) {
     if (ldlt_block_size < 1 || ldlt_block_size > 256) {
         throw std::runtime_error("--ldlt-block-size must be in [1,256]");
     }
-    if (ordering != "natural" && ordering != "nd") {
-        throw std::runtime_error("Invalid ordering; expected nd or natural");
+    if (ordering != "natural" && ordering != "nd" && ordering != "metis") {
+        throw std::runtime_error("Invalid ordering; expected nd, metis or natural");
     }
 
     // Select storage before import: a GENERAL numerical operator is never folded
@@ -73,6 +74,7 @@ int run_pivot_driver(int argc, char** argv) {
     auto graph = matrix.ordering_graph();
     std::vector<int> order(matrix.n);
     if (ordering == "nd") { order = nested_dissection(graph, threads); }
+    else if (ordering == "metis") { order = metis_nested_dissection(graph); }
     else { std::iota(order.begin(), order.end(), 0); }
     const auto ordered = Clock::now();
     const auto permuted = matrix.permute(order, order);
