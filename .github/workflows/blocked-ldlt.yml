@@ -1,7 +1,7 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [main, perf/ldlt-blocked-multifrontal]
+    branches: [main, perf/ldlt-blocked-multifrontal, perf/ldlt-incremental-pivot-cache]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -14,6 +14,13 @@ jobs:
       - name: Compile and run regression tests (single threaded)
         run: |
           make -j2 all check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
+      - name: Test cached pivots with multiple panel widths
+        run: |
+          for B in 8 16 32 64 128 256; do
+            echo "Testing LDLT block size $B"
+            MF_TEST_LDLT_BLOCK_SIZE="$B" ./build/native/tests/robustness > "/tmp/robustness-$B.log"
+            tail -2 "/tmp/robustness-$B.log"
+          done
       - name: Test scalar and blocked solver entry points
         run: |
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 1
