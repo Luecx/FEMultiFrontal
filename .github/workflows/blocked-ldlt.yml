@@ -1,7 +1,9 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [perf/ldlt-blocked-multifrontal]
+    branches: [main, perf/ldlt-blocked-multifrontal]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
