@@ -1,7 +1,7 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [main, perf/ldlt-blocked-multifrontal]
+    branches: [main, perf/ldlt-blocked-multifrontal, perf/ldlt-separate-supernode-panel]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -18,6 +18,14 @@ jobs:
         run: |
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 1
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32
+      - name: Validate independent panel and supernode widths
+        run: |
+          for cfg in "8 32" "16 16" "16 32" "16 64" "16 128" "32 16" "32 64"; do
+            set -- $cfg
+            echo "Panel $1, supernode $2"
+            MF_TEST_LDLT_BLOCK_SIZE="$1" MF_TEST_LDLT_SUPERNODE_SIZE="$2" ./build/native/tests/robustness | tail -1
+            ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size "$1" --ldlt-supernode-size "$2" | tail -2
+          done
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
