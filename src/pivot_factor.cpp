@@ -337,10 +337,12 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         const bool dense_update = symmetric && nc >= 64;
         std::vector<int> lower_positions;
         std::vector<double> update_upper;
-        if (dense_update) {
-            lower_positions.reserve(nr);
-            update_upper.resize(2*static_cast<std::size_t>(nc));
-        }
+        // Retain local indices for scalar as well as dense symmetric updates.
+        if (symmetric) { lower_positions.reserve(nr); }
+        if (dense_update) { update_upper.resize(2*static_cast<std::size_t>(nc)); }
+        // Reuse small-front pivot-row coefficients across pivots in this front.
+        std::vector<std::array<double, 2>> upper;
+        if (!dense_update) { upper.resize(nc); }
 
         // Only original IDs that have reached this front are fully summed candidates
         while (!active_rows.empty() && !active_columns.empty()) {
@@ -451,19 +453,27 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             const double b = block.diagonal[1] / scale;
             const double d = block.diagonal[3] / scale;
             const double det = size == 1 ? a : a * d - b * b;
+            // Calculate one scalar reciprocal instead of two divisions per row.
+            // Retain scaled arithmetic if a reciprocal would overflow.
+            const double inv_scalar = size == 1 ? 1.0 / block.diagonal[0] : 0.0;
+            const bool fast_scalar = size == 1 && std::isfinite(inv_scalar);
             for (int r : active_rows) {
                 if (r == pivot_rows[0] || (size == 2 && r == pivot_rows[1])) { continue; }
-                const double x = at(r, pivot_columns[0]) / scale;
-                const double y = size == 2 ? at(r, pivot_columns[1]) / scale : 0.0;
-                const std::array<double, 2> lower = size == 1 ? std::array<double, 2>{x / det, 0.0} :
-                    std::array<double, 2>{(x * d - y * b) / det, (y * a - x * b) / det};
+                std::array<double, 2> lower;
+                if (fast_scalar) {
+                    lower = {at(r, pivot_columns[0]) * inv_scalar, 0.0};
+                } else {
+                    const double x = at(r, pivot_columns[0]) / scale;
+                    const double y = size == 2 ? at(r, pivot_columns[1]) / scale : 0.0;
+                    lower = size == 1 ? std::array<double, 2>{x / det, 0.0} :
+                        std::array<double, 2>{(x * d - y * b) / det, (y * a - x * b) / det};
+                }
                 if (lower[0] != 0.0 || lower[1] != 0.0) {
-                    if (dense_update) { lower_positions.push_back(r); }
+                    if (symmetric) { lower_positions.push_back(r); }
                     block.lower_rows.push_back(front.rows[r]);
                     block.lower_values.push_back(lower);
                 }
             }
-            std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
             for (int c : active_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
@@ -526,7 +536,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             } else if (!defer) {
                 // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
                 for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                    const int r = row_position(block.lower_rows[p]);
+                    const int r = symmetric ? lower_positions[p] : row_position(block.lower_rows[p]);
                     const auto lower = block.lower_values[p];
                     for (int c : active_columns) {
                         if (symmetric && c > r) { continue; }
