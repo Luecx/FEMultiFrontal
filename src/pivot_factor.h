@@ -55,6 +55,8 @@ struct PivotFactor {
     double rank_tolerance  = 1e-12;
     double pivot_tolerance = 0.1;
     int    threads         = 1;
+    // 1 selects the original scalar LDLT; >=2 enables blocked multifrontal LDLT.
+    int    block_size      = 32;
 
     // Accepted scalar/2x2 pivots and complete lower/upper coefficients.
     std::vector<PivotBlock> blocks;
@@ -64,6 +66,8 @@ struct PivotFactor {
     int two_by_two_pivots    = 0;
     std::size_t delayed_candidates = 0;
     std::size_t maximum_front      = 0;
+    std::size_t blocked_panels      = 0;
+    std::size_t grouped_fronts     = 0;
     double minimum_pivot          = 0.0;
 
     // Matrix lifetime and scaling in equation and variable spaces
