@@ -44,6 +44,54 @@ struct BlockFront {
     int stride = 0;
 };
 
+// Fronts have disjoint owners, and a consumed child is never referenced again.
+// Recycle a few expensive aligned triangular buffers inside each worker.
+// Keep a fixed number of slots and a strict capacity limit to bound retained
+// memory; no sharing or locks are required, including under OpenMP tasks.
+struct FrontBufferPool {
+    static constexpr std::size_t slot_count = 4;
+    static constexpr std::size_t max_cached_elements = 8 * 1024 * 1024;
+    std::array<memory::Values, slot_count> cached{};
+
+    void acquire(memory::Values& buffer, std::size_t count) {
+        std::size_t best = slot_count;
+        for (std::size_t i = 0; i < slot_count; ++i) {
+            const std::size_t capacity = cached[i].capacity();
+            if (capacity >= count &&
+                (best == slot_count || capacity < cached[best].capacity())) {
+                best = i;
+            }
+        }
+        if (best != slot_count) {
+            buffer = std::move(cached[best]);
+        }
+        // Zero every logical entry, as the original front construction did.
+        buffer.assign(count, 0.0);
+    }
+
+    void recycle(memory::Values&& buffer) {
+        const std::size_t capacity = buffer.capacity();
+        if (capacity == 0 || capacity > max_cached_elements) { return; }
+        for (auto& slot : cached) {
+            if (slot.capacity() == 0) {
+                slot = std::move(buffer);
+                return;
+            }
+        }
+        // Retain the smallest capacity that is currently missing from the
+        // four buffers; discard the rest. Avoid unbounded growth.
+        std::size_t smallest = 0;
+        for (std::size_t i = 1; i < slot_count; ++i) {
+            if (cached[i].capacity() < cached[smallest].capacity()) {
+                smallest = i;
+            }
+        }
+        if (capacity > cached[smallest].capacity()) {
+            cached[smallest] = std::move(buffer);
+        }
+    }
+};
+
 // One writer per front: scalar pivot headers and all multiplier entries are
 // appended into shared front-local arrays, with no allocations per pivot.
 struct FrontPivotRecords {
@@ -317,6 +365,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<FrontPivotRecords> records(n);
     std::vector<std::size_t> delays(n, 0), widths(n, 0), panels(n, 0), groups(n, 0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
+    std::vector<FrontBufferPool> worker_front_buffers(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
 
@@ -331,6 +380,14 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
         groups[owner] = 1;
         records[owner].blocks.reserve(members.size());
+
+        // The current task runs entirely on one worker; neither its map nor
+        // its recycled front buffers can be accessed by another worker.
+        int worker = 0;
+#ifdef _OPENMP
+        worker = omp_get_thread_num();
+#endif
+        auto& front_buffers = worker_front_buffers[worker];
 
         BlockFront front;
         const auto first = symbolic.row.begin() + symbolic.ptr[bottom];
@@ -352,7 +409,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             std::sort(front.rows.begin(), front.rows.end());
             front.rows.erase(std::unique(front.rows.begin(), front.rows.end()), front.rows.end());
             const auto width = static_cast<std::size_t>(front.rows.size());
-            front.values.assign(width * (width + 1) / 2, 0.0);
+            front_buffers.acquire(front.values, width * (width + 1) / 2);
             front.stride = static_cast<int>(width);
         }
         const int width = static_cast<int>(front.rows.size());
@@ -365,10 +422,6 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
 
         // A worker's map is live only while assembling its current front;
         // there is no internal task scheduling in this process.
-        int worker = 0;
-#ifdef _OPENMP
-        worker = omp_get_thread_num();
-#endif
         auto& positions = worker_positions[worker];
         if (width >= 16 && positions.empty()) { positions.resize(n); }
         if (width >= 16) {
@@ -408,6 +461,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 double* const to = values + tr * (tr + 1) / 2 + front.origin;
                 for (std::size_t c = 0; c <= r; ++c) { to[child_map[c]] += from[c]; }
             }
+            front_buffers.recycle(std::move(source.values));
             source = BlockFront{};
         }
 
@@ -605,6 +659,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 }
             }
         }
+        // If the current front was not passed to a parent by move, retain its
+        // allocation for a later front processed by the same worker.
+        front_buffers.recycle(std::move(front.values));
     };
 
     // Retain independent-subtree task scheduling. Each front owns its factors
