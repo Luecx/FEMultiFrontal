@@ -20,6 +20,8 @@ from pathlib import Path
 LEGACY = (
     "--ldlt-legacy-pivot-order",
     "--ldlt-no-tiled-schur",
+    "--ldlt-no-dense-schur",
+    "--ldlt-no-pivot-cache",
     "--ldlt-no-relaxed-supernodes",
 )
 METRIC = re.compile(r"\b(\w+)=([^\s]+)")
