@@ -97,6 +97,59 @@ void rank_k_update(int origin, int dim, const std::vector<int>& active,
         const __m256d limit = _mm256_set1_pd(std::numeric_limits<double>::max());
         for (; j + 4 <= i + 1; ) {
             const int c = active[j];
+            // Use eight AVX2 accumulators for a contiguous 32-column run.
+            // The sixteen/eight/four-wide and scalar paths remain unchanged.
+            if (j + 32 <= i + 1 && active[j + 31] == c + 31) {
+                __m256d result0 = _mm256_loadu_pd(target + c);
+                __m256d result1 = _mm256_loadu_pd(target + c + 4);
+                __m256d result2 = _mm256_loadu_pd(target + c + 8);
+                __m256d result3 = _mm256_loadu_pd(target + c + 12);
+                __m256d result4 = _mm256_loadu_pd(target + c + 16);
+                __m256d result5 = _mm256_loadu_pd(target + c + 20);
+                __m256d result6 = _mm256_loadu_pd(target + c + 24);
+                __m256d result7 = _mm256_loadu_pd(target + c + 28);
+                for (int p = 0; p < panel.rank; ++p) {
+                    const std::size_t base = static_cast<std::size_t>(p) * dim;
+                    const __m256d l = _mm256_set1_pd(panel.left[base + r]);
+                    const double* const u = panel.right.data() + base + c;
+                    result0 = _mm256_sub_pd(result0, _mm256_mul_pd(l, _mm256_loadu_pd(u)));
+                    result1 = _mm256_sub_pd(result1, _mm256_mul_pd(l, _mm256_loadu_pd(u + 4)));
+                    result2 = _mm256_sub_pd(result2, _mm256_mul_pd(l, _mm256_loadu_pd(u + 8)));
+                    result3 = _mm256_sub_pd(result3, _mm256_mul_pd(l, _mm256_loadu_pd(u + 12)));
+                    result4 = _mm256_sub_pd(result4, _mm256_mul_pd(l, _mm256_loadu_pd(u + 16)));
+                    result5 = _mm256_sub_pd(result5, _mm256_mul_pd(l, _mm256_loadu_pd(u + 20)));
+                    result6 = _mm256_sub_pd(result6, _mm256_mul_pd(l, _mm256_loadu_pd(u + 24)));
+                    result7 = _mm256_sub_pd(result7, _mm256_mul_pd(l, _mm256_loadu_pd(u + 28)));
+                }
+                const __m256d finite0 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result0), limit, _CMP_LE_OQ);
+                const __m256d finite1 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result1), limit, _CMP_LE_OQ);
+                const __m256d finite2 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result2), limit, _CMP_LE_OQ);
+                const __m256d finite3 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result3), limit, _CMP_LE_OQ);
+                const __m256d finite4 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result4), limit, _CMP_LE_OQ);
+                const __m256d finite5 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result5), limit, _CMP_LE_OQ);
+                const __m256d finite6 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result6), limit, _CMP_LE_OQ);
+                const __m256d finite7 = _mm256_cmp_pd(_mm256_andnot_pd(sign, result7), limit, _CMP_LE_OQ);
+                if (_mm256_movemask_pd(finite0) != 15 ||
+                    _mm256_movemask_pd(finite1) != 15 ||
+                    _mm256_movemask_pd(finite2) != 15 ||
+                    _mm256_movemask_pd(finite3) != 15 ||
+                    _mm256_movemask_pd(finite4) != 15 ||
+                    _mm256_movemask_pd(finite5) != 15 ||
+                    _mm256_movemask_pd(finite6) != 15 ||
+                    _mm256_movemask_pd(finite7) != 15) {
+                    throw std::runtime_error("Nonfinite blocked LDLT Schur update");
+                }
+                _mm256_storeu_pd(target + c, result0);
+                _mm256_storeu_pd(target + c + 4, result1);
+                _mm256_storeu_pd(target + c + 8, result2);
+                _mm256_storeu_pd(target + c + 12, result3);
+                _mm256_storeu_pd(target + c + 16, result4);
+                _mm256_storeu_pd(target + c + 20, result5);
+                _mm256_storeu_pd(target + c + 24, result6);
+                _mm256_storeu_pd(target + c + 28, result7);
+                j += 32;
+                continue;
+            }
             // Consume sixteen contiguous columns with four independent AVX2
             // accumulators. This amortizes the pivot broadcast and rank-loop
             // overhead on large fronts, retaining exact per-entry pivot order.
