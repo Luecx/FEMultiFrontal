@@ -129,6 +129,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         factor.pivot_tolerance <= 0.0 || factor.pivot_tolerance > 0.5 ||
         !std::isfinite(factor.pivot_tolerance) || factor.threads < 1 ||
         factor.block_size < 2 || factor.block_size > 256 ||
+        factor.supernode_size < 0 || factor.supernode_size > 256 ||
         symbolic.parent.size() != static_cast<std::size_t>(input.n)) {
         throw std::runtime_error("Invalid blocked LDLT settings");
     }
@@ -175,6 +176,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     }
     factor.column_scale = factor.row_scale;
 
+    const int supernode_limit = factor.supernode_size > 0 ?
+        factor.supernode_size : factor.block_size;
+
     // Collapse exact unary assembly-tree chains into supernodes without
     // introducing any extra graph fill. The maximum width is a performance
     // policy only: numerical pivot acceptance is still fully dynamic.
@@ -185,7 +189,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         int head = first;
         int count = 1;
         group_first[head] = first;
-        while (count < factor.block_size) {
+        while (count < supernode_limit) {
             const int parent = symbolic.parent[head];
             if (parent == -1 || symbolic.reuse_child[parent] != head) { break; }
             head = parent;
