@@ -388,13 +388,27 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             std::vector<int> child_map;
             child_map.reserve(source.rows.size());
             for (int id : source.rows) { child_map.push_back(locate(id)); }
+            // Some child interfaces occupy one contiguous range in the parent.
+            // Their packed rows can be added with unit-stride memory accesses,
+            // instead of performing an indirect gather for every scalar entry.
+            // Exact inherited contributions have already been handled above.
+            const bool contiguous = child_map.size() >= 32 &&
+                std::adjacent_find(child_map.begin(), child_map.end(),
+                    [](int a, int b) { return b != a + 1; }) == child_map.end();
             for (std::size_t r = 0; r < child_map.size(); ++r) {
                 const std::size_t sr = static_cast<std::size_t>(source.origin) + r;
                 const double* const from = source.values.data() +
                     sr * (sr + 1) / 2 + source.origin;
                 const std::size_t tr = static_cast<std::size_t>(front.origin + child_map[r]);
                 double* const to = values + tr * (tr + 1) / 2 + front.origin;
-                for (std::size_t c = 0; c <= r; ++c) { to[child_map[c]] += from[c]; }
+                if (contiguous) {
+                    double* const dst = to + child_map.front();
+                    // Both arrays are disjoint, and each output entry is touched
+                    // once, preserving the existing child's assembly order.
+                    for (std::size_t c = 0; c <= r; ++c) { dst[c] += from[c]; }
+                } else {
+                    for (std::size_t c = 0; c <= r; ++c) { to[child_map[c]] += from[c]; }
+                }
             }
             source = BlockFront{};
         }
