@@ -360,6 +360,10 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
         };
 
+        // Reuse the pivot candidate array between steps of the same front.
+        std::vector<std::pair<double,int>> pivot_order;
+        pivot_order.reserve(width);
+
         while (!active.empty()) {
             // Limit a panel's rank; a 2x2 pivot must not straddle its boundary.
             if (panel.rank >= factor.block_size - 1) { flush(); }
@@ -371,18 +375,36 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
 
             int pivots[2] = {-1, -1};
             int count = 1;
-            double best = factor.rank_tolerance;
+            // The original scan selects the *largest* stable 1x1 diagonal.
+            // Checking candidates in descending diagonal order permits an
+            // identical decision after the first successful threshold check.
+            // Preserve the original lower local-index preference for ties.
+            pivot_order.clear();
             for (std::size_t i = 0; i < eligible_count; ++i) {
                 const int r = active[i];
                 const double magnitude = std::abs(current(r,r));
-                if (!(magnitude > best)) { continue; }
+                if (magnitude > factor.rank_tolerance) {
+                    pivot_order.emplace_back(magnitude,r);
+                }
+            }
+            std::sort(pivot_order.begin(),pivot_order.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.first != b.first) { return a.first > b.first; }
+                    return a.second < b.second;
+                });
+            for (const auto& candidate : pivot_order) {
+                const double magnitude = candidate.first;
+                const int r = candidate.second;
                 double maximum = 0.0;
                 for (int c : active) {
-                    maximum = std::max(maximum, std::abs(current(r,c)));
+                    maximum = std::max(maximum,std::abs(current(r,c)));
+                    // Once the maximum violates the threshold, subsequent
+                    // columns cannot make this candidate stable again.
+                    if (magnitude < factor.pivot_tolerance * maximum) { break; }
                 }
                 if (magnitude >= factor.pivot_tolerance * maximum) {
                     pivots[0] = r;
-                    best = magnitude;
+                    break;
                 }
             }
 
