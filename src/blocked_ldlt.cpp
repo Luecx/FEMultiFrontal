@@ -50,17 +50,32 @@ struct BlockFront {
 struct PivotPanel {
     int dim = 0;
     int rank = 0;
+    int pitch = 0;
     std::vector<double> left;
     std::vector<double> right;
+    // Pivot-major arrays feed the Schur kernel. Row-major arrays keep each
+    // candidate's short pivot history contiguous for repeated current(r,c).
+    std::vector<double> left_by_row;
+    std::vector<double> right_by_row;
 
-    explicit PivotPanel(int width, int capacity) : dim(width) {
+    explicit PivotPanel(int width, int capacity) : dim(width), pitch(capacity) {
         left.reserve(static_cast<std::size_t>(width) * capacity);
         right.reserve(static_cast<std::size_t>(width) * capacity);
+        left_by_row.resize(static_cast<std::size_t>(width) * capacity, 0.0);
+        right_by_row.resize(static_cast<std::size_t>(width) * capacity, 0.0);
     }
     void append(int count) {
         const std::size_t size = static_cast<std::size_t>(rank + count) * dim;
         left.resize(size, 0.0);
         right.resize(size, 0.0);
+        // A later panel can reuse the same pivot positions: clear only the
+        // newly exposed history slots instead of the entire row-major cache.
+        for (int r = 0; r < dim; ++r) {
+            double* const l = left_by_row.data() + static_cast<std::size_t>(r) * pitch + rank;
+            double* const u = right_by_row.data() + static_cast<std::size_t>(r) * pitch + rank;
+            std::fill_n(l, count, 0.0);
+            std::fill_n(u, count, 0.0);
+        }
     }
     void clear() {
         rank = 0;
@@ -405,9 +420,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
 
         auto current = [&](int r, int c) {
             double result = at(r,c);
+            const double* const lhs = panel.left_by_row.data() +
+                static_cast<std::size_t>(r) * panel.pitch;
+            const double* const rhs = panel.right_by_row.data() +
+                static_cast<std::size_t>(c) * panel.pitch;
             for (int p = 0; p < panel.rank; ++p) {
-                const auto base = static_cast<std::size_t>(p) * width;
-                result -= panel.left[base+r] * panel.right[base+c];
+                result -= lhs[p] * rhs[p];
             }
             if (!std::isfinite(result)) {
                 throw std::runtime_error("Nonfinite blocked LDLT candidate");
@@ -516,9 +534,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             panel.append(count);
             for (int c : active) {
                 const auto base = static_cast<std::size_t>(base_rank) * width;
-                panel.right[base+c] = current(pivots[0],c);
+                const double u0 = current(pivots[0],c);
+                panel.right[base+c] = u0;
+                panel.right_by_row[static_cast<std::size_t>(c) * panel.pitch + base_rank] = u0;
                 if (count == 2) {
-                    panel.right[base+width+c] = current(pivots[1],c);
+                    const double u1 = current(pivots[1],c);
+                    panel.right[base+width+c] = u1;
+                    panel.right_by_row[static_cast<std::size_t>(c) * panel.pitch + base_rank + 1] = u1;
                 }
             }
             for (int r : active) {
@@ -536,7 +558,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 if (lower[0] != 0.0 || lower[1] != 0.0) {
                     const auto base = static_cast<std::size_t>(base_rank) * width;
                     panel.left[base+r] = lower[0];
-                    if (count == 2) { panel.left[base+width+r] = lower[1]; }
+                    panel.left_by_row[static_cast<std::size_t>(r) * panel.pitch + base_rank] = lower[0];
+                    if (count == 2) {
+                        panel.left[base+width+r] = lower[1];
+                        panel.left_by_row[static_cast<std::size_t>(r) * panel.pitch + base_rank + 1] = lower[1];
+                    }
                     block.lower_rows.push_back(front.rows[r]);
                     block.lower_values.push_back(lower);
                 }
