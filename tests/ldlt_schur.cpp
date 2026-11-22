@@ -13,6 +13,9 @@
 #include <vector>
 
 static void check(int dim, int rank, int origin, int layout, bool parallel_run) {
+#ifndef _OPENMP
+    (void)parallel_run;
+#endif
     const int allocated = origin + dim + 7;
     std::vector<int> active;
     for (int i = 0; i < dim; ++i) {
