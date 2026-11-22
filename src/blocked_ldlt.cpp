@@ -79,13 +79,28 @@ void rank_k_update(int origin, int dim, const std::vector<int>& active,
         const int r = active[i];
         const std::size_t physical = static_cast<std::size_t>(origin + r);
         double* const target = values + physical * (physical + 1) / 2 + origin;
+        auto update_scalar = [&](std::size_t index) {
+            const int c = active[index];
+            double v = target[c];
+            for (int p = 0; p < panel.rank; ++p) {
+                const std::size_t base = static_cast<std::size_t>(p) * dim;
+                v -= panel.left[base + r] * panel.right[base + c];
+            }
+            if (!std::isfinite(v)) {
+                throw std::runtime_error("Nonfinite blocked LDLT Schur update");
+            }
+            target[c] = v;
+        };
         std::size_t j = 0;
 #if defined(__AVX2__) && defined(__FMA__)
         const __m256d sign = _mm256_set1_pd(-0.0);
         const __m256d limit = _mm256_set1_pd(std::numeric_limits<double>::max());
         for (; j + 4 <= i + 1; ) {
             const int c = active[j];
-            if (active[j + 3] != c + 3) { ++j; continue; }
+            if (active[j + 3] != c + 3) {
+                update_scalar(j++);
+                continue;
+            }
             __m256d result = _mm256_loadu_pd(target + c);
             for (int p = 0; p < panel.rank; ++p) {
                 const std::size_t base = static_cast<std::size_t>(p) * dim;
@@ -101,18 +116,7 @@ void rank_k_update(int origin, int dim, const std::vector<int>& active,
             j += 4;
         }
 #endif
-        for (; j <= i; ++j) {
-            const int c = active[j];
-            double v = target[c];
-            for (int p = 0; p < panel.rank; ++p) {
-                const std::size_t base = static_cast<std::size_t>(p) * dim;
-                v -= panel.left[base + r] * panel.right[base + c];
-            }
-            if (!std::isfinite(v)) {
-                throw std::runtime_error("Nonfinite blocked LDLT Schur update");
-            }
-            target[c] = v;
-        }
+        for (; j <= i; ++j) { update_scalar(j); }
     }
 }
 
