@@ -296,14 +296,54 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         std::iota(active.begin(), active.end(), 0);
         PivotPanel panel(width, factor.block_size);
 
+        // The same candidate entries are revisited after almost every
+        // accepted pivot. Recomputing an entire length-panel.rank dot product
+        // for each lookup makes pivot selection quadratic in the panel width.
+        //
+        // Remember the corrected value and the number of panel columns already
+        // applied. A revisited entry needs only the newly accepted columns.
+        // The packed indices are FRONT-LOCAL, independent of inherited storage
+        // origin/stride, and symmetric for either argument order.
+        //
+        // Small fronts use the original direct path to avoid a cache allocation.
+        constexpr int candidate_cache_min_width = 96;
+        const bool use_candidate_cache = width >= candidate_cache_min_width;
+        const std::size_t candidate_entries = use_candidate_cache
+            ? static_cast<std::size_t>(width) * (width + 1) / 2 : 0;
+        std::vector<double> candidate_values(candidate_entries);
+        std::vector<unsigned short> candidate_rank(candidate_entries);
+        std::vector<unsigned int> candidate_epoch(candidate_entries, 0U);
+        unsigned int epoch = 1;
+
         auto current = [&](int r, int c) {
-            double result = at(r,c);
-            for (int p = 0; p < panel.rank; ++p) {
+            // Always evaluate one canonical orientation of a symmetric entry,
+            // including when its two multipliers differ by roundoff.
+            if (r < c) { std::swap(r,c); }
+            double result;
+            int first_rank = 0;
+            std::size_t position = 0;
+            if (use_candidate_cache) {
+                position = static_cast<std::size_t>(r) * (r + 1) / 2 + c;
+                if (candidate_epoch[position] == epoch) {
+                    result = candidate_values[position];
+                    first_rank = candidate_rank[position];
+                } else {
+                    result = at(r,c);
+                }
+            } else {
+                result = at(r,c);
+            }
+            for (int p = first_rank; p < panel.rank; ++p) {
                 const auto base = static_cast<std::size_t>(p) * width;
                 result -= panel.left[base+r] * panel.right[base+c];
             }
             if (!std::isfinite(result)) {
                 throw std::runtime_error("Nonfinite blocked LDLT candidate");
+            }
+            if (use_candidate_cache) {
+                candidate_values[position] = result;
+                candidate_rank[position] = static_cast<unsigned short>(panel.rank);
+                candidate_epoch[position] = epoch;
             }
             return result;
         };
@@ -312,6 +352,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             rank_k_update(front.origin, width, active, panel, values);
             ++panels[owner];
             panel.clear();
+            // Full Schur flush changes the baseline front values. Invalidate
+            // cached panel-relative corrections without clearing large arrays.
+            if (++epoch == 0U) {
+                std::fill(candidate_epoch.begin(),candidate_epoch.end(),0U);
+                epoch = 1;
+            }
         };
 
         while (!active.empty()) {
