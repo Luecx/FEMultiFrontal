@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -33,6 +34,11 @@ int main() {
     auto seconds = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
     std::cout << std::unitbuf << std::setprecision(12);
     int failures = 0;
+    // Optional cross-product regression of numerical panel and supernode sizes.
+    const char* const panel_env = std::getenv("MF_TEST_LDLT_BLOCK_SIZE");
+    const char* const super_env = std::getenv("MF_TEST_LDLT_SUPERNODE_SIZE");
+    const int test_panel = panel_env ? std::stoi(panel_env) : 32;
+    const int test_super = super_env ? std::stoi(super_env) : 0;
     std::vector<int> thread_counts{1};
 #ifdef _OPENMP
     thread_counts.push_back(4);
@@ -65,6 +71,10 @@ int main() {
             mf::PivotFactor factor;
             factor.kind = symmetric ? mf::PivotFactor::Kind::Symmetric : mf::PivotFactor::Kind::General;
             factor.threads = threads;
+            if (symmetric) {
+                factor.block_size = test_panel;
+                factor.supernode_size = test_super;
+            }
             bool factored_ok = false;
             try {
                 const auto begin = Clock::now();
@@ -104,13 +114,17 @@ int main() {
                     (factor.two_by_two_pivots == 0 ||
                      (factor.block_size == 1 && factor.delayed_candidates == 0))) { pass = false; }
                 if (name == "delayed_across_supernode" &&
-                    (factor.two_by_two_pivots == 0 || factor.delayed_candidates == 0)) { pass = false; }
+                    (factor.two_by_two_pivots == 0 ||
+                     ((factor.supernode_size == 0 ? factor.block_size : factor.supernode_size) <= 32 &&
+                      factor.delayed_candidates == 0))) { pass = false; }
                 if (name == "forced_2x2_dense" &&
                     (factor.positive_directions != n/2 || factor.negative_directions != n/2)) { pass = false; }
                 if (name == "dense_null6" && factor.negative_directions != 0) { pass = false; }
                 if (!pass) { ++failures; }
                 std::cout << "case=" << name << " mode=" << (symmetric ? "ldlt" : "lu")
-                          << " threads=" << threads << " status=" << (pass ? "PASS" : "FAIL")
+                          << " threads=" << threads << " panel=" << factor.block_size
+                          << " supernode=" << (factor.supernode_size ? factor.supernode_size : factor.block_size)
+                          << " status=" << (pass ? "PASS" : "FAIL")
                           << " n=" << n << " rank=" << factor.rank << " expected_rank=" << expected_rank
                           << " pivots2=" << factor.two_by_two_pivots << " delays=" << factor.delayed_candidates
                           << " max_front=" << factor.maximum_front
