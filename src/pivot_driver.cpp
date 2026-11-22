@@ -23,7 +23,45 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <time.h>
+#endif
+
 namespace mf {
+
+namespace {
+// Per-thread resource accounting isolates time on-CPU from scheduler waits.
+// Linux-only, diagnostic-only; the solver and its numerical result are unchanged.
+struct ThreadSample {
+    double cpu_seconds = 0.0;
+    long voluntary_switches = 0;
+    long involuntary_switches = 0;
+    long minor_faults = 0;
+    long major_faults = 0;
+};
+
+ThreadSample sample_thread() {
+    ThreadSample sample;
+#if defined(__linux__)
+    timespec stamp{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &stamp) != 0) {
+        throw std::runtime_error("clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    }
+    sample.cpu_seconds = static_cast<double>(stamp.tv_sec) +
+                         static_cast<double>(stamp.tv_nsec) * 1e-9;
+    rusage resources{};
+    if (getrusage(RUSAGE_THREAD, &resources) != 0) {
+        throw std::runtime_error("getrusage(RUSAGE_THREAD) failed");
+    }
+    sample.voluntary_switches = resources.ru_nvcsw;
+    sample.involuntary_switches = resources.ru_nivcsw;
+    sample.minor_faults = resources.ru_minflt;
+    sample.major_faults = resources.ru_majflt;
+#endif
+    return sample;
+}
+} // namespace
 
 /**
  * Execute explicit pivoted modes and report their declared numerical policy.
@@ -42,6 +80,7 @@ int run_pivot_driver(int argc, char** argv) {
     double pivot_tolerance = 0.1;
     int ldlt_block_size = 32;
     bool analyze_only = false;
+    bool diagnose_timing = false;
     for (int i = 2; i < argc; ++i) {
         const std::string option = argv[i];
         if (option == "--matrix-type" && i + 1 < argc) { matrix_type = argv[++i]; }
@@ -52,6 +91,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--pivot-tolerance" && i + 1 < argc) { pivot_tolerance = std::stod(argv[++i]); }
         else if (option == "--ldlt-block-size" && i + 1 < argc) { ldlt_block_size = std::stoi(argv[++i]); }
         else if (option == "--analyze-only") { analyze_only = true; }
+        else if (option == "--diagnose-timing") { diagnose_timing = true; }
         else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
     }
     const bool symmetric = matrix_type == "symmetric" || matrix_type == "psd";
@@ -61,6 +101,14 @@ int run_pivot_driver(int argc, char** argv) {
     if (ldlt_block_size < 1 || ldlt_block_size > 256) {
         throw std::runtime_error("--ldlt-block-size must be in [1,256]");
     }
+    if (diagnose_timing && threads != 1) {
+        throw std::runtime_error("--diagnose-timing requires --threads 1");
+    }
+#if !defined(__linux__)
+    if (diagnose_timing) {
+        throw std::runtime_error("--diagnose-timing is supported on Linux only");
+    }
+#endif
     if (ordering != "natural" && ordering != "nd" && ordering != "metis") {
         throw std::runtime_error("Invalid ordering; expected nd, metis or natural");
     }
@@ -106,9 +154,11 @@ int run_pivot_driver(int argc, char** argv) {
     factor.block_size = ldlt_block_size;
     std::vector<double> totals;
     for (int trial = 0; trial < repeat; ++trial) {
+        const auto before_cpu = diagnose_timing ? sample_thread() : ThreadSample{};
         const auto begin = Clock::now();
         factor.factorize(permuted, symbolic);
         const auto factored = Clock::now();
+        const auto after_cpu = diagnose_timing ? sample_thread() : ThreadSample{};
         if (matrix_type == "psd" && factor.negative_directions != 0) {
             throw std::runtime_error("The declared PSD matrix has negative pivot directions");
         }
@@ -134,6 +184,20 @@ int run_pivot_driver(int argc, char** argv) {
                   << " solution_unique=" << int(factor.rank == matrix.n) << " max_front=" << factor.maximum_front
                   << " delayed_candidates=" << factor.delayed_candidates << " pivots_2x2=" << factor.two_by_two_pivots
                   << " relative_residual=" << relative;
+        if (diagnose_timing) {
+            const double wall = elapsed(begin, factored);
+            const double cpu = after_cpu.cpu_seconds - before_cpu.cpu_seconds;
+            std::cout << " factor_thread_cpu_s=" << cpu
+                      << " factor_cpu_wall_ratio=" << (wall > 0.0 ? cpu / wall : 0.0)
+                      << " factor_involuntary_switches="
+                      << (after_cpu.involuntary_switches - before_cpu.involuntary_switches)
+                      << " factor_voluntary_switches="
+                      << (after_cpu.voluntary_switches - before_cpu.voluntary_switches)
+                      << " factor_minor_faults="
+                      << (after_cpu.minor_faults - before_cpu.minor_faults)
+                      << " factor_major_faults="
+                      << (after_cpu.major_faults - before_cpu.major_faults);
+        }
         if (symmetric) {
             std::cout << " inertia_positive=" << factor.positive_directions << " inertia_negative=" << factor.negative_directions
                       << " inertia_zero=" << matrix.n - factor.rank;
