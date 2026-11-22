@@ -84,6 +84,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     packed_lower_values.clear();
     rank = positive_directions = negative_directions = two_by_two_pivots = 0;
     delayed_candidates = maximum_front = 0;
+    fast_path_pivots = fallback_searches = relaxed_groups = 0;
     minimum_pivot = std::numeric_limits<double>::infinity();
     row_scale.assign(n, 0.0);
     column_scale.assign(n, 0.0);

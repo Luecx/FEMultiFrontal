@@ -40,6 +40,7 @@ int run_pivot_driver(int argc, char** argv) {
     double rank_tolerance = 1e-12;
     double pivot_tolerance = 0.1;
     int ldlt_block_size = 32;
+    bool fast_pivoting = true, tiled_schur = true, relaxed_supernodes = true;
     bool analyze_only = false;
     for (int i = 2; i < argc; ++i) {
         const std::string option = argv[i];
@@ -50,6 +51,9 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--rank-tolerance" && i + 1 < argc) { rank_tolerance = std::stod(argv[++i]); }
         else if (option == "--pivot-tolerance" && i + 1 < argc) { pivot_tolerance = std::stod(argv[++i]); }
         else if (option == "--ldlt-block-size" && i + 1 < argc) { ldlt_block_size = std::stoi(argv[++i]); }
+        else if (option == "--ldlt-legacy-pivot-order") { fast_pivoting = false; }
+        else if (option == "--ldlt-no-tiled-schur") { tiled_schur = false; }
+        else if (option == "--ldlt-no-relaxed-supernodes") { relaxed_supernodes = false; }
         else if (option == "--analyze-only") { analyze_only = true; }
         else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
     }
@@ -102,6 +106,9 @@ int run_pivot_driver(int argc, char** argv) {
     factor.pivot_tolerance = pivot_tolerance;
     factor.threads = threads;
     factor.block_size = ldlt_block_size;
+    factor.fast_pivoting = fast_pivoting;
+    factor.tiled_schur = tiled_schur;
+    factor.relaxed_supernodes = relaxed_supernodes;
     std::vector<double> totals;
     for (int trial = 0; trial < repeat; ++trial) {
         const auto begin = Clock::now();
@@ -147,7 +154,10 @@ int run_pivot_driver(int argc, char** argv) {
     if (symmetric) {
         std::cout << "ldlt_block_size=" << ldlt_block_size
                   << " blocked_panels=" << factor.blocked_panels
-                  << " supernodes=" << factor.grouped_fronts << '\n';
+                  << " supernodes=" << factor.grouped_fronts
+                  << " relaxed_groups=" << factor.relaxed_groups
+                  << " fast_pivots=" << factor.fast_path_pivots
+                  << " fallback_searches=" << factor.fallback_searches << '\n';
     }
     std::cout << "median_numeric_s=" << median << '\n';
     return 0;
