@@ -12,6 +12,9 @@
 #include "symbolic.h"
 
 #include <array>
+#include <cstddef>
+#include <vector>
+#include "memory.h"
 
 namespace mf {
 
@@ -71,6 +74,18 @@ struct PivotFactor {
     std::vector<double> row_scale;
     std::vector<double> column_scale;
     bool ready = false;
+
+    // Serial numerical workspace persists across repeated factorizations.
+    // Parallel fronts use their own transient workspaces and do not share buffers.
+    struct Workspace {
+        std::vector<int> child_rows, child_columns, active_rows, active_columns, lower_positions;
+        std::vector<std::size_t> run_ends;
+        std::vector<double> update_upper;
+        std::vector<std::array<double, 2>> upper;
+        std::vector<memory::Values> recycled_values;
+        std::size_t recycled_bytes = 0;
+    };
+    Workspace workspace;
 
     // Numerical assembly follows the supplied structural forest, retaining delayed IDs
     void factorize(const GeneralMatrix& input, const Symbolic& symbolic);
