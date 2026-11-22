@@ -12,6 +12,7 @@
 #include "pivot_factor.h"
 #include "memory.h"
 #include "ldlt_schur.h"
+#include "ldlt_gemm.h"
 
 #include <algorithm>
 #include <array>
@@ -453,21 +454,109 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         std::iota(active.begin(), active.end(), 0);
         PivotPanel panel(width, factor.block_size);
 
-        auto current = [&](int r, int c) {
-            double result = at(r,c);
-            for (int p = 0; p < panel.rank; ++p) {
-                const auto base = static_cast<std::size_t>(p) * width;
-                result -= panel.left[base+r] * panel.right[base+c];
+        // Incrementally maintain fully summed candidate diagonals. Keep up
+        // to eight complete candidate rows as a tiny pivot workspace so the
+        // threshold test does not re-evaluate rank-length dot products for
+        // the same row on every accepted pivot.
+        constexpr int cache_capacity = 8;
+        std::vector<double> diagonal;
+        std::vector<double> cached_values;
+        std::vector<int> cache_slot;
+        std::array<int,cache_capacity> cached_ids{};
+        cached_ids.fill(-1);
+        if (factor.cached_pivot_rows) {
+            diagonal.resize(width);
+            cached_values.resize(static_cast<std::size_t>(cache_capacity)*width);
+            cache_slot.assign(width,-1);
+            for (int r=0;r<width;++r) { diagonal[r]=at(r,r); }
+        }
+        auto raw_current = [&](int r,int c) {
+            double result=at(r,c);
+            for (int p=0;p<panel.rank;++p) {
+                const auto base=static_cast<std::size_t>(p)*width;
+                result-=panel.left[base+r]*panel.right[base+c];
             }
             if (!std::isfinite(result)) {
                 throw std::runtime_error("Nonfinite blocked LDLT candidate");
             }
             return result;
         };
+        auto current = [&](int r,int c) {
+            if (factor.cached_pivot_rows) {
+                if (r==c) { return diagonal[r]; }
+                if (cache_slot[r]>=0) {
+                    return cached_values[static_cast<std::size_t>(cache_slot[r])*width+c];
+                }
+                if (cache_slot[c]>=0) {
+                    return cached_values[static_cast<std::size_t>(cache_slot[c])*width+r];
+                }
+            }
+            return raw_current(r,c);
+        };
+        auto refresh_candidates = [&](std::size_t count) {
+            if (!factor.cached_pivot_rows) { return; }
+            const int keep=static_cast<int>(std::min<std::size_t>(cache_capacity,count));
+            // Only cache rows in the current lookahead. Delayed rows can
+            // remain unchanged for many iterations, retaining their slots.
+            for (int slot=0;slot<cache_capacity;++slot) {
+                const int r=cached_ids[slot];
+                if (r<0) { continue; }
+                bool needed=false;
+                for (int j=0;j<keep;++j) {
+                    if (active[j]==r) { needed=true; break; }
+                }
+                if (!needed) {
+                    cache_slot[r]=-1;
+                    cached_ids[slot]=-1;
+                }
+            }
+            for (int j=0;j<keep;++j) {
+                const int r=active[j];
+                if (cache_slot[r]>=0) { continue; }
+                int slot=0;
+                while (slot<cache_capacity && cached_ids[slot]>=0) { ++slot; }
+                if (slot==cache_capacity) {
+                    throw std::runtime_error("LDLT candidate cache exhausted");
+                }
+                // This is done exactly once when a candidate enters the
+                // lookahead, not once per failed threshold check.
+                double* row=cached_values.data()+static_cast<std::size_t>(slot)*width;
+                for (int c:active) { row[c]=raw_current(r,c); }
+                cached_ids[slot]=r;
+                cache_slot[r]=slot;
+            }
+        };
+        auto apply_new_pivots_to_cache = [&](int base_rank,int count) {
+            if (!factor.cached_pivot_rows) { return; }
+            for (int p=base_rank;p<base_rank+count;++p) {
+                const auto base=static_cast<std::size_t>(p)*width;
+                for (int r:active) {
+                    diagonal[r]-=panel.left[base+r]*panel.right[base+r];
+                    if (!std::isfinite(diagonal[r])) {
+                        throw std::runtime_error("Nonfinite LDLT cached diagonal");
+                    }
+                }
+                for (int slot=0;slot<cache_capacity;++slot) {
+                    const int r=cached_ids[slot];
+                    if (r<0) { continue; }
+                    const double multiplier=panel.left[base+r];
+                    double* row=cached_values.data()+static_cast<std::size_t>(slot)*width;
+                    for (int c:active) {
+                        row[c]-=multiplier*panel.right[base+c];
+                        if (!std::isfinite(row[c])) {
+                            throw std::runtime_error("Nonfinite LDLT cached candidate row");
+                        }
+                    }
+                }
+            }
+        };
         auto flush = [&] {
             if (panel.rank == 0) { return; }
             const auto t = profile ? Clock::now() : Clock::time_point{};
-            if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
+            if (factor.dense_schur && active.size() >= 128 && panel.rank >= 8) {
+                dense::rank_k_ldlt_gemm(front.origin, width, active, panel.rank,
+                                        panel.left.data(), panel.right.data(), values);
+            } else if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
                 dense::rank_k_ldlt_tiled(front.origin, width, active, panel.rank,
                                          panel.left.data(), panel.right.data(), values);
             } else {
@@ -478,6 +567,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
             ++panels[owner];
             panel.clear();
+            if (factor.cached_pivot_rows) {
+                for (int slot=0;slot<cache_capacity;++slot) { cached_ids[slot]=-1; }
+                std::fill(cache_slot.begin(),cache_slot.end(),-1);
+                // Cached diagonals already include every accepted correction.
+                // Fresh rows will be rebuilt from the flushed physical front.
+            }
         };
 
         while (!active.empty()) {
@@ -488,6 +583,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 [&](int id, int local) { return id < front.rows[local]; });
             const auto eligible_count = static_cast<std::size_t>(eligible_end - active.begin());
             if (eligible_count == 0) { break; }
+            refresh_candidates(eligible_count);
 
             const auto search_started = profile ? Clock::now() : Clock::time_point{};
             int pivots[2] = {-1, -1};
@@ -642,6 +738,16 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             active.erase(std::remove_if(active.begin(), active.end(), [&](int r) {
                 return r == pivots[0] || (count == 2 && r == pivots[1]);
             }),active.end());
+            if (factor.cached_pivot_rows) {
+                for (int p=0;p<count;++p) {
+                    const int slot=cache_slot[pivots[p]];
+                    if (slot>=0) {
+                        cached_ids[slot]=-1;
+                        cache_slot[pivots[p]]=-1;
+                    }
+                }
+            }
+            apply_new_pivots_to_cache(base_rank,count);
             block.lower_count = owner_records.lower_rows.size() - block.lower_begin;
             owner_records.blocks.push_back(block);
         }
