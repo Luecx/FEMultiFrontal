@@ -72,51 +72,127 @@ struct PivotPanel {
 // Consume an entire accepted pivot panel while streaming each lower-triangle
 // output tile only once. Holes from noncontiguous pivoting remain supported.
 // The scalar path preserves the pivot acceptance order for all corrections.
+// Cache-blocked update of the packed lower triangle.
+//
+// Process four output rows and eight contiguous active columns at once. A
+// rank-major panel column is loaded once for all four rows, rather than four
+// times. The p loop keeps eight independent AVX registers live, avoiding the
+// long serial accumulator dependency of the original row-by-row kernel.
+//
+// Near the diagonal, or in the presence of holes in active positions, use the
+// exact scalar loop. This preserves 1x1/2x2 pivot order, dynamic row sets and
+// the existing nonfinite rejection contract.
 void rank_k_update(int origin, int dim, const std::vector<int>& active,
                    const PivotPanel& panel, double* values) {
     if (panel.rank == 0) { return; }
-    for (std::size_t i = 0; i < active.size(); ++i) {
-        const int r = active[i];
+    auto target_for = [&](int r) {
         const std::size_t physical = static_cast<std::size_t>(origin + r);
-        double* const target = values + physical * (physical + 1) / 2 + origin;
-        auto update_scalar = [&](std::size_t index) {
-            const int c = active[index];
-            double v = target[c];
-            for (int p = 0; p < panel.rank; ++p) {
-                const std::size_t base = static_cast<std::size_t>(p) * dim;
-                v -= panel.left[base + r] * panel.right[base + c];
-            }
-            if (!std::isfinite(v)) {
-                throw std::runtime_error("Nonfinite blocked LDLT Schur update");
-            }
-            target[c] = v;
-        };
-        std::size_t j = 0;
+        return values + physical * (physical + 1) / 2 + origin;
+    };
+    auto update_scalar = [&](double* target, int r, int c) {
+        double v = target[c];
+        for (int p = 0; p < panel.rank; ++p) {
+            const std::size_t base = static_cast<std::size_t>(p) * dim;
+            v -= panel.left[base + r] * panel.right[base + c];
+        }
+        if (!std::isfinite(v)) {
+            throw std::runtime_error("Nonfinite blocked LDLT Schur update");
+        }
+        target[c] = v;
+    };
+
+    std::size_t i = 0;
 #if defined(__AVX2__) && defined(__FMA__)
-        const __m256d sign = _mm256_set1_pd(-0.0);
-        const __m256d limit = _mm256_set1_pd(std::numeric_limits<double>::max());
-        for (; j + 4 <= i + 1; ) {
+    const __m256d sign = _mm256_set1_pd(-0.0);
+    const __m256d limit = _mm256_set1_pd(std::numeric_limits<double>::max());
+    const auto finite = [&](const __m256d x) {
+        return _mm256_movemask_pd(
+            _mm256_cmp_pd(_mm256_andnot_pd(sign, x), limit, _CMP_LE_OQ)) == 15;
+    };
+    for (; i + 4 <= active.size(); i += 4) {
+        const int r0 = active[i];
+        const int r1 = active[i+1];
+        const int r2 = active[i+2];
+        const int r3 = active[i+3];
+        double* const t0 = target_for(r0);
+        double* const t1 = target_for(r1);
+        double* const t2 = target_for(r2);
+        double* const t3 = target_for(r3);
+
+        std::size_t j = 0;
+        for (; j + 8 <= i + 1;) {
             const int c = active[j];
-            if (active[j + 3] != c + 3) {
-                update_scalar(j++);
+            if (active[j+7] != c+7) {
+                const int scattered = active[j++];
+                update_scalar(t0, r0, scattered);
+                update_scalar(t1, r1, scattered);
+                update_scalar(t2, r2, scattered);
+                update_scalar(t3, r3, scattered);
                 continue;
             }
-            __m256d result = _mm256_loadu_pd(target + c);
+            __m256d a00 = _mm256_loadu_pd(t0+c);
+            __m256d a01 = _mm256_loadu_pd(t0+c+4);
+            __m256d a10 = _mm256_loadu_pd(t1+c);
+            __m256d a11 = _mm256_loadu_pd(t1+c+4);
+            __m256d a20 = _mm256_loadu_pd(t2+c);
+            __m256d a21 = _mm256_loadu_pd(t2+c+4);
+            __m256d a30 = _mm256_loadu_pd(t3+c);
+            __m256d a31 = _mm256_loadu_pd(t3+c+4);
             for (int p = 0; p < panel.rank; ++p) {
                 const std::size_t base = static_cast<std::size_t>(p) * dim;
-                const __m256d l = _mm256_set1_pd(panel.left[base + r]);
-                const __m256d u = _mm256_loadu_pd(panel.right.data() + base + c);
-                result = _mm256_sub_pd(result, _mm256_mul_pd(l, u));
+                const double* const l = panel.left.data() + base;
+                const double* const u = panel.right.data() + base + c;
+                const __m256d u0 = _mm256_loadu_pd(u);
+                const __m256d u1 = _mm256_loadu_pd(u+4);
+                const __m256d l0 = _mm256_set1_pd(l[r0]);
+                const __m256d l1 = _mm256_set1_pd(l[r1]);
+                const __m256d l2 = _mm256_set1_pd(l[r2]);
+                const __m256d l3 = _mm256_set1_pd(l[r3]);
+                a00 = _mm256_sub_pd(a00, _mm256_mul_pd(l0,u0));
+                a01 = _mm256_sub_pd(a01, _mm256_mul_pd(l0,u1));
+                a10 = _mm256_sub_pd(a10, _mm256_mul_pd(l1,u0));
+                a11 = _mm256_sub_pd(a11, _mm256_mul_pd(l1,u1));
+                a20 = _mm256_sub_pd(a20, _mm256_mul_pd(l2,u0));
+                a21 = _mm256_sub_pd(a21, _mm256_mul_pd(l2,u1));
+                a30 = _mm256_sub_pd(a30, _mm256_mul_pd(l3,u0));
+                a31 = _mm256_sub_pd(a31, _mm256_mul_pd(l3,u1));
             }
-            const __m256d finite = _mm256_cmp_pd(_mm256_andnot_pd(sign, result), limit, _CMP_LE_OQ);
-            if (_mm256_movemask_pd(finite) != 15) {
+            if (!(finite(a00) && finite(a01) && finite(a10) && finite(a11) &&
+                  finite(a20) && finite(a21) && finite(a30) && finite(a31))) {
                 throw std::runtime_error("Nonfinite blocked LDLT Schur update");
             }
-            _mm256_storeu_pd(target + c, result);
-            j += 4;
+            _mm256_storeu_pd(t0+c,a00);
+            _mm256_storeu_pd(t0+c+4,a01);
+            _mm256_storeu_pd(t1+c,a10);
+            _mm256_storeu_pd(t1+c+4,a11);
+            _mm256_storeu_pd(t2+c,a20);
+            _mm256_storeu_pd(t2+c+4,a21);
+            _mm256_storeu_pd(t3+c,a30);
+            _mm256_storeu_pd(t3+c+4,a31);
+            j += 8;
         }
+        // The remaining columns include the four different diagonal tails.
+        // Earlier scattered columns and complete 8-wide tiles were consumed.
+        for (std::size_t col = j; col <= i; ++col) {
+            update_scalar(t0,r0,active[col]);
+        }
+        for (std::size_t col = j; col <= i+1; ++col) {
+            update_scalar(t1,r1,active[col]);
+        }
+        for (std::size_t col = j; col <= i+2; ++col) {
+            update_scalar(t2,r2,active[col]);
+        }
+        for (std::size_t col = j; col <= i+3; ++col) {
+            update_scalar(t3,r3,active[col]);
+        }
+    }
 #endif
-        for (; j <= i; ++j) { update_scalar(j); }
+    for (; i < active.size(); ++i) {
+        const int r = active[i];
+        double* const target = target_for(r);
+        for (std::size_t j = 0; j <= i; ++j) {
+            update_scalar(target,r,active[j]);
+        }
     }
 }
 
