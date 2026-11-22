@@ -9,6 +9,7 @@
  * choices and symmetric two-variable pivots.
  */
 #include "pivot_factor.h"
+#include "blocked_ldlt.h"
 #include "dense_pivot.h"
 
 #include <algorithm>
@@ -60,6 +61,10 @@ struct NumericFront {
  * is assumed. A nonzero unresolved root is an error, not an invented nullmode.
  */
 void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic) {
+    if (kind == Kind::Symmetric && block_size >= 2) {
+        factorize_blocked_ldlt(*this, input, symbolic);
+        return;
+    }
     // Validate mode, tolerances and the structural ownership contract
     ready = false;
     if (rank_tolerance <= 0.0 || !std::isfinite(rank_tolerance) || pivot_tolerance <= 0.0 ||

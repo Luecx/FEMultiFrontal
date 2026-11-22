@@ -96,7 +96,14 @@ int main() {
                 bool pass = !incompatible && factor.rank == expected_rank &&
                                   std::isfinite(residual) && residual < 1e-8 && backward < 1e-8;
                 if (name.rfind("forced_2x2",0) == 0 && factor.two_by_two_pivots == 0) { pass = false; }
+                // A supernode may eliminate a previously delayed scalar
+                // candidate in the same assembled panel instead of passing it
+                // to an explicit parent front. Require the same 2x2 pivot, but
+                // count only delays that actually cross supernode boundaries.
                 if (name.rfind("delayed_2x2",0) == 0 &&
+                    (factor.two_by_two_pivots == 0 ||
+                     (factor.block_size == 1 && factor.delayed_candidates == 0))) { pass = false; }
+                if (name == "delayed_across_supernode" &&
                     (factor.two_by_two_pivots == 0 || factor.delayed_candidates == 0)) { pass = false; }
                 if (name == "forced_2x2_dense" &&
                     (factor.positive_directions != n/2 || factor.negative_directions != n/2)) { pass = false; }
@@ -233,6 +240,18 @@ int main() {
         }
         dense[5*n+10] = dense[10*n+5] = 1.0;
         check("delayed_2x2_after_scalar_panel", n, dense, true, n, false, true);
+
+        // The two singular-diagonal partners are on opposite sides of an
+        // amalgamated 32-pivot supernode boundary. This one must genuinely
+        // delay a candidate into the next frontal assembly, even when blocked.
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                dense[r*n+c] = r == c ? ((r == 31 || r == 32) ? 0.0 : 2.0) :
+                    0.0001*std::cos(0.1*(r+c));
+            }
+        }
+        dense[31*n+32] = dense[32*n+31] = 1.0;
+        check("delayed_across_supernode", n, dense, true, n, false, true);
 
         // A full-column-rank dyadic B gives A=B*B^T exactly rank n-6.
         // Its leading triangular block stays well conditioned during elimination.

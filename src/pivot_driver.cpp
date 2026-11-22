@@ -39,6 +39,7 @@ int run_pivot_driver(int argc, char** argv) {
     int threads = 1;
     double rank_tolerance = 1e-12;
     double pivot_tolerance = 0.1;
+    int ldlt_block_size = 32;
     bool analyze_only = false;
     for (int i = 2; i < argc; ++i) {
         const std::string option = argv[i];
@@ -48,12 +49,16 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--threads" && i + 1 < argc) { threads = std::stoi(argv[++i]); }
         else if (option == "--rank-tolerance" && i + 1 < argc) { rank_tolerance = std::stod(argv[++i]); }
         else if (option == "--pivot-tolerance" && i + 1 < argc) { pivot_tolerance = std::stod(argv[++i]); }
+        else if (option == "--ldlt-block-size" && i + 1 < argc) { ldlt_block_size = std::stoi(argv[++i]); }
         else if (option == "--analyze-only") { analyze_only = true; }
         else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
     }
     const bool symmetric = matrix_type == "symmetric" || matrix_type == "psd";
     if ((!symmetric && matrix_type != "general") || repeat < 1 || threads < 1) {
         throw std::runtime_error("Expected matrix-type spd/symmetric/psd/general and positive repeat/threads");
+    }
+    if (ldlt_block_size < 1 || ldlt_block_size > 256) {
+        throw std::runtime_error("--ldlt-block-size must be in [1,256]");
     }
     if (ordering != "natural" && ordering != "nd") {
         throw std::runtime_error("Invalid ordering; expected nd or natural");
@@ -96,6 +101,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.rank_tolerance = rank_tolerance;
     factor.pivot_tolerance = pivot_tolerance;
     factor.threads = threads;
+    factor.block_size = ldlt_block_size;
     std::vector<double> totals;
     for (int trial = 0; trial < repeat; ++trial) {
         const auto begin = Clock::now();
@@ -138,6 +144,11 @@ int run_pivot_driver(int argc, char** argv) {
     std::sort(totals.begin(), totals.end());
     const std::size_t middle = totals.size() / 2;
     const double median = totals.size() % 2 ? totals[middle] : 0.5 * (totals[middle - 1] + totals[middle]);
+    if (symmetric) {
+        std::cout << "ldlt_block_size=" << ldlt_block_size
+                  << " blocked_panels=" << factor.blocked_panels
+                  << " supernodes=" << factor.grouped_fronts << '\n';
+    }
     std::cout << "median_numeric_s=" << median << '\n';
     return 0;
 }
