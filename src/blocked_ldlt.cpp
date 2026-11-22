@@ -296,6 +296,27 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         std::iota(active.begin(), active.end(), 0);
         PivotPanel panel(width, factor.block_size);
 
+        // Only original IDs <= owner are fully summed in this front. Build
+        // eager numerical rows for these candidates. Their cost is O(E*N)
+        // per accepted pivot instead of O(E*N*panel_rank) repeated lazy
+        // correction work during threshold-pivot scanning.
+        const int eligible_limit = static_cast<int>(std::upper_bound(
+            front.rows.begin(), front.rows.end(), owner) - front.rows.begin());
+        constexpr std::size_t eager_entry_limit = 1'000'000;
+        const bool eager_candidates = width >= 96 && eligible_limit >= 8 &&
+            static_cast<std::size_t>(eligible_limit) * width <= eager_entry_limit;
+        std::vector<double> eager_values;
+        if (eager_candidates) {
+            eager_values.resize(static_cast<std::size_t>(eligible_limit)*width);
+            for (int e = 0; e < eligible_limit; ++e) {
+                double* const row = eager_values.data() +
+                    static_cast<std::size_t>(e)*width;
+                // Only the upper-right triangle is used. The underlying
+                // packed front stores the symmetric element once.
+                for (int c = e; c < width; ++c) { row[c] = at(c,e); }
+            }
+        }
+
         // The same candidate entries are revisited after almost every
         // accepted pivot. Recomputing an entire length-panel.rank dot product
         // for each lookup makes pivot selection quadratic in the panel width.
@@ -307,7 +328,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         //
         // Small fronts use the original direct path to avoid a cache allocation.
         constexpr int candidate_cache_min_width = 96;
-        const bool use_candidate_cache = width >= candidate_cache_min_width;
+        const bool use_candidate_cache =
+            !eager_candidates && width >= candidate_cache_min_width;
         const std::size_t candidate_entries = use_candidate_cache
             ? static_cast<std::size_t>(width) * (width + 1) / 2 : 0;
         std::vector<double> candidate_values(candidate_entries);
@@ -319,6 +341,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             // Always evaluate one canonical orientation of a symmetric entry,
             // including when its two multipliers differ by roundoff.
             if (r < c) { std::swap(r,c); }
+            if (eager_candidates && c < eligible_limit) {
+                return eager_values[static_cast<std::size_t>(c)*width+r];
+            }
             double result;
             int first_rank = 0;
             std::size_t position = 0;
@@ -352,6 +377,19 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             rank_k_update(front.origin, width, active, panel, values);
             ++panels[owner];
             panel.clear();
+            // The trailing Schur matrix is now materialized in front.values.
+            // Rebase the eager candidate rows so any roundoff from the actual
+            // Schur kernel is reflected in subsequent pivot decisions.
+            if (eager_candidates) {
+                for (int e : active) {
+                    if (e >= eligible_limit) { break; }
+                    double* const row = eager_values.data() +
+                        static_cast<std::size_t>(e)*width;
+                    for (int c : active) {
+                        if (c >= e) { row[c] = at(c,e); }
+                    }
+                }
+            }
             // Full Schur flush changes the baseline front values. Invalidate
             // cached panel-relative corrections without clearing large arrays.
             if (++epoch == 0U) {
@@ -476,6 +514,37 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 }
             }
             panel.rank += count;
+
+            // Immediately apply the accepted rank-1/rank-2 correction to
+            // every remaining fully-summed candidate row. This transforms
+            // threshold scans into contiguous reads without repeated dot
+            // products or per-entry cache bookkeeping.
+            if (eager_candidates) {
+                for (int e : active) {
+                    if (e >= eligible_limit) { break; }
+                    if (e == pivots[0] || (count == 2 && e == pivots[1])) {
+                        continue;
+                    }
+                    double* const row = eager_values.data() +
+                        static_cast<std::size_t>(e)*width;
+                    for (int c : active) {
+                        if (c < e || c == pivots[0] ||
+                            (count == 2 && c == pivots[1])) { continue; }
+                        double value = row[c];
+                        for (int k = 0; k < count; ++k) {
+                            const auto base = static_cast<std::size_t>(base_rank + k)*width;
+                            // current() canonicalizes to (max, min). Match
+                            // that exact arithmetic orientation here.
+                            value -= panel.left[base+c] * panel.right[base+e];
+                        }
+                        if (!std::isfinite(value)) {
+                            throw std::runtime_error("Nonfinite eager LDLT pivot row");
+                        }
+                        row[c] = value;
+                    }
+                }
+            }
+
             active.erase(std::remove_if(active.begin(), active.end(), [&](int r) {
                 return r == pivots[0] || (count == 2 && r == pivots[1]);
             }),active.end());
