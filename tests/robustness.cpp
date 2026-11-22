@@ -101,6 +101,21 @@ int main() {
                 if (name == "forced_2x2_dense" &&
                     (factor.positive_directions != n/2 || factor.negative_directions != n/2)) { pass = false; }
                 if (name == "dense_null6" && factor.negative_directions != 0) { pass = false; }
+                // Re-factorizing the same object must be bitwise reproducible:
+                // its scratch vectors and recycled front buffers now survive calls.
+                if (threads == 1 && (name == "forced_2x2_dense" ||
+                                     name == "delayed_2x2_after_scalar_panel" ||
+                                     name == "dense_null6")) {
+                    const int previous_rank = factor.rank;
+                    const int previous_two = factor.two_by_two_pivots;
+                    const std::size_t previous_delays = factor.delayed_candidates;
+                    factor.factorize(matrix, symbolic);
+                    const auto repeated = factor.solve(rhs);
+                    pass &= factor.rank == previous_rank &&
+                            factor.two_by_two_pivots == previous_two &&
+                            factor.delayed_candidates == previous_delays &&
+                            repeated == x;
+                }
                 if (!pass) { ++failures; }
                 std::cout << "case=" << name << " mode=" << (symmetric ? "ldlt" : "lu")
                           << " threads=" << threads << " status=" << (pass ? "PASS" : "FAIL")
