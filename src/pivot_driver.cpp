@@ -40,6 +40,7 @@ int run_pivot_driver(int argc, char** argv) {
     double rank_tolerance = 1e-12;
     double pivot_tolerance = 0.1;
     int ldlt_block_size = 32;
+    int ldlt_supernode_size = 0;
     bool analyze_only = false;
     for (int i = 2; i < argc; ++i) {
         const std::string option = argv[i];
@@ -50,6 +51,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--rank-tolerance" && i + 1 < argc) { rank_tolerance = std::stod(argv[++i]); }
         else if (option == "--pivot-tolerance" && i + 1 < argc) { pivot_tolerance = std::stod(argv[++i]); }
         else if (option == "--ldlt-block-size" && i + 1 < argc) { ldlt_block_size = std::stoi(argv[++i]); }
+        else if (option == "--ldlt-supernode-size" && i + 1 < argc) { ldlt_supernode_size = std::stoi(argv[++i]); }
         else if (option == "--analyze-only") { analyze_only = true; }
         else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
     }
@@ -59,6 +61,9 @@ int run_pivot_driver(int argc, char** argv) {
     }
     if (ldlt_block_size < 1 || ldlt_block_size > 256) {
         throw std::runtime_error("--ldlt-block-size must be in [1,256]");
+    }
+    if (ldlt_supernode_size < 0 || ldlt_supernode_size > 256) {
+        throw std::runtime_error("--ldlt-supernode-size must be in [1,256] when specified");
     }
     if (ordering != "natural" && ordering != "nd") {
         throw std::runtime_error("Invalid ordering; expected nd or natural");
@@ -102,6 +107,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.pivot_tolerance = pivot_tolerance;
     factor.threads = threads;
     factor.block_size = ldlt_block_size;
+    factor.supernode_size = ldlt_supernode_size;
     std::vector<double> totals;
     for (int trial = 0; trial < repeat; ++trial) {
         const auto begin = Clock::now();
@@ -146,6 +152,7 @@ int run_pivot_driver(int argc, char** argv) {
     const double median = totals.size() % 2 ? totals[middle] : 0.5 * (totals[middle - 1] + totals[middle]);
     if (symmetric) {
         std::cout << "ldlt_block_size=" << ldlt_block_size
+                  << " ldlt_supernode_size=" << (ldlt_supernode_size > 0 ? ldlt_supernode_size : ldlt_block_size)
                   << " blocked_panels=" << factor.blocked_panels
                   << " supernodes=" << factor.grouped_fronts << '\n';
     }
