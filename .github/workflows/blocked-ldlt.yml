@@ -1,7 +1,7 @@
 name: Blocked LDLT
 on:
   push:
-    branches: [main, perf/ldlt-blocked-multifrontal, perf/haken-ldlt-dual-vector-schur]
+    branches: [main, perf/ldlt-blocked-multifrontal]
   pull_request:
     branches: [main]
   workflow_dispatch:
