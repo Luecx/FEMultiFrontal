@@ -149,6 +149,50 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
     auto process = [&](int owner) {
         // An exact unary match can consume a child buffer directly. Delayed
         // rows can change the index set, so check the actual outgoing IDs.
+        // Reuse scratch and aligned buffers only for the strictly serial path.
+        // Concurrent fronts still own independent storage.
+        Workspace local_workspace;
+        Workspace& scratch = threads == 1 ? workspace : local_workspace;
+        constexpr std::size_t cache_limit = std::size_t{128} * 1024 * 1024;
+        constexpr std::size_t buffer_limit = 48;
+        auto acquire_values = [&](std::size_t required) {
+            memory::Values buffer;
+            if (threads == 1 && required != 0) {
+                std::size_t best = scratch.recycled_values.size();
+                std::size_t best_capacity = std::numeric_limits<std::size_t>::max();
+                for (std::size_t i = 0; i < scratch.recycled_values.size(); ++i) {
+                    const std::size_t capacity = scratch.recycled_values[i].capacity();
+                    if (capacity >= required && capacity < best_capacity) {
+                        best = i;
+                        best_capacity = capacity;
+                    }
+                }
+                if (best < scratch.recycled_values.size()) {
+                    buffer = std::move(scratch.recycled_values[best]);
+                    scratch.recycled_bytes -= buffer.capacity() * sizeof(double);
+                    if (best + 1 != scratch.recycled_values.size()) {
+                        scratch.recycled_values[best] = std::move(scratch.recycled_values.back());
+                    }
+                    scratch.recycled_values.pop_back();
+                }
+            }
+            if (buffer.capacity() < required) { buffer.reserve(required); }
+            buffer.clear();
+            return buffer;
+        };
+        auto recycle_values = [&](memory::Values& buffer) {
+            const std::size_t bytes = buffer.capacity() * sizeof(double);
+            if (threads == 1 && bytes > 0 && bytes <= cache_limit &&
+                scratch.recycled_bytes <= cache_limit - bytes &&
+                scratch.recycled_values.size() < buffer_limit) {
+                buffer.clear();
+                scratch.recycled_values.push_back(std::move(buffer));
+                scratch.recycled_bytes += bytes;
+            } else {
+                memory::Values{}.swap(buffer);
+            }
+        };
+
         NumericFront front;
         const auto first = symbolic.row.begin() + symbolic.ptr[owner];
         const auto last  = symbolic.row.begin() + symbolic.ptr[owner+1];
@@ -179,7 +223,9 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         if (!inherited) {
             front.stride = nc;
             const auto rows = static_cast<std::size_t>(nr);
-            front.values.assign(symmetric ? rows*(rows+1)/2 : rows*nc, 0.0);
+            const std::size_t required = symmetric ? rows*(rows+1)/2 : rows*nc;
+            front.values = acquire_values(required);
+            front.values.assign(required, 0.0);
         }
         double* const values = front.values.data();
         auto row_position = [&](int id) {
@@ -281,8 +327,12 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
         for (int child = symbolic.first_child[owner]; child != -1; child = symbolic.next_child[child]) {
             if (inherited && child == child_to_reuse) { continue; }
             auto& source = contributions[child];
-            std::vector<int> rows;
-            std::vector<int> columns;
+            auto& rows = scratch.child_rows;
+            auto& columns = scratch.child_columns;
+            rows.clear();
+            columns.clear();
+            rows.reserve(source.rows.size());
+            columns.reserve(source.columns.size());
             for (int id : source.rows) { rows.push_back(assembly_row(id)); }
             if (!symmetric) {
                 for (int id : source.columns) { columns.push_back(assembly_column(id)); }
@@ -290,7 +340,8 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             if (symmetric) {
                 // The child-to-parent map is increasing. Build contiguous
                 // spans once, then apply their prefixes to each packed row.
-                std::vector<std::size_t> run_ends;
+                auto& run_ends = scratch.run_ends;
+                run_ends.clear();
                 if (rows.size() >= 32) {
                     for (std::size_t c = 1; c < rows.size(); ++c) {
                         if (rows[c] != rows[c-1]+1) { run_ends.push_back(c); }
@@ -325,22 +376,26 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                     }
                 }
             }
+            recycle_values(source.values);
+            recycle_values(source.pending_lower);
+            recycle_values(source.pending_upper);
             source = NumericFront{};
         }
-        std::vector<int> active_rows(nr);
-        std::vector<int> active_columns(nc);
+        auto& active_rows = scratch.active_rows;
+        auto& active_columns = scratch.active_columns;
+        active_rows.resize(nr);
+        active_columns.resize(nc);
         std::iota(active_rows.begin(), active_rows.end(), 0);
         std::iota(active_columns.begin(), active_columns.end(), 0);
 
         // Reuse local positions and contiguous pivot-row coefficients only for
         // sufficiently large symmetric fronts. LU keeps its independent path.
         const bool dense_update = symmetric && nc >= 64;
-        std::vector<int> lower_positions;
-        std::vector<double> update_upper;
-        if (dense_update) {
-            lower_positions.reserve(nr);
-            update_upper.resize(2*static_cast<std::size_t>(nc));
-        }
+        auto& lower_positions = scratch.lower_positions;
+        auto& update_upper = scratch.update_upper;
+        lower_positions.clear();
+        lower_positions.reserve(nr);
+        if (dense_update) { update_upper.resize(2*static_cast<std::size_t>(nc)); }
 
         // Only original IDs that have reached this front are fully summed candidates
         while (!active_rows.empty() && !active_columns.empty()) {
@@ -458,12 +513,13 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 const std::array<double, 2> lower = size == 1 ? std::array<double, 2>{x / det, 0.0} :
                     std::array<double, 2>{(x * d - y * b) / det, (y * a - x * b) / det};
                 if (lower[0] != 0.0 || lower[1] != 0.0) {
-                    if (dense_update) { lower_positions.push_back(r); }
+                    lower_positions.push_back(r);
                     block.lower_rows.push_back(front.rows[r]);
                     block.lower_values.push_back(lower);
                 }
             }
-            std::vector<std::array<double, 2>> upper(dense_update ? 0 : nc);
+            auto& upper = scratch.upper;
+            if (!dense_update) { upper.resize(nc); }
             for (int c : active_columns) {
                 if (dense_update) {
                     update_upper[c] = at(pivot_rows[0], c);
@@ -526,7 +582,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
             } else if (!defer) {
                 // Update trailing coordinates. Symmetric pairs are evaluated once and mirrored
                 for (std::size_t p = 0; p < block.lower_rows.size(); ++p) {
-                    const int r = row_position(block.lower_rows[p]);
+                    const int r = lower_positions[p];
                     const auto lower = block.lower_values[p];
                     for (int c : active_columns) {
                         if (symmetric && c > r) { continue; }
@@ -578,7 +634,7 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 flush_pending();
                 output.stride = static_cast<int>(active_columns.size());
                 const auto rows = active_rows.size();
-                output.values.reserve(symmetric ? rows*(rows+1)/2 : rows*active_columns.size());
+                output.values = acquire_values(symmetric ? rows*(rows+1)/2 : rows*active_columns.size());
                 for (std::size_t r = 0; r < rows; ++r) {
                     const auto count = symmetric ? r+1 : active_columns.size();
                     for (std::size_t c = 0; c < count; ++c) {
@@ -587,6 +643,11 @@ void PivotFactor::factorize(const GeneralMatrix& input, const Symbolic& symbolic
                 }
             }
         }
+        // Non-inherited fronts no longer have a numerical consumer.
+        // Inherited buffers have already moved into their outgoing contribution.
+        recycle_values(front.values);
+        recycle_values(front.pending_lower);
+        recycle_values(front.pending_upper);
     };
 
     // Schedule coarse independent subtrees; pivot selection remains local and deterministic
