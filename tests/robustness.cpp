@@ -283,6 +283,48 @@ int main() {
                         pass = false;
                     }
                 }
+
+                // Speculative signed 1x1 panel must retain robust fallback,
+                // inertia, rank and independent residual on indefinite,
+                // 2x2, delayed and singular matrices. Always compare against
+                // the unchanged regular solver on identical symbolic input.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor batch;
+                    batch.kind = mf::PivotFactor::Kind::Symmetric;
+                    batch.supernode_size = factor.supernode_size;
+                    batch.pivot_major_cache_refresh = true;
+                    batch.simd_cache_apply = true;
+                    batch.signed_batch_panels = true;
+                    batch.signed_batch_width = 16;
+                    batch.factorize(matrix,symbolic);
+                    const auto bx = batch.solve(rhs);
+                    const auto bax = matrix.multiply(bx);
+                    long double br2=0.0L,bb2=0.0L;
+                    for (int k=0;k<n;++k) {
+                        const long double d=static_cast<long double>(bax[k])-rhs[k];
+                        br2+=d*d;
+                        bb2+=static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double bres=std::sqrt(br2/std::max(bb2,1e-300L));
+                    const bool exercised = name != "signed_batch_dense" ||
+                        (batch.signed_batch_attempts>0 && batch.signed_batch_pivots>=4);
+                    if (batch.rank != factor.rank ||
+                        batch.positive_directions != factor.positive_directions ||
+                        batch.negative_directions != factor.negative_directions ||
+                        !exercised || !std::isfinite(bres) || bres>=1e-8) {
+                        std::cerr << "Signed LDLT batch panel disagreement in "
+                                  << name << " rank=" << batch.rank << "/"
+                                  << factor.rank << " inertia=("
+                                  << batch.positive_directions << ","
+                                  << batch.negative_directions << ")/("
+                                  << factor.positive_directions << ","
+                                  << factor.negative_directions << ")"
+                                  << " attempts=" << batch.signed_batch_attempts
+                                  << " accepted=" << batch.signed_batch_pivots
+                                  << " residual=" << bres << '\n';
+                        pass=false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
@@ -458,6 +500,18 @@ int main() {
         }
         dense[1] = dense[n] = 1.0;
         check("forced_2x2_dense",n,dense,true,n);
+
+        // Dense diagonally stable signed block guarantees at least one
+        // substantial batch. Both positive and negative 1x1 D entries
+        // are essential: this is a true LDLT path, never a hidden LLT.
+        for (int r=0;r<n;++r) {
+            for (int c=0;c<n;++c) {
+                dense[r*n+c]= r == c ? (r%3==0 ? -4.0 : 4.0) :
+                    0.001*std::cos(0.1*(r+c));
+            }
+        }
+        check("signed_batch_dense",n,dense,true,n,false,true);
+
 
         // A strong future coupling postpones variable zero while several
         // intervening scalar pivots create holes in a still-large active front.
