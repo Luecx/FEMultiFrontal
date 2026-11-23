@@ -13,6 +13,7 @@
 #include "memory.h"
 #include "ldlt_schur.h"
 #include "ldlt_indexed_schur.h"
+#include "ldlt_extend_add.h"
 
 #include <algorithm>
 #include <array>
@@ -350,6 +351,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> cache_refresh_s(profile ? n : 0,0.0);
     std::vector<std::size_t> pivot_major_cache_rows(profile ? n : 0,0);
     std::vector<std::size_t> simd_cache_apply_quads(profile ? n : 0,0);
+    std::vector<std::size_t> segmented_extend_add_rows(profile ? n : 0,0);
+    std::vector<std::size_t> segmented_extend_add_sources(profile ? n : 0,0);
     std::vector<double> cache_apply_s(profile ? n : 0,0.0);
     std::vector<double> panel_build_s(profile ? n : 0,0.0);
     std::vector<double> pivot_bookkeeping_s(profile ? n : 0,0.0);
@@ -530,13 +533,27 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             std::vector<int> child_map;
             child_map.reserve(source.rows.size());
             for (int id : source.rows) { child_map.push_back(locate(id)); }
+            const dense::ExtendAddPlan segments =
+                factor.segmented_extend_add
+                    ? dense::plan_segmented_extend_add(child_map)
+                    : dense::ExtendAddPlan{};
+            if (profile && segments.enabled) {
+                ++segmented_extend_add_sources[owner];
+                segmented_extend_add_rows[owner] += child_map.size();
+            }
             for (std::size_t r = 0; r < child_map.size(); ++r) {
                 const std::size_t sr = static_cast<std::size_t>(source.origin) + r;
                 const double* const from = source.values.data() +
                     sr * (sr + 1) / 2 + source.origin;
                 const std::size_t tr = static_cast<std::size_t>(front.origin + child_map[r]);
                 double* const to = values + tr * (tr + 1) / 2 + front.origin;
-                for (std::size_t c = 0; c <= r; ++c) { to[child_map[c]] += from[c]; }
+                if (segments.enabled) {
+                    dense::extend_add_row_segmented(to,from,static_cast<int>(r),segments);
+                } else {
+                    for (std::size_t c = 0; c <= r; ++c) {
+                        to[child_map[c]] += from[c];
+                    }
+                }
             }
             source = BlockFront{};
         }
@@ -1214,6 +1231,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
             "front_contained_sources=%zu front_merged_sources=%zu "
             "pivot_major_cache_rows=%zu simd_cache_apply_quads=%zu "
+            "segmented_extend_add_sources=%zu segmented_extend_add_rows=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1226,7 +1244,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
             sum_count(front_contained_sources),sum_count(front_merged_sources),
             sum_count(pivot_major_cache_rows),
-            sum_count(simd_cache_apply_quads));
+            sum_count(simd_cache_apply_quads),
+            sum_count(segmented_extend_add_sources),
+            sum_count(segmented_extend_add_rows));
     }
     factor.ready = true;
 }

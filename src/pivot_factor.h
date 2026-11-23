@@ -86,6 +86,7 @@ struct PivotFactor {
     bool cached_pivot_rows = true; // Incrementally updated lookahead rows and diagonals.
     bool pivot_major_cache_refresh = false; // Experimental rank-major SIMD rebuild of lookahead cache.
     bool simd_cache_apply = false; // Experimental AVX2 contiguous-run updates for retained candidate rows.
+    bool segmented_extend_add = false; // Experimental contiguous-run child-to-parent packed assembly.
     bool relaxed_supernodes = true;
 
     // Legacy per-pivot representation for scalar LDLT and general LU.
