@@ -29,9 +29,9 @@ all: $(BUILD_DIR)/mfsolve
 # Standalone LDLT microbenchmark: no solver linkage, no BLAS dependency.
 kernel-sweep: $(BUILD_DIR)/ldlt-kernel-sweep
 
-$(BUILD_DIR)/ldlt-kernel-sweep: benchmarks/ldlt_kernel_sweep.cpp
+$(BUILD_DIR)/ldlt-kernel-sweep: benchmarks/ldlt_kernel_sweep.cpp src/ldlt_schur.cpp src/ldlt_schur.h
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) benchmarks/ldlt_kernel_sweep.cpp src/ldlt_schur.cpp $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BUILD_DIR)/mfsolve: $(LIB_OBJECTS) $(BUILD_DIR)/main.o
 	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
