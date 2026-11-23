@@ -20,6 +20,7 @@ jobs:
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-supernode-size 1
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-supernode-size 64
+          ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-gemm-schur
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-no-indexed-schur
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-legacy-pivot-order --ldlt-no-tiled-schur --ldlt-no-relaxed-supernodes
       - name: Smoke-test reproducible LDLT A/B benchmark
@@ -28,6 +29,7 @@ jobs:
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --ablations
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --indexed-ablation
+          python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --gemm-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --contribution-copy-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --front-prepare-ablation
           python3 -m py_compile benchmarks/sweep_ldlt_panel_supernode.py
@@ -55,6 +57,11 @@ jobs:
           grep -q 'front_position_map_s=' /tmp/ldlt-profile.txt
           grep -q 'front_contained_sources=' /tmp/ldlt-profile.txt
           grep -q 'front_merged_sources=' /tmp/ldlt-profile.txt
+          grep -q 'staged_gemm_pack_s=' /tmp/ldlt-profile.txt
+          grep -q 'staged_gemm_load_s=' /tmp/ldlt-profile.txt
+          grep -q 'staged_gemm_compute_s=' /tmp/ldlt-profile.txt
+          grep -q 'staged_gemm_store_s=' /tmp/ldlt-profile.txt
+          grep -q 'staged_gemm_tiles=' /tmp/ldlt-profile.txt
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
