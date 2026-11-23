@@ -48,8 +48,9 @@ region; input packing done *by the kernel* is included.
 ### Variants
 
 - Scalar reference and scalar column unroll factors 2, 4, 8, 16.
+- **Exact production `rank_k_ldlt_tiled` kernel**, linked from the solver source.
 - Direct AVX2/FMA output tiles: 4×8, 6×8, 8×8, 4×16, 6×16, 8×16,
-  12×8, 4×32, 6×32.
+  12×8, 4×32.
 - Rank-major **B-packed** tiles: 4×8, 6×8, 6×16.
 - Rank-major **A+B-packed** tiles: 4×8, 6×8, 6×16.
 
@@ -63,8 +64,9 @@ to scalar updates for irregular `active` blocks.
 
 - **Hot** repeatedly updates the same packed contribution, showing the
   processor's compute/L1/L2/LLC behavior once warmed.
-- **Cold** rotates through independent packed contributions. The buffer pool
-  attempts to exceed the effective LLC and better exposes memory bandwidth.
+- **Cold** rotates through independent packed contributions **and L/R factor
+  panels**. The buffer pool attempts to exceed the effective LLC and better
+  exposes memory bandwidth. Factor panels stay reused *within* each front.
 - Both modes keep a *single thread*. Comparing 20 variants inside the same
   binary avoids compilation and ordering differences.
 - The test excludes assembly-tree traversal, pivot selection, factor-row
