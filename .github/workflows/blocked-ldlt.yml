@@ -14,7 +14,7 @@ jobs:
       - name: Compile and run regression tests (single threaded)
         run: |
           make -j2 all check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
-      - name: Compile and verify all 20 signed LDLT Schur microkernels
+      - name: Compile and verify all 26 signed LDLT Schur microkernels
         run: |
           make -j2 kernel-sweep CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
           ./build/native/ldlt-kernel-sweep --verify-only --sizes 9,33,65,129,256 --ranks 1,2,8,32 --holes 0,12 --origins 0,19
