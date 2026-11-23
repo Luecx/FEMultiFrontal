@@ -149,20 +149,42 @@ int main() {
                         pb2+=static_cast<long double>(rhs[k])*rhs[k];
                     }
                     const double pres=std::sqrt(pr2/std::max(pb2,1e-300L));
+                    // A lazily materialized row may evaluate a rank-length
+                    // correction with slightly different floating-point
+                    // contraction than a row updated after every pivot.
+                    // Require EXACT structural/pivot decisions and tightly
+                    // equivalent numerical values; the other ablations must
+                    // continue to match bit-for-bit.
+                    auto coefficient_equal = [&](double a,double b) {
+                        if (ablation != 2) { return a == b; }
+                        return std::isfinite(a) && std::isfinite(b) &&
+                            std::abs(a-b) <= 1e-13 *
+                                std::max({1.0,std::abs(a),std::abs(b)});
+                    };
                     bool metadata_identical =
                         previous.rank == factor.rank &&
                         previous.positive_directions == factor.positive_directions &&
                         previous.negative_directions == factor.negative_directions &&
                         previous.two_by_two_pivots == factor.two_by_two_pivots &&
                         previous.packed_lower_rows == factor.packed_lower_rows &&
-                        previous.packed_lower_values == factor.packed_lower_values &&
+                        previous.packed_lower_values.size() == factor.packed_lower_values.size() &&
                         previous.packed_blocks.size() == factor.packed_blocks.size();
+                    if (metadata_identical) {
+                        for (std::size_t k=0;k<factor.packed_lower_values.size();++k) {
+                            if (!coefficient_equal(previous.packed_lower_values[k],
+                                                   factor.packed_lower_values[k])) {
+                                metadata_identical=false;
+                                break;
+                            }
+                        }
+                    }
                     if (metadata_identical) {
                         for (std::size_t i=0;i<factor.packed_blocks.size();++i) {
                             const auto& a=factor.packed_blocks[i];
                             const auto& b=previous.packed_blocks[i];
                             if (a.size!=b.size || a.rows!=b.rows ||
-                                a.diagonal!=b.diagonal ||
+                                !std::equal(a.diagonal.begin(),a.diagonal.end(),
+                                    b.diagonal.begin(),coefficient_equal) ||
                                 a.lower_begin!=b.lower_begin ||
                                 a.value_begin!=b.value_begin ||
                                 a.lower_count!=b.lower_count) {
