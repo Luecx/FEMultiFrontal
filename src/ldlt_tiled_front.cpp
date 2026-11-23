@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 #if defined(__AVX2__) && defined(__FMA__)
@@ -34,20 +35,30 @@ void rank_k_ldlt_tiled_front(int origin, int dim, const std::vector<int>& active
     std::vector<double> b(static_cast<std::size_t>(tiles) * panel_size, 0.0);
 
     for (int r : active) {
-        const int physical = origin + r;
-        const int tile = physical / BS;
-        const int lane = physical % BS;
-        selected[tile].push_back(lane);
-        for (int p = 0; p < rank; ++p) {
-            const std::size_t base = static_cast<std::size_t>(tile) * panel_size +
-                                     static_cast<std::size_t>(p) * BS + lane;
-            a[base] = left[static_cast<std::size_t>(p)*dim + r];
-            b[base] = right[static_cast<std::size_t>(p)*dim + r];
+        selected[(origin+r)/BS].push_back((origin+r)%BS);
+    }
+    // Traverse the source factors in rank-major order. Traversing pivot
+    // columns for each active row would load them at full front-width
+    // strides and squander spatial locality before the Schur computation.
+    for (int p = 0; p < rank; ++p) {
+        const std::size_t source = static_cast<std::size_t>(p)*dim;
+        for (int r : active) {
+            const int physical = origin+r;
+            const int tile = physical/BS;
+            const int lane = physical%BS;
+            const std::size_t target = static_cast<std::size_t>(tile)*panel_size +
+                                       static_cast<std::size_t>(p)*BS + lane;
+            a[target] = left[source+r];
+            b[target] = right[source+r];
         }
     }
 
     // Each lower output tile is traversed once and remains physically dense.
     // The row/column-lane lists exclude all delayed-pivot holes.
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256d sign = _mm256_set1_pd(-0.0);
+    const __m256d maxval = _mm256_set1_pd(std::numeric_limits<double>::max());
+#endif
     for (int ti = 0; ti < tiles; ++ti) {
         const auto& rows = selected[ti];
         if (rows.empty()) { continue; }
@@ -94,14 +105,14 @@ void rank_k_ldlt_tiled_front(int origin, int dim, const std::vector<int>& active
                             }
                         }
                         for (int r = 0; r < 4; ++r) {
-                            alignas(32) double check[8];
-                            _mm256_store_pd(check,c0[r]);
-                            _mm256_store_pd(check+4,c1[r]);
-                            for (double value : check) {
-                                if (!std::isfinite(value)) {
-                                    throw std::runtime_error(
-                                        "Nonfinite tile-packed LDLT Schur update");
-                                }
+                            const __m256d good0 = _mm256_cmp_pd(
+                                _mm256_andnot_pd(sign,c0[r]),maxval,_CMP_LE_OQ);
+                            const __m256d good1 = _mm256_cmp_pd(
+                                _mm256_andnot_pd(sign,c1[r]),maxval,_CMP_LE_OQ);
+                            if (_mm256_movemask_pd(good0) != 15 ||
+                                _mm256_movemask_pd(good1) != 15) {
+                                throw std::runtime_error(
+                                    "Nonfinite tile-packed LDLT Schur update");
                             }
                             double* row = tile + static_cast<std::size_t>(rows[ir+r])*BS
                                           + first_col;
