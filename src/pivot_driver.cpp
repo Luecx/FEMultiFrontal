@@ -171,6 +171,8 @@ int run_pivot_driver(int argc, char** argv) {
     const double median = totals.size() % 2 ? totals[middle] : 0.5 * (totals[middle - 1] + totals[middle]);
     if (symmetric) {
         std::cout << "ldlt_block_size=" << ldlt_block_size
+                  << " ldlt_supernode_size="
+                  << (ldlt_supernode_size == 0 ? ldlt_block_size : ldlt_supernode_size)
                   << " blocked_panels=" << factor.blocked_panels
                   << " supernodes=" << factor.grouped_fronts
                   << " relaxed_groups=" << factor.relaxed_groups
