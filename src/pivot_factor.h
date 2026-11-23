@@ -80,7 +80,8 @@ struct PivotFactor {
     // The general LU and scalar LDLT paths are unaffected.
     bool fast_pivoting = true;
     bool tiled_schur = true;
-    bool indexed_schur = true; // Experimental packed 4x8 SIMD kernel; disable for A/B.
+    bool indexed_schur = true; // Packed 4x8 SIMD kernel; disable for A/B.
+    bool staged_gemm_schur = false; // Experimental dense C-tile GEMM; retain packed fronts.
     bool fast_contribution_copy = true; // Optimized packed outgoing triangle; false runs exact original.
     bool fast_front_prepare = true; // Merge sorted frontal row patterns; false uses original sort/unique.
     bool cached_pivot_rows = true; // Incrementally updated lookahead rows and diagonals.
