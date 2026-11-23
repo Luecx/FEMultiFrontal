@@ -23,8 +23,15 @@ LIB_OBJECTS := $(LIB_SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)
 TEST_OBJECTS := $(BUILD_DIR)/tests/check.o $(BUILD_DIR)/tests/robustness.o $(BUILD_DIR)/tests/pivot_update.o $(BUILD_DIR)/tests/ldlt_schur.o
 OBJECTS := $(LIB_OBJECTS) $(BUILD_DIR)/main.o $(TEST_OBJECTS)
 
-.PHONY: all check test clean
+.PHONY: all check test clean kernel-sweep
 all: $(BUILD_DIR)/mfsolve
+
+# Standalone LDLT microbenchmark: no solver linkage, no BLAS dependency.
+kernel-sweep: $(BUILD_DIR)/ldlt-kernel-sweep
+
+$(BUILD_DIR)/ldlt-kernel-sweep: benchmarks/ldlt_kernel_sweep.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BUILD_DIR)/mfsolve: $(LIB_OBJECTS) $(BUILD_DIR)/main.o
 	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
