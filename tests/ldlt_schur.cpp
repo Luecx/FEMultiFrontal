@@ -7,6 +7,7 @@
  */
 #include "ldlt_schur.h"
 #include "ldlt_indexed_schur.h"
+#include "ldlt_staged_gemm.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -49,17 +50,19 @@ static void check(int dim, int rank, int origin, int layout, bool parallel_run) 
             expected[offset+col] = v;
         }
     }
-    // Exercise both the incumbent and the new index-aware packed panel
-    // implementation, including the threaded taskloop for sufficiently large
-    // matrix/rank combinations. All inactive and guard positions must remain.
-    for (int variant=0; variant<2; ++variant) {
+    // Exercise tiled, indexed packed and dense-staged GEMM kernels, including
+    // OpenMP calls. Every inactive or guard entry must remain untouched.
+    for (int variant=0; variant<3; ++variant) {
         std::vector<double> actual(expected.size(),1.25);
         auto update = [&] {
             if (variant==0) {
                 mf::dense::rank_k_ldlt_tiled(
                     origin,dim,active,rank,left.data(),right.data(),actual.data());
-            } else {
+            } else if (variant == 1) {
                 mf::dense::rank_k_ldlt_indexed_packed(
+                    origin,dim,active,rank,left.data(),right.data(),actual.data());
+            } else {
+                mf::dense::rank_k_ldlt_staged_gemm(
                     origin,dim,active,rank,left.data(),right.data(),actual.data());
             }
         };
@@ -76,7 +79,7 @@ static void check(int dim, int rank, int origin, int layout, bool parallel_run) 
             if (!std::isfinite(actual[i]) ||
                 diff>2e-12*std::max(1.0,std::abs(expected[i]))) {
                 throw std::runtime_error(
-                    std::string(variant==0?"Tiled":"Indexed packed")+
+                    std::string(variant==0?"Tiled":variant==1?"Indexed packed":"Staged GEMM")+
                     " LDLT Schur update differs from scalar reference at entry "+
                     std::to_string(i));
             }
@@ -101,7 +104,7 @@ int main() {
         // active set and a high enough rank, then exercise irregular holes.
         check(1025,64,19,0,true);
         check(1025,64,19,1,true);
-        std::cout << "PASS: " << cases+2 << " tiled and indexed packed LDLT Schur cases\n";
+        std::cout << "PASS: " << cases+2 << " tiled, indexed and staged-GEMM LDLT Schur cases\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
