@@ -863,9 +863,38 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 const auto copy_started = profile ? Clock::now() : Clock::time_point{};
                 output.stride = static_cast<int>(active.size());
                 output.values.reserve(active.size() * (active.size()+1) / 2);
-                for (std::size_t r = 0; r < active.size(); ++r) {
-                    for (std::size_t c = 0; c <= r; ++c) {
-                        output.values.push_back(at(active[r],active[c]));
+                if (factor.fast_contribution_copy && !active.empty()) {
+                    // Active indices are sorted. For each output row, the
+                    // source lies entirely below the physical diagonal.
+                    // Avoid repeated max/min in at() for every copied entry.
+                    const int first_active = active.front();
+                    const bool contiguous =
+                        static_cast<std::size_t>(active.back()-first_active+1) == active.size();
+                    for (std::size_t r=0; r<active.size(); ++r) {
+                        const std::size_t physical = static_cast<std::size_t>(
+                            front.origin+active[r]);
+                        const double* row = values +
+                            physical*(physical+1)/2 + front.origin;
+                        if (contiguous) {
+                            // One bulk copy per packed output row; input may
+                            // have a nonzero inherited front origin.
+                            output.values.insert(
+                                output.values.end(), row+first_active,
+                                row+first_active+r+1);
+                        } else {
+                            // Delayed-pivot holes: copy only the active entries
+                            // in canonical packed order; no dense-front repack.
+                            for (std::size_t c=0; c<=r; ++c) {
+                                output.values.push_back(row[active[c]]);
+                            }
+                        }
+                    }
+                } else {
+                    // Exact incumbent path for A/B measurements and rollback.
+                    for (std::size_t r=0; r<active.size(); ++r) {
+                        for (std::size_t c=0; c<=r; ++c) {
+                            output.values.push_back(at(active[r],active[c]));
+                        }
                     }
                 }
                 if (profile) {
