@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -355,6 +356,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> contribution_move_s(profile ? n : 0,0.0);
     std::vector<std::size_t> contribution_copy_entries(profile ? n : 0,0);
     std::vector<std::size_t> contribution_moved_fronts(profile ? n : 0,0);
+    // Subphases of front_prepare_s, not additional time.
+    std::vector<double> front_row_union_s(profile ? n : 0,0.0);
+    std::vector<double> front_zero_s(profile ? n : 0,0.0);
+    std::vector<double> front_position_map_s(profile ? n : 0,0.0);
+    std::vector<std::size_t> front_contained_sources(profile ? n : 0,0);
+    std::vector<std::size_t> front_merged_sources(profile ? n : 0,0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
@@ -386,13 +393,47 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         const bool inherited = exact_group && reusable != -1 &&
             contributions[reusable].rows.size() == static_cast<std::size_t>(last - first) &&
             std::equal(first, last, contributions[reusable].rows.begin());
+        const auto row_union_started = profile ? Clock::now() : Clock::time_point{};
         if (inherited) {
             front = std::move(contributions[reusable]);
             contributions[reusable] = BlockFront{};
-        } else {
+        } else if (factor.fast_front_prepare) {
+            // Symbolic column rows and completed child contribution rows are
+            // sorted. Build their union incrementally in linear time per input
+            // list rather than concatenate duplicates and re-sort the entire
+            // potentially large frontal row pattern.
             front.rows.assign(first, last);
-            // A relaxed unary merge may introduce original parent-column rows
-            // absent from the bottom scalar front. Preserve the full union.
+            std::vector<int> merged;
+            auto add_sorted = [&](auto begin, auto end) {
+                if (begin==end) { return; }
+                if (std::includes(front.rows.begin(),front.rows.end(),begin,end)) {
+                    if (profile) { ++front_contained_sources[owner]; }
+                    return;
+                }
+                merged.clear();
+                merged.reserve(front.rows.size()+static_cast<std::size_t>(end-begin));
+                std::set_union(front.rows.begin(),front.rows.end(),begin,end,
+                               std::back_inserter(merged));
+                front.rows.swap(merged);
+                if (profile) { ++front_merged_sources[owner]; }
+            };
+            // The bottom column is already in front.rows: never add it twice.
+            for (std::size_t k=1;k<members.size();++k) {
+                const int member=members[k];
+                add_sorted(symbolic.row.begin()+symbolic.ptr[member],
+                           symbolic.row.begin()+symbolic.ptr[member+1]);
+            }
+            for (int child=symbolic.first_child[bottom]; child!=-1;
+                 child=symbolic.next_child[child]) {
+                const auto& rows=contributions[child].rows;
+                add_sorted(rows.begin(),rows.end());
+            }
+            // Preserve the original strict-unique row invariant even if an
+            // input range contains repeated indices.
+            front.rows.erase(std::unique(front.rows.begin(),front.rows.end()),front.rows.end());
+        } else {
+            // Exact original assembly for benchmark A/B and rollback.
+            front.rows.assign(first, last);
             for (int member : members) {
                 const auto begin = symbolic.row.begin()+symbolic.ptr[member];
                 const auto end = symbolic.row.begin()+symbolic.ptr[member+1];
@@ -405,9 +446,22 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
             std::sort(front.rows.begin(), front.rows.end());
             front.rows.erase(std::unique(front.rows.begin(), front.rows.end()), front.rows.end());
+        }
+        if (profile) {
+            front_row_union_s[owner] += std::chrono::duration<double>(
+                Clock::now()-row_union_started).count();
+        }
+        if (!inherited) {
+            // The frontal matrix must remain fully zero-initialized: original
+            // columns and child contributions are subsequently added into it.
+            const auto zero_started = profile ? Clock::now() : Clock::time_point{};
             const auto width = static_cast<std::size_t>(front.rows.size());
             front.values.assign(width * (width + 1) / 2, 0.0);
             front.stride = static_cast<int>(width);
+            if (profile) {
+                front_zero_s[owner] += std::chrono::duration<double>(
+                    Clock::now()-zero_started).count();
+            }
         }
         const int width = static_cast<int>(front.rows.size());
         widths[owner] = width;
@@ -423,10 +477,15 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
 #ifdef _OPENMP
         worker = omp_get_thread_num();
 #endif
+        const auto position_map_started = profile ? Clock::now() : Clock::time_point{};
         auto& positions = worker_positions[worker];
         if (width >= 16 && positions.empty()) { positions.resize(n); }
         if (width >= 16) {
             for (int i = 0; i < width; ++i) { positions[front.rows[i]] = i; }
+        }
+        if (profile) {
+            front_position_map_s[owner] += std::chrono::duration<double>(
+                Clock::now()-position_map_started).count();
         }
         auto locate = [&](int id) {
             return width >= 16 ? positions[id] :
@@ -1062,6 +1121,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "front_prepare_s=%.6f original_assemble_s=%.6f extend_add_s=%.6f "
             "contribution_copy_s=%.6f contribution_move_s=%.6f "
             "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
+            "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
+            "front_contained_sources=%zu front_merged_sources=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1070,7 +1131,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum(contribution_s),unattributed,factor_pack_s,
             sum(front_prepare_s),sum(original_assemble_s),sum(extend_add_s),
             sum(contribution_copy_s),sum(contribution_move_s),
-            sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts));
+            sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts),
+            sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
+            sum_count(front_contained_sources),sum_count(front_merged_sources));
     }
     factor.ready = true;
 }
