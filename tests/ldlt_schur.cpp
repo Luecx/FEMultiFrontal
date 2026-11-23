@@ -11,6 +11,7 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void check(int dim, int rank, int origin, int layout, bool parallel_run) {
