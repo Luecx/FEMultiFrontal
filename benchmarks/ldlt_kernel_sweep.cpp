@@ -11,6 +11,7 @@
  * This benchmark intentionally does not link to FEMF or to BLAS. It can
  * validate and time the kernels independently before changing solver code.
  */
+#include "ldlt_schur.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -97,6 +98,11 @@ void scalar_reference(const Fixture& f,double* c,Scratch&) {
         for(std::size_t j=0;j<=i;++j)
             target[f.active[j]]=cell(f,c,r,f.active[j]);
     }
+}
+// Exact incumbent kernel, rather than a reconstructed approximation.
+void production_current(const Fixture& f,double* c,Scratch&) {
+    mf::dense::rank_k_ldlt_tiled(f.origin,f.n,f.active,f.rank,
+                                 f.left.data(),f.right.data(),c);
 }
 
 template<int W> void column_unroll(const Fixture& f,double* c,Scratch&) {
@@ -236,7 +242,7 @@ constexpr std::array<Variant,20> kernels{{
     {"direct_8x16",tiled<8,16,0>},
     {"direct_12x8",tiled<12,8,0>},
     {"direct_4x32",tiled<4,32,0>},
-    {"direct_6x32",tiled<6,32,0>},
+    {"production_current",production_current},
     {"packedB_4x8",tiled<4,8,1>},
     {"packedB_6x8",tiled<6,8,1>},
     {"packedB_6x16",tiled<6,16,1>},
@@ -352,9 +358,27 @@ double measure(const Fixture& f,const Variant& variant,const std::string& mode,
     pool.resize(one*count);
     for(std::size_t i=0;i<count;++i)
         std::copy(f.initial.begin(),f.initial.end(),pool.data()+i*one);
+    // Cold workloads must rotate BOTH the contribution C and factor panels:
+    // otherwise L/R stay hot and only C tests streaming memory behavior.
+    // Fixture copies share no allocation with each other; initial is omitted.
+    std::vector<Fixture> cold_factors;
+    if(cold) {
+        cold_factors.reserve(count);
+        for(std::size_t i=0;i<count;++i) {
+            Fixture candidate;
+            candidate.n=f.n;candidate.rank=f.rank;candidate.origin=f.origin;
+            candidate.active=f.active;
+            candidate.left=f.left;
+            candidate.right=f.right;
+            cold_factors.push_back(std::move(candidate));
+        }
+    }
     const auto begin=Clock::now();
-    for(std::size_t i=0;i<iterations;++i)
-        variant.call(f,pool.data()+(i%count)*one,work);
+    for(std::size_t i=0;i<iterations;++i) {
+        const std::size_t slot=i%count;
+        const Fixture& factor=cold?cold_factors[slot]:f;
+        variant.call(factor,pool.data()+slot*one,work);
+    }
     const auto end=Clock::now();
     checksum_sink=pool[(iterations%count)*one+(one/2)];
     return elapsed_ms(begin,end)/iterations;
