@@ -49,17 +49,19 @@ static void check(int dim, int rank, int origin, int layout, bool parallel_run) 
             expected[offset+col] = v;
         }
     }
-    // Exercise both the incumbent and the new index-aware packed panel
-    // implementation, including the threaded taskloop for sufficiently large
-    // matrix/rank combinations. All inactive and guard positions must remain.
-    for (int variant=0; variant<2; ++variant) {
+    // Exercise tiled, packed 4x8 and packed 6x8 kernels, including inherited
+    // origins, index holes, guard positions and threaded Schur taskloops.
+    for (int variant=0; variant<3; ++variant) {
         std::vector<double> actual(expected.size(),1.25);
         auto update = [&] {
             if (variant==0) {
                 mf::dense::rank_k_ldlt_tiled(
                     origin,dim,active,rank,left.data(),right.data(),actual.data());
-            } else {
+            } else if (variant == 1) {
                 mf::dense::rank_k_ldlt_indexed_packed(
+                    origin,dim,active,rank,left.data(),right.data(),actual.data());
+            } else {
+                mf::dense::rank_k_ldlt_indexed_packed6(
                     origin,dim,active,rank,left.data(),right.data(),actual.data());
             }
         };
