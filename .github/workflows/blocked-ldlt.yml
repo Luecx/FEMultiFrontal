@@ -28,6 +28,7 @@ jobs:
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --indexed-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --contribution-copy-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --front-prepare-ablation
+          python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --lazy-cache-ablation
       - name: Verify detailed LDLT profiling output
         run: |
           FEMF_LDLT_PROFILE=1 ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 > /tmp/ldlt-profile.txt 2>&1
@@ -51,6 +52,8 @@ jobs:
           grep -q 'front_position_map_s=' /tmp/ldlt-profile.txt
           grep -q 'front_contained_sources=' /tmp/ldlt-profile.txt
           grep -q 'front_merged_sources=' /tmp/ldlt-profile.txt
+          grep -q 'cache_prefetched_rows=' /tmp/ldlt-profile.txt
+          grep -q 'cache_demand_rows=' /tmp/ldlt-profile.txt
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
