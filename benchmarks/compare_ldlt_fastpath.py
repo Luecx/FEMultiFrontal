@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--ablations", action="store_true", help="Compare PR23 baseline with the pivot-cache-only candidate")
     parser.add_argument("--indexed-ablation", action="store_true",
                         help="Compare current production Schur kernel with new packed-indexed kernel")
+    parser.add_argument("--gemm-ablation", action="store_true",
+                        help="Compare production packed Schur updates with experimental dense-staged GEMM")
     parser.add_argument("--contribution-copy-ablation", action="store_true",
                         help="Compare exact original contribution compaction with optimized packed row copies")
     parser.add_argument("--front-prepare-ablation", action="store_true",
@@ -72,9 +74,11 @@ def main():
             command = ["taskset", "-c", str(args.cpu)] + command
 
         if sum((args.ablations, args.indexed_ablation, args.contribution_copy_ablation,
-                args.front_prepare_ablation)) > 1:
+                args.front_prepare_ablation, args.gemm_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": (), "candidate": ("--ldlt-gemm-schur",)}
+            if args.gemm_ablation else
             {"previous": ("--ldlt-no-fast-front-prepare",), "candidate": ()}
             if args.front_prepare_ablation else
             {"previous": ("--ldlt-no-fast-contribution-copy",), "candidate": ()}
@@ -134,7 +138,8 @@ def main():
             print(f"{label}_median_s={median:.9f} {label}_MAD_s={mad:.9f}")
         baseline = "previous" if any((args.ablations, args.indexed_ablation,
                                      args.contribution_copy_ablation,
-                                     args.front_prepare_ablation)) else "legacy"
+                                     args.front_prepare_ablation,
+                                     args.gemm_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
