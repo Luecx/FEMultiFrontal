@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,6 +99,29 @@ int main() {
                         ++cases;
                     }
                 }
+            }
+        }
+        // The dense GEMM staging path must reject a nonfinite correction
+        // instead of silently committing it to the persistent frontal buffer.
+        {
+            constexpr int n=257;
+            constexpr int rank=16;
+            std::vector<int> active(n);
+            for(int i=0;i<n;++i) { active[i]=i; }
+            std::vector<double> left(static_cast<std::size_t>(n)*rank,0.0);
+            std::vector<double> right(static_cast<std::size_t>(n)*rank,0.0);
+            std::vector<double> packed(static_cast<std::size_t>(n)*(n+1)/2,1.25);
+            left[0] = std::numeric_limits<double>::infinity();
+            right[0] = 1.0;
+            bool rejected=false;
+            try {
+                mf::dense::rank_k_ldlt_staged_gemm(
+                    0,n,active,rank,left.data(),right.data(),packed.data());
+            } catch(const std::runtime_error&) {
+                rejected=true;
+            }
+            if(!rejected) {
+                throw std::runtime_error("Staged GEMM accepted nonfinite correction");
             }
         }
         // Cross the intra-front parallel-work threshold with a contiguous
