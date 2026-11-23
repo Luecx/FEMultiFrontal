@@ -13,6 +13,7 @@
 #include "memory.h"
 #include "ldlt_schur.h"
 #include "ldlt_indexed_schur.h"
+#include "ldlt_tiled_front.h"
 
 #include <algorithm>
 #include <array>
@@ -48,6 +49,20 @@ struct BlockFront {
     memory::Values values;
     int origin = 0;
     int stride = 0;
+    bool tiled = false;
+
+    // r/c are logical indices in rows; origin maps them to the inherited
+    // physical backing allocation. The tiled variant keeps exactly this
+    // coordinate convention so ownership transfers need no reindexing.
+    const double& at(int r, int c) const {
+        const int physical_row = origin + std::max(r,c);
+        const int physical_col = origin + std::min(r,c);
+        const std::size_t index = tiled
+            ? dense::tiled_front_offset(physical_row,physical_col)
+            : static_cast<std::size_t>(physical_row)*(physical_row+1)/2
+              + physical_col;
+        return values[index];
+    }
 };
 
 // One writer per front: scalar pivot headers and all multiplier entries are
@@ -461,7 +476,14 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             // columns and child contributions are subsequently added into it.
             const auto zero_started = profile ? Clock::now() : Clock::time_point{};
             const auto width = static_cast<std::size_t>(front.rows.size());
-            front.values.assign(width * (width + 1) / 2, 0.0);
+            // Tile-major storage is enabled only for substantial fronts.
+            // Padding all the thousands of tiny multifrontal leaves to 32x32
+            // would waste memory without offering any Schur acceleration.
+            front.tiled = factor.tiled_front_storage && width >= 96;
+            const auto entries = front.tiled
+                ? dense::tiled_front_entries(width)
+                : width*(width+1)/2;
+            front.values.assign(entries, 0.0);
             front.stride = static_cast<int>(width);
             if (profile) {
                 front_zero_s[owner] += std::chrono::duration<double>(
@@ -472,8 +494,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         widths[owner] = width;
         double* const values = front.values.data();
         auto at = [&](int r, int c) -> double& {
-            const auto physical = static_cast<std::size_t>(front.origin + std::max(r,c));
-            return values[physical * (physical + 1) / 2 + front.origin + std::min(r,c)];
+            const int physical_row = front.origin + std::max(r,c);
+            const int physical_col = front.origin + std::min(r,c);
+            if (front.tiled) {
+                return values[dense::tiled_front_offset(physical_row,physical_col)];
+            }
+            return values[static_cast<std::size_t>(physical_row)*(physical_row+1)/2
+                          + physical_col];
         };
 
         // A worker's map is live only while assembling its current front;
@@ -528,13 +555,27 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             std::vector<int> child_map;
             child_map.reserve(source.rows.size());
             for (int id : source.rows) { child_map.push_back(locate(id)); }
-            for (std::size_t r = 0; r < child_map.size(); ++r) {
-                const std::size_t sr = static_cast<std::size_t>(source.origin) + r;
-                const double* const from = source.values.data() +
-                    sr * (sr + 1) / 2 + source.origin;
-                const std::size_t tr = static_cast<std::size_t>(front.origin + child_map[r]);
-                double* const to = values + tr * (tr + 1) / 2 + front.origin;
-                for (std::size_t c = 0; c <= r; ++c) { to[child_map[c]] += from[c]; }
+            if (!front.tiled && !source.tiled) {
+                // Preserve the incumbent fast streaming extend-add on the
+                // standard row-packed layout.
+                for (std::size_t r = 0; r < child_map.size(); ++r) {
+                    const std::size_t sr = static_cast<std::size_t>(source.origin) + r;
+                    const double* const from = source.values.data() +
+                        sr * (sr + 1) / 2 + source.origin;
+                    const std::size_t tr = static_cast<std::size_t>(front.origin + child_map[r]);
+                    double* const to = values + tr * (tr + 1) / 2 + front.origin;
+                    for (std::size_t c = 0; c <= r; ++c) { to[child_map[c]] += from[c]; }
+                }
+            } else {
+                // Mixed layouts are valid: a tiled front may inherit a small
+                // row-packed child and vice versa. Never reinterpret the
+                // child's physical backing storage as the parent's layout.
+                for (std::size_t r = 0; r < child_map.size(); ++r) {
+                    for (std::size_t c = 0; c <= r; ++c) {
+                        at(child_map[r],child_map[c]) +=
+                            source.at(static_cast<int>(r),static_cast<int>(c));
+                    }
+                }
             }
             source = BlockFront{};
         }
@@ -651,7 +692,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         auto flush = [&] {
             if (panel.rank == 0) { return; }
             const auto t = profile ? Clock::now() : Clock::time_point{};
-            if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
+            if (front.tiled) {
+                dense::rank_k_ldlt_tiled_front(
+                    front.origin, width, active, panel.rank,
+                    panel.left.data(), panel.right.data(), values);
+            } else if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
                 if (factor.indexed_schur) {
                     dense::rank_k_ldlt_indexed_packed(
                         front.origin, width, active, panel.rank,
@@ -918,6 +963,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 output.origin = front.origin + active.front();
                 output.stride = front.stride;
                 output.values = std::move(front.values);
+                output.tiled = front.tiled;
                 if (profile) {
                     contribution_move_s[owner] += std::chrono::duration<double>(
                         Clock::now()-move_started).count();
@@ -927,7 +973,17 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 const auto copy_started = profile ? Clock::now() : Clock::time_point{};
                 output.stride = static_cast<int>(active.size());
                 output.values.reserve(active.size() * (active.size()+1) / 2);
-                if (factor.fast_contribution_copy && !active.empty()) {
+                if (front.tiled) {
+                    // Outgoing contributions remain compact row-packed
+                    // triangles unless ownership transfers the entire tiled
+                    // physical buffer. This keeps parent assembly compatible
+                    // with leaves that still use the original layout.
+                    for (std::size_t r=0; r<active.size(); ++r) {
+                        for (std::size_t c=0; c<=r; ++c) {
+                            output.values.push_back(at(active[r],active[c]));
+                        }
+                    }
+                } else if (factor.fast_contribution_copy && !active.empty()) {
                     // Active indices are sorted. For each output row, the
                     // source lies entirely below the physical diagonal.
                     // Avoid repeated max/min in at() for every copied entry.
