@@ -348,6 +348,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     // Keep the fine-grained arrays empty unless profiling is requested.
     std::vector<double> setup_s(profile ? n : 0,0.0);
     std::vector<double> cache_refresh_s(profile ? n : 0,0.0);
+    std::vector<std::size_t> pivot_major_cache_rows(profile ? n : 0,0);
     std::vector<double> cache_apply_s(profile ? n : 0,0.0);
     std::vector<double> panel_build_s(profile ? n : 0,0.0);
     std::vector<double> pivot_bookkeeping_s(profile ? n : 0,0.0);
@@ -620,6 +621,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 // lookahead, not once per failed threshold check.
                 double* row=cached_values.data()+static_cast<std::size_t>(slot)*width;
                 if (factor.pivot_major_cache_refresh && panel.rank >= 4) {
+                    if (profile) { ++pivot_major_cache_rows[owner]; }
                     // Before: for each active c, recompute a pivot-major dot
                     // product with strided reads through left/right.
                     // Now: copy the physical front row once, then stream
@@ -1171,6 +1173,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
             "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
             "front_contained_sources=%zu front_merged_sources=%zu "
+            "pivot_major_cache_rows=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1181,7 +1184,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum(contribution_copy_s),sum(contribution_move_s),
             sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts),
             sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
-            sum_count(front_contained_sources),sum_count(front_merged_sources));
+            sum_count(front_contained_sources),sum_count(front_merged_sources),
+            sum_count(pivot_major_cache_rows));
     }
     factor.ready = true;
 }
