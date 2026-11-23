@@ -40,7 +40,7 @@ int run_pivot_driver(int argc, char** argv) {
     double rank_tolerance = 1e-12;
     double pivot_tolerance = 0.1;
     int ldlt_block_size = 32;
-    int ldlt_supernode_size = 0; // 0 means follow --ldlt-block-size (original behavior).
+    int ldlt_supernode_size = 64; // Tuned default; 0 follows --ldlt-block-size (legacy).
     bool fast_pivoting = true, tiled_schur = true, relaxed_supernodes = true;
     bool cached_pivot_rows = true;
     bool indexed_schur = true;
@@ -171,6 +171,8 @@ int run_pivot_driver(int argc, char** argv) {
     const double median = totals.size() % 2 ? totals[middle] : 0.5 * (totals[middle - 1] + totals[middle]);
     if (symmetric) {
         std::cout << "ldlt_block_size=" << ldlt_block_size
+                  << " ldlt_supernode_size="
+                  << (ldlt_supernode_size == 0 ? ldlt_block_size : ldlt_supernode_size)
                   << " blocked_panels=" << factor.blocked_panels
                   << " supernodes=" << factor.grouped_fronts
                   << " relaxed_groups=" << factor.relaxed_groups
