@@ -20,7 +20,6 @@ from pathlib import Path
 LEGACY = (
     "--ldlt-legacy-pivot-order",
     "--ldlt-no-tiled-schur",
-    "--ldlt-no-dense-schur",
     "--ldlt-no-pivot-cache",
     "--ldlt-no-relaxed-supernodes",
 )
@@ -34,7 +33,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=32)
-    parser.add_argument("--ablations", action="store_true", help="Compare PR23 baseline vs dense-only, cache-only and both optimizations")
+    parser.add_argument("--ablations", action="store_true", help="Compare PR23 baseline with the pivot-cache-only candidate")
     parser.add_argument("--ordering", choices=("nd", "natural"), default="nd")
     parser.add_argument("--cpu", type=int, help="Optional Linux taskset CPU; leave empty for multi-thread runs")
     parser.add_argument("--pivot-tolerance", type=float, default=0.1)
@@ -67,9 +66,7 @@ def main():
             command = ["taskset", "-c", str(args.cpu)] + command
 
         variants = (
-            {"previous": ("--ldlt-no-dense-schur", "--ldlt-no-pivot-cache"),
-             "cache_only": ("--ldlt-no-dense-schur",),
-             "dense_only": ("--ldlt-no-pivot-cache",),
+            {"previous": ("--ldlt-no-pivot-cache",),
              "candidate": ()}
             if args.ablations else {"legacy": LEGACY, "candidate": ()}
         )
