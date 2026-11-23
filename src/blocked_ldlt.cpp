@@ -619,7 +619,50 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 // This is done exactly once when a candidate enters the
                 // lookahead, not once per failed threshold check.
                 double* row=cached_values.data()+static_cast<std::size_t>(slot)*width;
-                for (int c:active) { row[c]=raw_current(r,c); }
+                if (factor.pivot_major_cache_refresh && panel.rank >= 4) {
+                    // Before: for each active c, recompute a pivot-major dot
+                    // product with strided reads through left/right.
+                    // Now: copy the physical front row once, then stream
+                    // each pivot panel's contiguous R[p,:] into the cache
+                    // row. Every individual c still accumulates pivots in
+                    // the original accepted order, including signed 2x2 D.
+                    for (int c:active) { row[c]=at(r,c); }
+                    for (int p=0;p<panel.rank;++p) {
+                        const auto base=static_cast<std::size_t>(p)*width;
+                        const double alpha=panel.left[base+r];
+                        const double* const right=panel.right.data()+base;
+                        std::size_t j=0;
+#if defined(__AVX2__) && defined(__FMA__)
+                        const __m256d va=_mm256_set1_pd(alpha);
+                        for (;j+4<=active.size();) {
+                            const int c=active[j];
+                            if (active[j+3]==c+3) {
+                                const __m256d old=_mm256_loadu_pd(row+c);
+                                const __m256d next=_mm256_fnmadd_pd(
+                                    va,_mm256_loadu_pd(right+c),old);
+                                _mm256_storeu_pd(row+c,next);
+                                j+=4;
+                            } else {
+                                row[c]-=alpha*right[c];
+                                ++j;
+                            }
+                        }
+#endif
+                        for (;j<active.size();++j) {
+                            const int c=active[j];
+                            row[c]-=alpha*right[c];
+                        }
+                    }
+                    for (int c:active) {
+                        if (!std::isfinite(row[c])) {
+                            throw std::runtime_error("Nonfinite blocked LDLT candidate");
+                        }
+                    }
+                } else {
+                    // Exact incumbent scalar dot-product reconstruction,
+                    // retained for controlled performance A/B and rollback.
+                    for (int c:active) { row[c]=raw_current(r,c); }
+                }
                 cached_ids[slot]=r;
                 cache_slot[r]=slot;
             }
