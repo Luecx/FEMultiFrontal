@@ -127,14 +127,16 @@ int main() {
                         pass = false;
                     }
                 }
-                // The contribution compaction change is purely a data-copy
-                // optimization. It must reproduce the exact elimination
-                // sequence, multiplier storage, inertia and solve residual on
-                // large fronts (including delayed pivots, 2x2 and singularity).
+                // Both front row-union and contribution compaction must
+                // reconstruct the identical factor, not merely its residual:
+                // test them independently on delayed, indefinite and singular
+                // operators, while holding every other flag fixed.
                 if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                  for (int ablation=0; ablation<2; ++ablation) {
                     mf::PivotFactor previous;
                     previous.kind = mf::PivotFactor::Kind::Symmetric;
-                    previous.fast_contribution_copy = false;
+                    previous.fast_contribution_copy = (ablation != 0);
+                    previous.fast_front_prepare = (ablation == 0);
                     previous.factorize(matrix,symbolic);
                     const auto px = previous.solve(rhs);
                     const auto pax = matrix.multiply(px);
@@ -168,10 +170,13 @@ int main() {
                         }
                     }
                     if (!metadata_identical || !std::isfinite(pres) || pres>1e-8) {
-                        std::cerr << "Fast contribution copy disagreement in "
+                        std::cerr << (ablation == 0 ?
+                            "Fast contribution copy disagreement in " :
+                            "Fast front prepare disagreement in ")
                                   << name << " old_residual=" << pres << '\n';
                         pass=false;
                     }
+                  }
                 }
                 if (name.rfind("forced_2x2",0) == 0 && factor.two_by_two_pivots == 0) { pass = false; }
                 // A supernode may eliminate a previously delayed scalar
