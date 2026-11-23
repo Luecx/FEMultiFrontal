@@ -44,3 +44,26 @@ packed-indexed Schur optimization, not to assume that all remaining time
 belongs to pivot search. For `haken`, the previous profiling showed roughly
 4.76 s in Schur, 2.24 s in Assembly, 0.30 s in pivot search and
 3.87 s in otherwise unattributed front operations.
+
+## Assembly and contribution subphases (added after first profiling results)
+
+To distinguish the expensive parts of the two memory-heavy bins, the detailed
+profile now also reports:
+
+| Field | Meaning |
+|---|---|
+| `front_prepare_s` | Front-row union, allocation, position map and ownership reuse |
+| `original_assemble_s` | Inserting scaled original matrix entries into the front |
+| `extend_add_s` | Scattering child contributions into the current front |
+| `contribution_copy_s` | Allocating and compacting the outgoing packed triangular contribution |
+| `contribution_move_s` | Transferring reusable contiguous contribution storage without copying |
+| `contribution_copy_entries` | Number of `double` entries materialized into compacted contribution buffers |
+| `contribution_moved_fronts` | Number of outgoing fronts whose backing storage was inherited without copying |
+
+These are **subphases already contained in** `assembly_s` and `contribution_s`.
+Do not add them to the earlier top-level categories or to
+`unattributed_front_s`. `contribution_copy_entries * 8` estimates payload
+bytes written but **not** total traffic, since packed source reads, allocations
+and memory writes also contribute. For a representative single-thread run,
+compare the contribution copy count with the measured copy time to decide
+whether to optimize physical triangular compaction or front reuse.
