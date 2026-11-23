@@ -127,15 +127,15 @@ int main() {
                         pass = false;
                     }
                 }
-                // With an explicit supernode size equal to the panel size,
-                // the new independent control must reconstruct EXACTLY the
-                // original factor. This checks backward compatibility without
-                // requiring equal factors after intentionally changing the
-                // front ownership/amalgamation topology.
+                // With an explicit supernode size equal to the tuned default,
+                // the solver must reconstruct EXACTLY the same factor. This
+                // guards the default C++ API against accidental divergence
+                // from the explicit configuration while preserving a separate
+                // opt-in legacy linked-width policy (supernode_size=0).
                 if (symmetric && !incompatible && threads == 1 && n >= 96) {
                     mf::PivotFactor explicitly_matched;
                     explicitly_matched.kind = mf::PivotFactor::Kind::Symmetric;
-                    explicitly_matched.supernode_size = explicitly_matched.block_size;
+                    explicitly_matched.supernode_size = 64;
                     explicitly_matched.factorize(matrix,symbolic);
                     bool identical =
                         explicitly_matched.rank == factor.rank &&
