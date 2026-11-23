@@ -17,4 +17,10 @@ void rank_k_ldlt_indexed_packed(
     int origin, int dim, const std::vector<int>& active, int rank,
     const double* left, const double* right, double* packed);
 
+// Experimental 6-row x 8-column microtile, otherwise same semantics as
+// rank_k_ldlt_indexed_packed (4-row x 8-column).
+void rank_k_ldlt_indexed_packed6(
+    int origin, int dim, const std::vector<int>& active, int rank,
+    const double* left, const double* right, double* packed);
+
 } // namespace mf::dense
