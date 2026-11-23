@@ -700,6 +700,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
 
             const auto search_started = profile ? Clock::now() : Clock::time_point{};
+            double on_demand_cache_s = 0.0;
             int pivots[2] = {-1, -1};
             int count = 1;
 
@@ -722,8 +723,10 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         // repeated rank-length reconstruction on delayed pivots.
                         refresh_candidates(eligible_count, i + 1, true);
                         if (profile) {
-                            cache_refresh_s[owner] += std::chrono::duration<double>(
+                            const double elapsed = std::chrono::duration<double>(
                                 Clock::now()-lazy_started).count();
+                            cache_refresh_s[owner] += elapsed;
+                            on_demand_cache_s += elapsed;
                         }
                     }
                     const double magnitude = std::abs(current(r,r));
@@ -804,7 +807,10 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 }
             }
             if (profile) {
-                search_s[owner] += std::chrono::duration<double>(Clock::now()-search_started).count();
+                // Keep timing bins disjoint: on-demand cache materialization
+                // happens inside the search scope but belongs to cache_refresh.
+                search_s[owner] += std::chrono::duration<double>(
+                    Clock::now()-search_started).count() - on_demand_cache_s;
             }
             if (pivots[0] == -1) { break; }
 
