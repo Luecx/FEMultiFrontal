@@ -209,6 +209,43 @@ int main() {
                         pass = false;
                     }
                 }
+                // SIMD cache-apply is a separate opt-in experiment built
+                // on the pivot-major row refresh. Compare all retained
+                // numerical contracts, including delayed 2x2 pivots and
+                // singular test cases, with an independent original residual.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor simd;
+                    simd.kind = mf::PivotFactor::Kind::Symmetric;
+                    simd.supernode_size = factor.supernode_size;
+                    simd.pivot_major_cache_refresh = true;
+                    simd.simd_cache_apply = true;
+                    simd.factorize(matrix,symbolic);
+                    const auto x_simd=simd.solve(rhs);
+                    const auto ax_simd=matrix.multiply(x_simd);
+                    long double res2=0.0L, rhs2=0.0L;
+                    for(int k=0;k<n;++k) {
+                        const long double difference=
+                            static_cast<long double>(ax_simd[k])-rhs[k];
+                        res2+=difference*difference;
+                        rhs2+=static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double simd_res=std::sqrt(res2/std::max(rhs2,1e-300L));
+                    if (simd.rank != factor.rank ||
+                        simd.positive_directions != factor.positive_directions ||
+                        simd.negative_directions != factor.negative_directions ||
+                        simd.two_by_two_pivots != factor.two_by_two_pivots ||
+                        simd.delayed_candidates != factor.delayed_candidates ||
+                        !std::isfinite(simd_res) || simd_res >= 1e-8) {
+                        std::cerr << "SIMD cache apply diverges in " << name
+                                  << " rank=" << simd.rank << "/" << factor.rank
+                                  << " pivots2=" << simd.two_by_two_pivots
+                                  << "/" << factor.two_by_two_pivots
+                                  << " delays=" << simd.delayed_candidates
+                                  << "/" << factor.delayed_candidates
+                                  << " residual=" << simd_res << '\n';
+                        pass=false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular

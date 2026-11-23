@@ -85,6 +85,7 @@ struct PivotFactor {
     bool fast_front_prepare = true; // Merge sorted frontal row patterns; false uses original sort/unique.
     bool cached_pivot_rows = true; // Incrementally updated lookahead rows and diagonals.
     bool pivot_major_cache_refresh = false; // Experimental rank-major SIMD rebuild of lookahead cache.
+    bool simd_cache_apply = false; // Experimental AVX2 contiguous-run updates for retained candidate rows.
     bool relaxed_supernodes = true;
 
     // Legacy per-pivot representation for scalar LDLT and general LU.

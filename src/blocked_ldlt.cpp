@@ -349,6 +349,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> setup_s(profile ? n : 0,0.0);
     std::vector<double> cache_refresh_s(profile ? n : 0,0.0);
     std::vector<std::size_t> pivot_major_cache_rows(profile ? n : 0,0);
+    std::vector<std::size_t> simd_cache_apply_quads(profile ? n : 0,0);
     std::vector<double> cache_apply_s(profile ? n : 0,0.0);
     std::vector<double> panel_build_s(profile ? n : 0,0.0);
     std::vector<double> pivot_bookkeeping_s(profile ? n : 0,0.0);
@@ -684,8 +685,47 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     if (r<0) { continue; }
                     const double multiplier=panel.left[base+r];
                     double* row=cached_values.data()+static_cast<std::size_t>(slot)*width;
-                    for (int c:active) {
-                        row[c]-=multiplier*panel.right[base+c];
+                    const double* const right=panel.right.data()+base;
+                    std::size_t j=0;
+#if defined(__AVX2__) && defined(__FMA__)
+                    if (factor.simd_cache_apply) {
+                        const __m256d alpha=_mm256_set1_pd(multiplier);
+                        const __m256d sign=_mm256_set1_pd(-0.0);
+                        const __m256d limit=_mm256_set1_pd(
+                            std::numeric_limits<double>::max());
+                        for (;j+4<=active.size();) {
+                            const int c=active[j];
+                            if (active[j+3]==c+3) {
+                                // Process four adjacent active columns in
+                                // physical row order. Each entry receives one
+                                // pivot correction, preserving the incumbent
+                                // accepted-pivot arithmetic sequence.
+                                const __m256d prior=_mm256_loadu_pd(row+c);
+                                const __m256d delta=_mm256_loadu_pd(right+c);
+                                const __m256d next=_mm256_fnmadd_pd(alpha,delta,prior);
+                                const __m256d finite=_mm256_cmp_pd(
+                                    _mm256_andnot_pd(sign,next),limit,_CMP_LE_OQ);
+                                if (_mm256_movemask_pd(finite)!=15) {
+                                    throw std::runtime_error(
+                                        "Nonfinite LDLT cached candidate row");
+                                }
+                                _mm256_storeu_pd(row+c,next);
+                                if (profile) { ++simd_cache_apply_quads[owner]; }
+                                j+=4;
+                            } else {
+                                row[c]-=multiplier*right[c];
+                                if (!std::isfinite(row[c])) {
+                                    throw std::runtime_error(
+                                        "Nonfinite LDLT cached candidate row");
+                                }
+                                ++j;
+                            }
+                        }
+                    }
+#endif
+                    for (;j<active.size();++j) {
+                        const int c=active[j];
+                        row[c]-=multiplier*right[c];
                         if (!std::isfinite(row[c])) {
                             throw std::runtime_error("Nonfinite LDLT cached candidate row");
                         }
@@ -1173,7 +1213,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
             "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
             "front_contained_sources=%zu front_merged_sources=%zu "
-            "pivot_major_cache_rows=%zu "
+            "pivot_major_cache_rows=%zu simd_cache_apply_quads=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1185,7 +1225,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts),
             sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
             sum_count(front_contained_sources),sum_count(front_merged_sources),
-            sum_count(pivot_major_cache_rows));
+            sum_count(pivot_major_cache_rows),
+            sum_count(simd_cache_apply_quads));
     }
     factor.ready = true;
 }

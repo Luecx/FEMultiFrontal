@@ -38,6 +38,8 @@ def main():
                         help="Compare current production Schur kernel with new packed-indexed kernel")
     parser.add_argument("--pivot-major-cache-ablation", action="store_true",
                         help="Compare scalar per-entry cache rebuild with pivot-major SIMD refresh")
+    parser.add_argument("--simd-cache-apply-ablation", action="store_true",
+                        help="Compare SIMD vs scalar cache row updates on top of pivot-major cache refresh")
     parser.add_argument("--contribution-copy-ablation", action="store_true",
                         help="Compare exact original contribution compaction with optimized packed row copies")
     parser.add_argument("--front-prepare-ablation", action="store_true",
@@ -74,9 +76,13 @@ def main():
             command = ["taskset", "-c", str(args.cpu)] + command
 
         if sum((args.ablations, args.indexed_ablation, args.contribution_copy_ablation,
-                args.front_prepare_ablation, args.pivot_major_cache_ablation)) > 1:
+                args.front_prepare_ablation, args.pivot_major_cache_ablation,
+                args.simd_cache_apply_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": ("--ldlt-pivot-major-cache-refresh",),
+             "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply")}
+            if args.simd_cache_apply_ablation else
             {"previous": (), "candidate": ("--ldlt-pivot-major-cache-refresh",)}
             if args.pivot_major_cache_ablation else
             {"previous": ("--ldlt-no-fast-front-prepare",), "candidate": ()}
@@ -139,7 +145,8 @@ def main():
         baseline = "previous" if any((args.ablations, args.indexed_ablation,
                                      args.contribution_copy_ablation,
                                      args.front_prepare_ablation,
-                                     args.pivot_major_cache_ablation)) else "legacy"
+                                     args.pivot_major_cache_ablation,
+                                     args.simd_cache_apply_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
