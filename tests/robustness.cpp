@@ -65,6 +65,13 @@ int main() {
             mf::PivotFactor factor;
             factor.kind = symmetric ? mf::PivotFactor::Kind::Symmetric : mf::PivotFactor::Kind::General;
             factor.threads = threads;
+            // This fixture is intentionally constructed to force a delayed
+            // candidate across a 32-wide supernode boundary. With the tuned
+            // 64-wide default the pivot stays inside the enlarged front;
+            // keep the targeted delay contract under the former topology.
+            if (name == "delayed_across_supernode") {
+                factor.supernode_size = 32;
+            }
             bool factored_ok = false;
             try {
                 const auto begin = Clock::now();
@@ -127,15 +134,14 @@ int main() {
                         pass = false;
                     }
                 }
-                // With an explicit supernode size equal to the tuned default,
-                // the solver must reconstruct EXACTLY the same factor. This
-                // guards the default C++ API against accidental divergence
-                // from the explicit configuration while preserving a separate
-                // opt-in legacy linked-width policy (supernode_size=0).
+                // With an explicitly configured supernode width equal to the
+                // active policy (normally tuned 64, forced 32 for the targeted
+                // cross-supernode-delay test), reconstruct the same factor
+                // bit-for-bit. This guards the C++ API against divergence.
                 if (symmetric && !incompatible && threads == 1 && n >= 96) {
                     mf::PivotFactor explicitly_matched;
                     explicitly_matched.kind = mf::PivotFactor::Kind::Symmetric;
-                    explicitly_matched.supernode_size = 64;
+                    explicitly_matched.supernode_size = factor.supernode_size;
                     explicitly_matched.factorize(matrix,symbolic);
                     bool identical =
                         explicitly_matched.rank == factor.rank &&
@@ -173,6 +179,7 @@ int main() {
                   for (int ablation=0; ablation<2; ++ablation) {
                     mf::PivotFactor previous;
                     previous.kind = mf::PivotFactor::Kind::Symmetric;
+                    previous.supernode_size = factor.supernode_size;
                     previous.fast_contribution_copy = (ablation != 0);
                     previous.fast_front_prepare = (ablation == 0);
                     previous.factorize(matrix,symbolic);
