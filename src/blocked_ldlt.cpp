@@ -275,6 +275,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.delayed_candidates = factor.maximum_front = 0;
     factor.blocked_panels = factor.grouped_fronts = 0;
     factor.fast_path_pivots = factor.fallback_searches = factor.relaxed_groups = 0;
+    factor.signed_batch_attempts = factor.signed_batch_pivots = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
@@ -341,6 +342,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<FrontPivotRecords> records(n);
     std::vector<std::size_t> delays(n, 0), widths(n, 0), panels(n, 0), groups(n, 0);
     std::vector<std::size_t> fast_pivots(n, 0), fallback_searches(n, 0), relaxed_groups(n, 0);
+    std::vector<std::size_t> signed_attempts(n, 0), signed_accepted(n, 0);
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
@@ -787,6 +789,126 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 [&](int id, int local) { return id < front.rows[local]; });
             const auto eligible_count = static_cast<std::size_t>(eligible_end - active.begin());
             if (eligible_count == 0) { break; }
+
+            // Experimental signed 1x1 supernode panel. The first k eligible
+            // candidates are processed in a single narrow, row-major work
+            // matrix C = F(active, candidates). This is *not* an SPD guess:
+            // each signed pivot must satisfy the original threshold against
+            // its entire CURRENT active column. An unstable/zero pivot ends
+            // the speculative prefix immediately. Any accepted prefix is
+            // committed to the ordinary L/R Schur panel; the incumbent
+            // 1x1/2x2 pivot search then handles the remainder unchanged.
+            //
+            // Attempt only at an empty panel, immediately after a flush.
+            // Thus F is current and no lookahead rows are live. Batched
+            // rank-one corrections touch only C, not the packed front,
+            // which still receives one rank-k Schur update on flush.
+            if (factor.signed_batch_panels && factor.fast_pivoting &&
+                panel.rank == 0 && eligible_count >= 4 && factor.block_size >= 5) {
+                const int k = std::min({
+                    static_cast<int>(eligible_count), factor.signed_batch_width,
+                    factor.block_size - 1
+                });
+                if (k >= 4) {
+                    ++signed_attempts[owner];
+                    const auto batch_started = profile ? Clock::now() : Clock::time_point{};
+                    const int m = static_cast<int>(active.size());
+                    // Work is m-by-k, with row-major contiguous candidate
+                    // columns. Only C[r,j] for r>=j is needed.
+                    std::vector<double> trial(static_cast<std::size_t>(m)*k, 0.0);
+                    for (int r=0;r<m;++r) {
+                        double* const row=trial.data()+static_cast<std::size_t>(r)*k;
+                        for (int j=0;j<k && j<=r;++j) {
+                            row[j]=at(active[r],active[j]);
+                        }
+                    }
+                    auto& owner_records = records[owner];
+                    int accepted = 0;
+                    for (int j=0;j<k;++j) {
+                        const double d=trial[static_cast<std::size_t>(j)*k+j];
+                        const double magnitude=std::abs(d);
+                        if (!std::isfinite(d)) {
+                            throw std::runtime_error("Nonfinite signed LDLT batch pivot");
+                        }
+                        if (!(magnitude > factor.rank_tolerance)) { break; }
+                        double maximum=magnitude;
+                        for (int r=j+1;r<m;++r) {
+                            const double coupling=trial[static_cast<std::size_t>(r)*k+j];
+                            if (!std::isfinite(coupling)) {
+                                throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                            }
+                            maximum=std::max(maximum,std::abs(coupling));
+                        }
+                        if (magnitude < factor.pivot_tolerance*maximum) { break; }
+
+                        // 1x1 signed D, no Cholesky or positive-definite
+                        // assumption. Entries of trial(:,j) already include
+                        // every previously accepted pivot in this batch.
+                        PackedSymmetricPivot block;
+                        block.size=1;
+                        block.rows[0]=front.rows[active[j]];
+                        block.diagonal[0]=d;
+                        block.lower_begin=owner_records.lower_rows.size();
+                        block.value_begin=owner_records.lower_values.size();
+                        const int rank=panel.rank;
+                        panel.append(1);
+                        const auto base=static_cast<std::size_t>(rank)*width;
+                        panel.right[base+active[j]]=d;
+                        const double sign=d/magnitude;
+                        for (int r=j+1;r<m;++r) {
+                            const double value=trial[static_cast<std::size_t>(r)*k+j];
+                            // Scale before division like the incumbent
+                            // 1x1 path, preserving signed scalar pivots.
+                            const double multiplier=(value/magnitude)/sign;
+                            if (!std::isfinite(multiplier)) {
+                                throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                            }
+                            panel.right[base+active[r]]=value;
+                            panel.left[base+active[r]]=multiplier;
+                            if (multiplier != 0.0) {
+                                owner_records.lower_rows.push_back(front.rows[active[r]]);
+                                owner_records.lower_values.push_back(multiplier);
+                            }
+                        }
+                        block.lower_count=owner_records.lower_rows.size()-block.lower_begin;
+                        owner_records.blocks.push_back(block);
+                        ++panel.rank;
+                        ++accepted;
+                        ++fast_pivots[owner];
+
+                        // Small signed LDLT trailing solve/update on C.
+                        // For every (r,c), c<=r, apply the accepted D
+                        // correction exactly once. The full Schur matrix
+                        // is deliberately not modified here.
+                        for (int r=j+1;r<m;++r) {
+                            double* const row=trial.data()+static_cast<std::size_t>(r)*k;
+                            const double multiplier=panel.left[base+active[r]];
+                            for (int c=j+1;c<k && c<=r;++c) {
+                                row[c]-=multiplier*
+                                    panel.right[base+active[c]];
+                                if (!std::isfinite(row[c])) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                }
+                            }
+                        }
+                    }
+                    if (accepted != 0) {
+                        signed_accepted[owner]+=accepted;
+                        // Only a prefix was removed; delayed/2x2 candidates
+                        // never disappear from active before robust fallback.
+                        active.erase(active.begin(),active.begin()+accepted);
+                        // No candidate cache slots exist at panel.rank==0;
+                        // maintain its diagonals with the same accepted
+                        // pivot sequence as the incumbent implementation.
+                        apply_new_pivots_to_cache(0,accepted);
+                    }
+                    if (profile) {
+                        panel_build_s[owner] += std::chrono::duration<double>(
+                            Clock::now()-batch_started).count();
+                    }
+                    if (accepted != 0) { continue; }
+                }
+            }
             const auto cache_refresh_started = profile ? Clock::now() : Clock::time_point{};
             refresh_candidates(eligible_count);
             if (profile) {
@@ -1157,6 +1279,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.packed_lower_values.reserve(value_total);
     for (int owner : symbolic.postorder) {
         factor.fast_path_pivots += fast_pivots[owner];
+        factor.signed_batch_attempts += signed_attempts[owner];
+        factor.signed_batch_pivots += signed_accepted[owner];
         factor.fallback_searches += fallback_searches[owner];
         factor.relaxed_groups += relaxed_groups[owner];
         factor.delayed_candidates += delays[owner];
