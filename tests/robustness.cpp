@@ -201,11 +201,23 @@ int main() {
                                       << " packed_values=" << previous.packed_lower_values.size() << "/" << factor.packed_lower_values.size()
                                       << " headers=" << previous.packed_blocks.size() << "/" << factor.packed_blocks.size();
                             for (std::size_t k=0;k<std::min(previous.packed_lower_values.size(),factor.packed_lower_values.size());++k) {
-                                if (previous.packed_lower_values[k] != factor.packed_lower_values[k]) {
-                                    std::cerr << " first_diff_index=" << k
+                                if (!coefficient_equal(previous.packed_lower_values[k],factor.packed_lower_values[k])) {
+                                    std::cerr << " coefficient_mismatch_at=" << k
                                               << " eager=" << std::setprecision(17) << previous.packed_lower_values[k]
                                               << " lazy=" << factor.packed_lower_values[k];
                                     break;
+                                }
+                            }
+                            for(std::size_t j=0;j<factor.packed_blocks.size() && j<previous.packed_blocks.size();++j) {
+                                const auto& aa=previous.packed_blocks[j];
+                                const auto& bb=factor.packed_blocks[j];
+                                for(int p=0;p<4;++p) {
+                                    if(!coefficient_equal(aa.diagonal[p],bb.diagonal[p])) {
+                                        std::cerr << " pivot_diagonal_mismatch_at=" << j << ":" << p
+                                                  << " eager=" << aa.diagonal[p] << " lazy=" << bb.diagonal[p];
+                                        j=factor.packed_blocks.size();
+                                        break;
+                                    }
                                 }
                             }
                             std::cerr << "\n";
