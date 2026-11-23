@@ -38,7 +38,7 @@ taskset -c 90 ./build/native/ldlt-kernel-sweep \
     > /tmp/ldlt-kernel-sweep.csv
 ```
 
-The CSV records **20 variants** with median milliseconds per update and
+The CSV records **26 variants** with median milliseconds per update and
 speedup against the independent scalar reference. Progress and correctness
 messages go to stderr. The default cold pool is deliberately much larger than
 a typical single-chiplet cache, but the appropriate size depends on the exact
@@ -53,6 +53,10 @@ region; input packing done *by the kernel* is included.
   12×8, 4×32.
 - Rank-major **B-packed** tiles: 4×8, 6×8, 6×16.
 - Rank-major **A+B-packed** tiles: 4×8, 6×8, 6×16.
+- **Index-hole-aware A+B-packed** tiles, without a whole-front copy:
+  AVX2 gather/scalar load into register C tiles, FMA on packed operands,
+  individual scatter back to active packed-front entries. Compare both
+  load mechanisms at 4×8, 6×8 and 4×16.
 
 The last group adapts the LLT `rank_k_subtract_packed6` **factor-panel
 structure** to *separate signed LDLT operands*, without copying the entire
