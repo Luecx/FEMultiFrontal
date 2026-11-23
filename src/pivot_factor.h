@@ -74,7 +74,8 @@ struct PivotFactor {
     double pivot_tolerance = 0.1;
     int    threads         = 1;
     // 1 selects the original scalar LDLT; >=2 enables blocked multifrontal LDLT.
-    int    block_size      = 32;
+    int    block_size      = 32; // Numerical Schur-panel rank; also default max supernode width.
+    int    supernode_size  = 0;  // 0 follows block_size (legacy); 1..256 overrides max amalgamation width.
     // Independent performance switches permit exact A/B comparisons.
     // The general LU and scalar LDLT paths are unaffected.
     bool fast_pivoting = true;
