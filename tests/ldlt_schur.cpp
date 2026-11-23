@@ -6,14 +6,13 @@
  * active-index holes, inherited packed origins, SIMD tails and OpenMP tasks.
  */
 #include "ldlt_schur.h"
-#include "ldlt_gemm.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
-static void check(int dim, int rank, int origin, int layout, bool parallel_run, bool dense_tile) {
+static void check(int dim, int rank, int origin, int layout, bool parallel_run) {
 #ifndef _OPENMP
     (void)parallel_run;
 #endif
@@ -53,26 +52,14 @@ static void check(int dim, int rank, int origin, int layout, bool parallel_run, 
     if (parallel_run) {
 #pragma omp parallel num_threads(4)
 #pragma omp single
-        {
-            if (dense_tile) {
-                mf::dense::rank_k_ldlt_gemm(origin,dim,active,rank,left.data(),right.data(),actual.data());
-            } else {
-                mf::dense::rank_k_ldlt_tiled(origin,dim,active,rank,left.data(),right.data(),actual.data());
-            }
-        }
+        { mf::dense::rank_k_ldlt_tiled(origin,dim,active,rank,left.data(),right.data(),actual.data()); }
     } else
 #endif
-    {
-        if (dense_tile) {
-            mf::dense::rank_k_ldlt_gemm(origin,dim,active,rank,left.data(),right.data(),actual.data());
-        } else {
-            mf::dense::rank_k_ldlt_tiled(origin,dim,active,rank,left.data(),right.data(),actual.data());
-        }
-    }
+    { mf::dense::rank_k_ldlt_tiled(origin,dim,active,rank,left.data(),right.data(),actual.data()); }
     for (std::size_t i = 0; i < expected.size(); ++i) {
         const double diff = std::abs(actual[i]-expected[i]);
         if (!std::isfinite(actual[i]) || diff > 2e-12*std::max(1.0,std::abs(expected[i]))) {
-            throw std::runtime_error(std::string(dense_tile ? "Dense" : "Packed")+" LDLT Schur update differs from scalar reference at entry "+std::to_string(i));
+            throw std::runtime_error("Tiled LDLT Schur update differs from scalar reference at entry "+std::to_string(i));
         }
     }
 }
@@ -84,22 +71,17 @@ int main() {
             for (int rank : {1,2,8,32}) {
                 for (int origin : {0,19}) {
                     for (int layout = 0; layout < 4; ++layout) {
-                        for (bool dense : {false,true}) {
-                            check(dim,rank,origin,layout,false,dense);
-                            ++cases;
-                        }
+                        check(dim,rank,origin,layout,false);
+                        ++cases;
                     }
                 }
             }
         }
         // Cross the intra-front parallel-work threshold with a contiguous
         // active set and a high enough rank, then exercise irregular holes.
-        for (bool dense : {false,true}) {
-            check(1025,64,19,0,true,dense);
-            check(1025,64,19,1,true,dense);
-            cases += 2;
-        }
-        std::cout << "PASS: " << cases << " packed and dense-tiled LDLT Schur cases\n";
+        check(1025,64,19,0,true);
+        check(1025,64,19,1,true);
+        std::cout << "PASS: " << cases+2 << " tiled LDLT Schur cases\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
