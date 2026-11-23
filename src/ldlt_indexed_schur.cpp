@@ -2,7 +2,7 @@
  * @file ldlt_indexed_schur.cpp
  * @brief LLT-style packed factor panels for signed multifrontal LDLT updates.
  *
- * Each 4x8 AVX2 microtile keeps the original physical packed Schur output.
+ * Both 4x8 and experimental 6x8 AVX2 microtiles keep the original physical packed Schur output.
  * Input factors are copied just once into separate rank-major 4-row and
  * 8-column panels. The noncontiguous-output case gathers only C's eight
  * active columns, never the whole C matrix, and scatters back to the original
@@ -28,9 +28,11 @@
 
 namespace mf::dense {
 
-void rank_k_ldlt_indexed_packed(
+template<int MR>
+static void rank_k_ldlt_indexed_packed_impl(
     int origin, int dim, const std::vector<int>& active, int rank,
     const double* left, const double* right, double* packed) {
+    static_assert(MR == 4 || MR == 6);
     if (rank <= 0 || active.empty()) { return; }
 #if !defined(__AVX2__) || !defined(__FMA__)
     rank_k_ldlt_tiled(origin, dim, active, rank, left, right, packed);
@@ -43,7 +45,6 @@ void rank_k_ldlt_indexed_packed(
         return;
     }
 
-    constexpr int MR = 4;
     constexpr int NR = 8;
     const int row_tiles = (count+MR-1)/MR;
     const int col_tiles = (count+NR-1)/NR;
@@ -181,6 +182,20 @@ void rank_k_ldlt_indexed_packed(
         throw std::runtime_error("Nonfinite indexed LDLT Schur update");
     }
 #endif
+}
+
+void rank_k_ldlt_indexed_packed(
+    int origin, int dim, const std::vector<int>& active, int rank,
+    const double* left, const double* right, double* packed) {
+    rank_k_ldlt_indexed_packed_impl<4>(
+        origin, dim, active, rank, left, right, packed);
+}
+
+void rank_k_ldlt_indexed_packed6(
+    int origin, int dim, const std::vector<int>& active, int rank,
+    const double* left, const double* right, double* packed) {
+    rank_k_ldlt_indexed_packed_impl<6>(
+        origin, dim, active, rank, left, right, packed);
 }
 
 } // namespace mf::dense
