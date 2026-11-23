@@ -47,6 +47,7 @@ if [[ $# -gt 0 ]]; then
     export LD_LIBRARY_PATH="$mkl_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export OMP_DYNAMIC=FALSE
     export MKL_DYNAMIC=FALSE
+    export MKL_INTERFACE_LAYER=LP64
     export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
     export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
     exec "$exe" "$@"
