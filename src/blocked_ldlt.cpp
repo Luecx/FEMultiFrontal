@@ -13,6 +13,7 @@
 #include "memory.h"
 #include "ldlt_schur.h"
 #include "ldlt_indexed_schur.h"
+#include "ldlt_staged_gemm.h"
 
 #include <algorithm>
 #include <array>
@@ -365,6 +366,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> front_row_union_s(profile ? n : 0,0.0);
     std::vector<double> front_zero_s(profile ? n : 0,0.0);
     std::vector<double> front_position_map_s(profile ? n : 0,0.0);
+    // Staged GEMM phase timings are sub-bins of schur_s, not independent.
+    std::vector<dense::StagedGemmProfile> staged_gemm_profile(profile ? n : 0);
     std::vector<std::size_t> front_contained_sources(profile ? n : 0,0);
     std::vector<std::size_t> front_merged_sources(profile ? n : 0,0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
@@ -651,7 +654,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         auto flush = [&] {
             if (panel.rank == 0) { return; }
             const auto t = profile ? Clock::now() : Clock::time_point{};
-            if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
+            if (factor.staged_gemm_schur && active.size() >= 192 &&
+                panel.rank >= 16) {
+                dense::rank_k_ldlt_staged_gemm(
+                    front.origin, width, active, panel.rank,
+                    panel.left.data(), panel.right.data(), values,
+                    profile ? &staged_gemm_profile[owner] : nullptr);
+            } else if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
                 if (factor.indexed_schur) {
                     dense::rank_k_ldlt_indexed_packed(
                         front.origin, width, active, panel.rank,
@@ -1117,6 +1126,14 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         const auto sum_count = [](const std::vector<std::size_t>& xs) {
             return std::accumulate(xs.begin(),xs.end(),std::size_t{0});
         };
+        dense::StagedGemmProfile gemm_detail;
+        for (const auto& x : staged_gemm_profile) {
+            gemm_detail.pack_s += x.pack_s;
+            gemm_detail.load_s += x.load_s;
+            gemm_detail.gemm_s += x.gemm_s;
+            gemm_detail.store_s += x.store_s;
+            gemm_detail.tiles += x.tiles;
+        }
         std::fprintf(stderr,
             "FEMF_LDLT_PROFILE fronts=%zu relaxed=%zu fast_pivots=%zu fallback_searches=%zu "
             "assembly_s=%.6f pivot_search_s=%.6f schur_s=%.6f total_front_s=%.6f "
@@ -1128,6 +1145,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
             "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
             "front_contained_sources=%zu front_merged_sources=%zu "
+            "staged_gemm_pack_s=%.6f staged_gemm_load_s=%.6f "
+            "staged_gemm_compute_s=%.6f staged_gemm_store_s=%.6f "
+            "staged_gemm_tiles=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1138,7 +1158,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum(contribution_copy_s),sum(contribution_move_s),
             sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts),
             sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
-            sum_count(front_contained_sources),sum_count(front_merged_sources));
+            sum_count(front_contained_sources),sum_count(front_merged_sources),
+            gemm_detail.pack_s,gemm_detail.load_s,gemm_detail.gemm_s,
+            gemm_detail.store_s,gemm_detail.tiles);
     }
     factor.ready = true;
 }
