@@ -99,3 +99,41 @@ remaining difference between `front_prepare_s` and these subphases includes
 front metadata and timer overhead. If `front_zero_s` dominates, the row-union
 change may deliver limited speedup; do not optimize zero initialization without
 maintaining the same all-zero numerical semantics.
+
+## Demand-driven pivot lookahead cache (A/B experiment)
+
+The original `refresh_candidates` eagerly materialized **all eight**
+eligible candidate rows and then maintained each cached row incrementally
+after every accepted pivot. On the `haken` profile, these operations took
+roughly 0.9 seconds of cache refresh and 0.5 seconds of cache application.
+
+The new `lazy_pivot_cache` policy (default on, blocked LDLT only):
+- Start each pivot search with only the first eligible candidate materialized.
+- Keep any other already-cached row among the first eight candidates.
+  **Do not** discard a delayed candidate merely because it was not tested on
+  the immediately preceding iteration.
+- If candidate 0 fails the threshold criterion, construct candidate 1 on
+  demand, then candidate 2 only if 1 also fails, and so on.
+- Preserve the old full lookahead and cached diagonal update equations,
+  `raw_current` implementation, fallback exhaustive threshold search,
+  2x2 pivot selection, the Schur update and all pivot-acceptance thresholds.
+
+For comparison, use
+`--ldlt-no-lazy-pivot-cache` with `mfsolve`, or the
+`--lazy-cache-ablation` mode of `compare_ldlt_fastpath.py`.
+The latter uses the same binary and alternating A/B rounds. The entire old
+eight-row policy is available; disabling the full pivot cache is a separate
+`--ldlt-no-pivot-cache` ablation.
+
+`cache_prefetched_rows` and `cache_demand_rows` count newly computed
+candidate rows. Their sum is the number of constructed cache rows. With
+profiling enabled, on-demand row construction is charged to
+`cache_refresh_s` **and explicitly removed from** `pivot_search_s`:
+the phase timers remain nonoverlapping.
+
+Expected advantage: substantial reduction in cached row initialization and
+incremental rank-one cache updates when most pivots accept their first
+candidate. The number of 2x2 pivots, numerical rank, inertia and packed
+multiplier/pivot data must remain unchanged. The A/B performance comparison
+on `haken` and a smaller structurally different matrix is required before
+merge; clean CI by itself does not establish speedup.
