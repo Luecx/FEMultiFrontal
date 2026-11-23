@@ -337,6 +337,24 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
+    // Fine-grained bins are disjoint from each other and from the coarse
+    // assembly/search/Schur bins. One writer per front avoids atomics.
+    // Keep the fine-grained arrays empty unless profiling is requested.
+    std::vector<double> setup_s(profile ? n : 0,0.0);
+    std::vector<double> cache_refresh_s(profile ? n : 0,0.0);
+    std::vector<double> cache_apply_s(profile ? n : 0,0.0);
+    std::vector<double> panel_build_s(profile ? n : 0,0.0);
+    std::vector<double> pivot_bookkeeping_s(profile ? n : 0,0.0);
+    std::vector<double> contribution_s(profile ? n : 0,0.0);
+    // Subphases of assembly and contribution; included in the parent bins,
+    // not additional elapsed time.
+    std::vector<double> front_prepare_s(profile ? n : 0,0.0);
+    std::vector<double> original_assemble_s(profile ? n : 0,0.0);
+    std::vector<double> extend_add_s(profile ? n : 0,0.0);
+    std::vector<double> contribution_copy_s(profile ? n : 0,0.0);
+    std::vector<double> contribution_move_s(profile ? n : 0,0.0);
+    std::vector<std::size_t> contribution_copy_entries(profile ? n : 0,0);
+    std::vector<std::size_t> contribution_moved_fronts(profile ? n : 0,0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
@@ -416,6 +434,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                                  front.rows.begin());
         };
 
+        if (profile) {
+            front_prepare_s[owner] += std::chrono::duration<double>(
+                Clock::now()-started).count();
+        }
+        const auto original_started = profile ? Clock::now() : Clock::time_point{};
         // Assemble every original lower column of the supernode exactly once.
         // Each higher member's column is already in the bottom member's pattern.
         for (int member : members) {
@@ -427,6 +450,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
         }
 
+        if (profile) {
+            original_assemble_s[owner] += std::chrono::duration<double>(
+                Clock::now()-original_started).count();
+        }
+        const auto extend_started = profile ? Clock::now() : Clock::time_point{};
         // Extend-add completed child Schur blocks. A child's delayed variables
         // travel with its rows and can enlarge this symbolic supernode.
         for (int child = symbolic.first_child[bottom]; child != -1;
@@ -448,8 +476,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
 
         if (profile) {
+            extend_add_s[owner] += std::chrono::duration<double>(
+                Clock::now()-extend_started).count();
             assembly_s[owner] += std::chrono::duration<double>(Clock::now()-started).count();
         }
+        const auto setup_started = profile ? Clock::now() : Clock::time_point{};
         std::vector<int> active(width);
         std::iota(active.begin(), active.end(), 0);
         PivotPanel panel(width, factor.block_size);
@@ -469,6 +500,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             cached_values.resize(static_cast<std::size_t>(cache_capacity)*width);
             cache_slot.assign(width,-1);
             for (int r=0;r<width;++r) { diagonal[r]=at(r,r); }
+        }
+        if (profile) {
+            setup_s[owner] += std::chrono::duration<double>(Clock::now()-setup_started).count();
         }
         auto raw_current = [&](int r,int c) {
             double result=at(r,c);
@@ -587,7 +621,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 [&](int id, int local) { return id < front.rows[local]; });
             const auto eligible_count = static_cast<std::size_t>(eligible_end - active.begin());
             if (eligible_count == 0) { break; }
+            const auto cache_refresh_started = profile ? Clock::now() : Clock::time_point{};
             refresh_candidates(eligible_count);
+            if (profile) {
+                cache_refresh_s[owner] +=
+                    std::chrono::duration<double>(Clock::now()-cache_refresh_started).count();
+            }
 
             const auto search_started = profile ? Clock::now() : Clock::time_point{};
             int pivots[2] = {-1, -1};
@@ -687,6 +726,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
             if (pivots[0] == -1) { break; }
 
+            // Includes forming the pivot block, computing factor multipliers,
+            // appending the L/R panel and writing per-pivot multiplier records.
+            const auto panel_build_started = profile ? Clock::now() : Clock::time_point{};
             PackedSymmetricPivot block;
             block.size = count;
             auto& owner_records = records[owner];
@@ -739,6 +781,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 }
             }
             panel.rank += count;
+            if (profile) {
+                panel_build_s[owner] +=
+                    std::chrono::duration<double>(Clock::now()-panel_build_started).count();
+            }
+
+            const auto bookkeeping_started = profile ? Clock::now() : Clock::time_point{};
             active.erase(std::remove_if(active.begin(), active.end(), [&](int r) {
                 return r == pivots[0] || (count == 2 && r == pivots[1]);
             }),active.end());
@@ -751,12 +799,31 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     }
                 }
             }
+            if (profile) {
+                pivot_bookkeeping_s[owner] +=
+                    std::chrono::duration<double>(Clock::now()-bookkeeping_started).count();
+            }
+
+            const auto cache_apply_started = profile ? Clock::now() : Clock::time_point{};
             apply_new_pivots_to_cache(base_rank,count);
+            if (profile) {
+                cache_apply_s[owner] +=
+                    std::chrono::duration<double>(Clock::now()-cache_apply_started).count();
+            }
+
+            const auto record_started = profile ? Clock::now() : Clock::time_point{};
             block.lower_count = owner_records.lower_rows.size() - block.lower_begin;
             owner_records.blocks.push_back(block);
+            if (profile) {
+                pivot_bookkeeping_s[owner] +=
+                    std::chrono::duration<double>(Clock::now()-record_started).count();
+            }
         }
         flush();
 
+        // Root check and inter-front Schur contribution packaging/inheritance.
+        // Includes allocations, active-index mapping and triangular copying.
+        const auto contribution_started = profile ? Clock::now() : Clock::time_point{};
         if (symbolic.parent[owner] == -1) {
             double maximum = 0.0;
             for (int r : active) {
@@ -783,10 +850,17 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 std::equal(output.rows.begin(),output.rows.end(),
                     symbolic.row.begin()+symbolic.ptr[parent],
                     symbolic.row.begin()+symbolic.ptr[parent+1])) {
+                const auto move_started = profile ? Clock::now() : Clock::time_point{};
                 output.origin = front.origin + active.front();
                 output.stride = front.stride;
                 output.values = std::move(front.values);
+                if (profile) {
+                    contribution_move_s[owner] += std::chrono::duration<double>(
+                        Clock::now()-move_started).count();
+                    ++contribution_moved_fronts[owner];
+                }
             } else {
+                const auto copy_started = profile ? Clock::now() : Clock::time_point{};
                 output.stride = static_cast<int>(active.size());
                 output.values.reserve(active.size() * (active.size()+1) / 2);
                 for (std::size_t r = 0; r < active.size(); ++r) {
@@ -794,9 +868,16 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         output.values.push_back(at(active[r],active[c]));
                     }
                 }
+                if (profile) {
+                    contribution_copy_s[owner] += std::chrono::duration<double>(
+                        Clock::now()-copy_started).count();
+                    contribution_copy_entries[owner] += active.size()*(active.size()+1)/2;
+                }
             }
         }
         if (profile) {
+            contribution_s[owner] +=
+                std::chrono::duration<double>(Clock::now()-contribution_started).count();
             front_s[owner] = std::chrono::duration<double>(Clock::now()-started).count();
         }
     };
@@ -866,6 +947,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     { for (int root : symbolic.roots) { visit(root,0); } }
     if (failure) { std::rethrow_exception(failure); }
 
+    const auto finalize_started = profile ? Clock::now() : Clock::time_point{};
     // Build a single, contiguous factor representation in elimination order.
     // Reserve once after all parallel fronts have finished to avoid reallocations
     // and preserve the original symbolic postorder across independent subtrees.
@@ -926,16 +1008,40 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     }
     if (factor.rank == 0) { factor.minimum_pivot = 0.0; }
     if (profile) {
+        const double factor_pack_s =
+            std::chrono::duration<double>(Clock::now()-finalize_started).count();
         auto sum = [](const std::vector<double>& xs) {
             return std::accumulate(xs.begin(),xs.end(),0.0);
+        };
+        // A residual bin is computed only from disjoint measurement intervals.
+        // It contains front traversal, uninstrumented work and timer overhead,
+        // not additional factorization time. This is CPU-time-like work when
+        // fronts execute concurrently; individual phase sums may overlap.
+        const double measured = sum(assembly_s)+sum(search_s)+sum(schur_s)+
+            sum(setup_s)+sum(cache_refresh_s)+sum(cache_apply_s)+
+            sum(panel_build_s)+sum(pivot_bookkeeping_s)+sum(contribution_s);
+        const double unattributed = sum(front_s)-measured;
+        const auto sum_count = [](const std::vector<std::size_t>& xs) {
+            return std::accumulate(xs.begin(),xs.end(),std::size_t{0});
         };
         std::fprintf(stderr,
             "FEMF_LDLT_PROFILE fronts=%zu relaxed=%zu fast_pivots=%zu fallback_searches=%zu "
             "assembly_s=%.6f pivot_search_s=%.6f schur_s=%.6f total_front_s=%.6f "
-            "(phase sums overlap with parallel work)\n",
+            "front_setup_s=%.6f cache_refresh_s=%.6f cache_apply_s=%.6f "
+            "panel_build_s=%.6f pivot_bookkeeping_s=%.6f contribution_s=%.6f "
+            "unattributed_front_s=%.6f factor_pack_s=%.6f "
+            "front_prepare_s=%.6f original_assemble_s=%.6f extend_add_s=%.6f "
+            "contribution_copy_s=%.6f contribution_move_s=%.6f "
+            "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
+            "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
-            sum(schur_s),sum(front_s));
+            sum(schur_s),sum(front_s),sum(setup_s),sum(cache_refresh_s),
+            sum(cache_apply_s),sum(panel_build_s),sum(pivot_bookkeeping_s),
+            sum(contribution_s),unattributed,factor_pack_s,
+            sum(front_prepare_s),sum(original_assemble_s),sum(extend_add_s),
+            sum(contribution_copy_s),sum(contribution_move_s),
+            sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts));
     }
     factor.ready = true;
 }
