@@ -648,9 +648,15 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             const auto t = profile ? Clock::now() : Clock::time_point{};
             if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
                 if (factor.indexed_schur) {
-                    dense::rank_k_ldlt_indexed_packed(
-                        front.origin, width, active, panel.rank,
-                        panel.left.data(), panel.right.data(), values);
+                    if (factor.wide_indexed_schur) {
+                        dense::rank_k_ldlt_indexed_packed6(
+                            front.origin, width, active, panel.rank,
+                            panel.left.data(), panel.right.data(), values);
+                    } else {
+                        dense::rank_k_ldlt_indexed_packed(
+                            front.origin, width, active, panel.rank,
+                            panel.left.data(), panel.right.data(), values);
+                    }
                 } else {
                     dense::rank_k_ldlt_tiled(
                         front.origin, width, active, panel.rank,
