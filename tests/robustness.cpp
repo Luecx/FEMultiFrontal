@@ -127,6 +127,44 @@ int main() {
                         pass = false;
                     }
                 }
+                // With an explicit supernode size equal to the panel size,
+                // the new independent control must reconstruct EXACTLY the
+                // original factor. This checks backward compatibility without
+                // requiring equal factors after intentionally changing the
+                // front ownership/amalgamation topology.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor explicitly_matched;
+                    explicitly_matched.kind = mf::PivotFactor::Kind::Symmetric;
+                    explicitly_matched.supernode_size = explicitly_matched.block_size;
+                    explicitly_matched.factorize(matrix,symbolic);
+                    bool identical =
+                        explicitly_matched.rank == factor.rank &&
+                        explicitly_matched.positive_directions == factor.positive_directions &&
+                        explicitly_matched.negative_directions == factor.negative_directions &&
+                        explicitly_matched.delayed_candidates == factor.delayed_candidates &&
+                        explicitly_matched.packed_lower_rows == factor.packed_lower_rows &&
+                        explicitly_matched.packed_lower_values == factor.packed_lower_values &&
+                        explicitly_matched.packed_blocks.size() == factor.packed_blocks.size();
+                    if (identical) {
+                        for (std::size_t k=0; k<factor.packed_blocks.size(); ++k) {
+                            const auto& a = explicitly_matched.packed_blocks[k];
+                            const auto& b = factor.packed_blocks[k];
+                            if (a.size != b.size || a.rows != b.rows ||
+                                a.diagonal != b.diagonal ||
+                                a.lower_begin != b.lower_begin ||
+                                a.value_begin != b.value_begin ||
+                                a.lower_count != b.lower_count) {
+                                identical = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!identical) {
+                        std::cerr << "Explicit matching supernode size changes factor in "
+                                  << name << '\n';
+                        pass = false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
