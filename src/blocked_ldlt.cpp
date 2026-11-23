@@ -984,8 +984,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     // at a time instead of doing an indexed lookup per entry.
                     const std::size_t nactive=active.size();
                     output.values.resize(nactive*(nactive+1)/2);
-                    const int first_active=active.front();
-                    const bool contiguous=static_cast<std::size_t>(
+                    const int first_active=active.empty() ? 0 : active.front();
+                    const bool contiguous=!active.empty() && static_cast<std::size_t>(
                         active.back()-first_active+1)==nactive;
                     for (std::size_t r=0; r<nactive; ++r) {
                         double* target=output.values.data()+r*(r+1)/2;
