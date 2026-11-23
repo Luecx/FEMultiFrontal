@@ -6,10 +6,12 @@
  * active-index holes, inherited packed origins, SIMD tails and OpenMP tasks.
  */
 #include "ldlt_schur.h"
+#include "ldlt_indexed_schur.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void check(int dim, int rank, int origin, int layout, bool parallel_run) {
@@ -47,19 +49,37 @@ static void check(int dim, int rank, int origin, int layout, bool parallel_run) 
             expected[offset+col] = v;
         }
     }
-    std::vector<double> actual(expected.size(),1.25);
+    // Exercise both the incumbent and the new index-aware packed panel
+    // implementation, including the threaded taskloop for sufficiently large
+    // matrix/rank combinations. All inactive and guard positions must remain.
+    for (int variant=0; variant<2; ++variant) {
+        std::vector<double> actual(expected.size(),1.25);
+        auto update = [&] {
+            if (variant==0) {
+                mf::dense::rank_k_ldlt_tiled(
+                    origin,dim,active,rank,left.data(),right.data(),actual.data());
+            } else {
+                mf::dense::rank_k_ldlt_indexed_packed(
+                    origin,dim,active,rank,left.data(),right.data(),actual.data());
+            }
+        };
 #ifdef _OPENMP
-    if (parallel_run) {
+        if (parallel_run) {
 #pragma omp parallel num_threads(4)
 #pragma omp single
-        { mf::dense::rank_k_ldlt_tiled(origin,dim,active,rank,left.data(),right.data(),actual.data()); }
-    } else
+            { update(); }
+        } else
 #endif
-    { mf::dense::rank_k_ldlt_tiled(origin,dim,active,rank,left.data(),right.data(),actual.data()); }
-    for (std::size_t i = 0; i < expected.size(); ++i) {
-        const double diff = std::abs(actual[i]-expected[i]);
-        if (!std::isfinite(actual[i]) || diff > 2e-12*std::max(1.0,std::abs(expected[i]))) {
-            throw std::runtime_error("Tiled LDLT Schur update differs from scalar reference at entry "+std::to_string(i));
+        { update(); }
+        for (std::size_t i=0; i<expected.size(); ++i) {
+            const double diff=std::abs(actual[i]-expected[i]);
+            if (!std::isfinite(actual[i]) ||
+                diff>2e-12*std::max(1.0,std::abs(expected[i]))) {
+                throw std::runtime_error(
+                    std::string(variant==0?"Tiled":"Indexed packed")+
+                    " LDLT Schur update differs from scalar reference at entry "+
+                    std::to_string(i));
+            }
         }
     }
 }
@@ -81,7 +101,7 @@ int main() {
         // active set and a high enough rank, then exercise irregular holes.
         check(1025,64,19,0,true);
         check(1025,64,19,1,true);
-        std::cout << "PASS: " << cases+2 << " tiled LDLT Schur cases\n";
+        std::cout << "PASS: " << cases+2 << " tiled and indexed packed LDLT Schur cases\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
