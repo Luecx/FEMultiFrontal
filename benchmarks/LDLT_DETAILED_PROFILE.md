@@ -67,3 +67,35 @@ bytes written but **not** total traffic, since packed source reads, allocations
 and memory writes also contribute. For a representative single-thread run,
 compare the contribution copy count with the measured copy time to decide
 whether to optimize physical triangular compaction or front reuse.
+
+## Front-row union A/B experiment
+
+Profiling on `haken` showed ~1.60 s in `front_prepare_s`, but this combines
+row-pattern construction and **mandatory** dense packed-front zero-initialization.
+The fast front-preparation variant eliminates repeated appends and a global
+sort/unique by incrementally merging sorted symbolic and contribution row lists:
+
+- Start with the bottom symbolic column once (previous code appended it twice).
+- Skip nested member or child lists already contained in the current union.
+- Merge only genuinely additional sorted lists with `std::set_union`.
+- Continue to zero-fill the entire packed triangular matrix so all original
+  assembly and Schur operations have the same initialized input.
+- Retain the exact old concatenation/sort/unique behind
+  `--ldlt-no-fast-front-prepare`, which can be evaluated with
+  `benchmarks/compare_ldlt_fastpath.py --front-prepare-ablation`.
+
+Additional **subphases** within `front_prepare_s`:
+
+| Field | Meaning |
+|---|---|
+| `front_row_union_s` | Front row union construction or inherited-front move |
+| `front_zero_s` | New packed front allocation and zero-initialization |
+| `front_position_map_s` | Construction of row-to-local-index mapping |
+| `front_contained_sources` | Number of sorted source lists skipped because all entries already exist |
+| `front_merged_sources` | Number of source lists that required a union |
+
+The nested subphases must **not** be added again to the top-level phases. A
+remaining difference between `front_prepare_s` and these subphases includes
+front metadata and timer overhead. If `front_zero_s` dominates, the row-union
+change may deliver limited speedup; do not optimize zero initialization without
+maintaining the same all-zero numerical semantics.
