@@ -171,6 +171,44 @@ int main() {
                         pass = false;
                     }
                 }
+                // Reordering the cache-reconstruction traversal must not
+                // change threshold pivot decisions, inertia or residual.
+                // Exercise 2x2 pivots, delayed candidates and low-rank
+                // matrices with both the scalar and SIMD candidate rebuilds.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor pivot_major;
+                    pivot_major.kind = mf::PivotFactor::Kind::Symmetric;
+                    pivot_major.supernode_size = factor.supernode_size;
+                    pivot_major.pivot_major_cache_refresh = true;
+                    pivot_major.factorize(matrix,symbolic);
+                    const auto x_pivot_major = pivot_major.solve(rhs);
+                    const auto ax_pivot_major = matrix.multiply(x_pivot_major);
+                    long double diff_squared=0.0L,rhs_squared=0.0L;
+                    for(int k=0;k<n;++k) {
+                        const long double diff =
+                            static_cast<long double>(ax_pivot_major[k])-rhs[k];
+                        diff_squared+=diff*diff;
+                        rhs_squared+=static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double res=std::sqrt(
+                        diff_squared/std::max(rhs_squared,1e-300L));
+                    if (pivot_major.rank != factor.rank ||
+                        pivot_major.positive_directions != factor.positive_directions ||
+                        pivot_major.negative_directions != factor.negative_directions ||
+                        pivot_major.two_by_two_pivots != factor.two_by_two_pivots ||
+                        pivot_major.delayed_candidates != factor.delayed_candidates ||
+                        !std::isfinite(res) || res >= 1e-8) {
+                        std::cerr << "Pivot-major cache refresh diverges in "
+                                  << name << " rank=" << pivot_major.rank
+                                  << "/" << factor.rank << " pivots2="
+                                  << pivot_major.two_by_two_pivots << "/"
+                                  << factor.two_by_two_pivots << " delays="
+                                  << pivot_major.delayed_candidates << "/"
+                                  << factor.delayed_candidates
+                                  << " residual=" << res << '\n';
+                        pass = false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
