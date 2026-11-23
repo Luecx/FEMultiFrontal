@@ -12,7 +12,6 @@
 #include "pivot_factor.h"
 #include "memory.h"
 #include "ldlt_schur.h"
-#include "ldlt_gemm.h"
 
 #include <algorithm>
 #include <array>
@@ -553,10 +552,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         auto flush = [&] {
             if (panel.rank == 0) { return; }
             const auto t = profile ? Clock::now() : Clock::time_point{};
-            if (factor.dense_schur && active.size() >= 128 && panel.rank >= 8) {
-                dense::rank_k_ldlt_gemm(front.origin, width, active, panel.rank,
-                                        panel.left.data(), panel.right.data(), values);
-            } else if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
+            if (factor.tiled_schur && active.size() >= 96 && panel.rank >= 8) {
                 dense::rank_k_ldlt_tiled(front.origin, width, active, panel.rank,
                                          panel.left.data(), panel.right.data(), values);
             } else {
