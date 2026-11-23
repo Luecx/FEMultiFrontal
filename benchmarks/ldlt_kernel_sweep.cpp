@@ -1,6 +1,6 @@
 /**
  * @file ldlt_kernel_sweep.cpp
- * @brief Standalone 20-way microbenchmark for FEMF's actual packed LDLT update.
+ * @brief Standalone 26-way microbenchmark for FEMF's actual packed LDLT update.
  *
  * Workload: C(active,active) -= L(active,:) * R(active,:)^T, where
  * R = L*D and D contains signed 1x1 and indefinite 2x2 blocks.
@@ -128,9 +128,14 @@ template<int W> void column_unroll(const Fixture& f,double* c,Scratch&) {
 // PACK=0: unpacked input operands
 // PACK=1: rank-major 8/16-wide right panels, constructed once per call
 // PACK=2: independent rank-major A and B panels, as in LLT packed6
-template<int MR,int NR,int PACK>
+// INDEXED=0: incumbent slow scalar fallback for output holes
+// INDEXED=1: AVX2 gathers output C; packed A/B; individual output scatters
+// INDEXED=2: scalar loads into vector accumulators; packed A/B; individual scatters
+template<int MR,int NR,int PACK,int INDEXED=0>
 void tiled(const Fixture& f,double* c,Scratch& scratch) {
     static_assert(MR>0 && NR%4==0);
+    static_assert(INDEXED==0 || PACK==2,
+                  "Indexed SIMD fallback requires both factor operands packed");
     const int na=static_cast<int>(f.active.size());
     const int ra=f.rank;
     const int a_panels=(na+MR-1)/MR, b_panels=(na+NR-1)/NR;
@@ -209,6 +214,48 @@ void tiled(const Fixture& f,double* c,Scratch& scratch) {
                         _mm256_storeu_pd(target[i]+base+4*v,acc[i][v]);
                 continue;
             }
+            if constexpr(INDEXED!=0) {
+                // The output remains in row-packed storage. Only this small
+                // rectangular tile is gathered/scattered; no whole-front copy.
+                __m256d acc[MR][NR/4];
+                __m128i index[NR/4];
+                for(int v=0;v<NR/4;++v) {
+                    const int p=jb+4*v;
+                    index[v]=_mm_setr_epi32(f.active[p], f.active[p+1],
+                                            f.active[p+2], f.active[p+3]);
+                }
+                for(int i=0;i<MR;++i) for(int v=0;v<NR/4;++v) {
+                    if constexpr(INDEXED==1) {
+                        acc[i][v]=_mm256_i32gather_pd(target[i],index[v],8);
+                    } else {
+                        const int p=jb+4*v;
+                        acc[i][v]=_mm256_setr_pd(
+                            target[i][f.active[p]],target[i][f.active[p+1]],
+                            target[i][f.active[p+2]],target[i][f.active[p+3]]);
+                    }
+                }
+                const std::size_t aoff=static_cast<std::size_t>(ib/MR)*ra*MR;
+                const std::size_t boff=static_cast<std::size_t>(jb/NR)*ra*NR;
+                for(int k=0;k<ra;++k) {
+                    const double* rhs=b_data+boff+static_cast<std::size_t>(k)*NR;
+                    __m256d b[NR/4];
+                    for(int v=0;v<NR/4;++v)b[v]=_mm256_loadu_pd(rhs+4*v);
+                    for(int i=0;i<MR;++i) {
+                        const __m256d x=_mm256_set1_pd(
+                            a_data[aoff+static_cast<std::size_t>(k)*MR+i]);
+                        for(int v=0;v<NR/4;++v)
+                            acc[i][v]=_mm256_fnmadd_pd(x,b[v],acc[i][v]);
+                    }
+                }
+                alignas(32) double values[NR];
+                for(int i=0;i<MR;++i) {
+                    for(int v=0;v<NR/4;++v)
+                        _mm256_store_pd(values+4*v,acc[i][v]);
+                    for(int j=0;j<NR;++j)
+                        target[i][f.active[jb+j]]=values[j];
+                }
+                continue;
+            }
 #else
             (void)contiguous;
 #endif
@@ -228,7 +275,7 @@ void tiled(const Fixture& f,double* c,Scratch& scratch) {
     }
 }
 
-constexpr std::array<Variant,20> kernels{{
+constexpr std::array<Variant,26> kernels{{
     {"scalar_reference",scalar_reference},
     {"column_unroll_2",column_unroll<2>},
     {"column_unroll_4",column_unroll<4>},
@@ -248,7 +295,13 @@ constexpr std::array<Variant,20> kernels{{
     {"packedB_6x16",tiled<6,16,1>},
     {"packedAB_4x8",tiled<4,8,2>},
     {"packedAB_6x8",tiled<6,8,2>},
-    {"packedAB_6x16",tiled<6,16,2>}
+    {"packedAB_6x16",tiled<6,16,2>},
+    {"indexedGatherAB_4x8",tiled<4,8,2,1>},
+    {"indexedGatherAB_6x8",tiled<6,8,2,1>},
+    {"indexedGatherAB_4x16",tiled<4,16,2,1>},
+    {"indexedScalarAB_4x8",tiled<4,8,2,2>},
+    {"indexedScalarAB_6x8",tiled<6,8,2,2>},
+    {"indexedScalarAB_4x16",tiled<4,16,2,2>}
 }};
 
 std::vector<int> numbers(const std::string& value) {
@@ -311,7 +364,7 @@ Options parse(int argc,char** argv) {
         else if(key=="--modes")x.modes=arg();
         else if(key=="--verify-only")x.verify_only=true;
         else if(key=="--help") {
-            std::cout<<"LDLT 20-kernel sweep\n"
+            std::cout<<"LDLT indexed+packed kernel sweep\n"
                 <<"  --sizes 256,768 --ranks 32 --holes 0,12 --origins 19\n"
                 <<"  --modes hot,cold --rounds 3 --target-ms 30 --cold-mib 96\n"
                 <<"  --verify-only (all kernels must match scalar reference)\n";
@@ -401,23 +454,23 @@ int main(int argc,char** argv) {
                 for(const std::string& mode:std::array<std::string,2>{"hot","cold"}) {
                     if(opts.modes=="hot"&&mode=="cold")continue;
                     if(opts.modes=="cold"&&mode=="hot")continue;
-                    std::array<std::vector<double>,20> samples;
+                    std::array<std::vector<double>,kernels.size()> samples;
                     // Reverse evaluation order every other round to reduce
                     // turbo/temperature bias, as in paired A/B benchmarks.
                     for(int rep=0;rep<opts.rounds;++rep) {
-                        for(int v=0;v<20;++v) {
-                            const int index=rep%2==0?v:19-v;
+                        for(std::size_t v=0;v<kernels.size();++v) {
+                            const std::size_t index=rep%2==0?v:kernels.size()-1-v;
                             samples[index].push_back(measure(fixture,kernels[index],mode,
                                 opts.target_ms,opts.cold_mib));
                         }
                     }
-                    std::array<double,20> medians{};
-                    for(int v=0;v<20;++v) {
+                    std::array<double,kernels.size()> medians{};
+                    for(std::size_t v=0;v<kernels.size();++v) {
                         auto& times=samples[v];
                         std::sort(times.begin(),times.end());
                         medians[v]=times[times.size()/2];
                     }
-                    for(int v=0;v<20;++v)
+                    for(std::size_t v=0;v<kernels.size();++v)
                         std::cout<<n<<','<<rank<<','<<hole<<','<<origin<<','<<mode<<','
                             <<kernels[v].name<<','<<medians[v]<<','
                             <<medians[0]/medians[v]<<'\n';
