@@ -127,16 +127,18 @@ int main() {
                         pass = false;
                     }
                 }
-                // Both front row-union and contribution compaction must
-                // reconstruct the identical factor, not merely its residual:
-                // test them independently on delayed, indefinite and singular
-                // operators, while holding every other flag fixed.
+                // Check front row-union, contribution compaction and the
+                // demand-driven pivot-cache policy independently. Every
+                // alternative must reconstruct identical pivot metadata, not
+                // merely an acceptable residual, even with delayed or 2x2
+                // indefinite pivots and singular root blocks.
                 if (symmetric && !incompatible && threads == 1 && n >= 96) {
-                  for (int ablation=0; ablation<2; ++ablation) {
+                  for (int ablation=0; ablation<3; ++ablation) {
                     mf::PivotFactor previous;
                     previous.kind = mf::PivotFactor::Kind::Symmetric;
                     previous.fast_contribution_copy = (ablation != 0);
-                    previous.fast_front_prepare = (ablation == 0);
+                    previous.fast_front_prepare = (ablation != 1);
+                    previous.lazy_pivot_cache = (ablation != 2);
                     previous.factorize(matrix,symbolic);
                     const auto px = previous.solve(rhs);
                     const auto pax = matrix.multiply(px);
@@ -172,7 +174,9 @@ int main() {
                     if (!metadata_identical || !std::isfinite(pres) || pres>1e-8) {
                         std::cerr << (ablation == 0 ?
                             "Fast contribution copy disagreement in " :
-                            "Fast front prepare disagreement in ")
+                            ablation == 1 ?
+                            "Fast front prepare disagreement in " :
+                            "Lazy cache disagreement in ")
                                   << name << " old_residual=" << pres << '\n';
                         pass=false;
                     }
