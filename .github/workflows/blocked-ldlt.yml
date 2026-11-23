@@ -62,6 +62,14 @@ jobs:
           grep -q 'staged_gemm_compute_s=' /tmp/ldlt-profile.txt
           grep -q 'staged_gemm_store_s=' /tmp/ldlt-profile.txt
           grep -q 'staged_gemm_tiles=' /tmp/ldlt-profile.txt
+      - name: Compile and validate optional CBLAS GEMM mode (OpenBLAS)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libopenblas-dev
+          OPENBLAS_NUM_THREADS=1 make -j2 WITH_CBLAS=1 WITH_OPENMP=0 all check \
+            BLAS_LIBS="-lopenblas" \
+            CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic"
+          OPENBLAS_NUM_THREADS=1 ./build/native-cblas/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-gemm-schur
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
