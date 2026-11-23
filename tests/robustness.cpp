@@ -246,6 +246,43 @@ int main() {
                         pass=false;
                     }
                 }
+                // The optional segmented contribution assembly uses
+                // the same 32:64 layout and both cache optimizations.
+                // Validate complete factorization across indefinite,
+                // delayed-2x2 and singular examples independently.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor segment;
+                    segment.kind = mf::PivotFactor::Kind::Symmetric;
+                    segment.supernode_size = factor.supernode_size;
+                    segment.pivot_major_cache_refresh = true;
+                    segment.simd_cache_apply = true;
+                    segment.segmented_extend_add = true;
+                    segment.factorize(matrix,symbolic);
+                    const auto x_segment=segment.solve(rhs);
+                    const auto ax_segment=matrix.multiply(x_segment);
+                    long double diff2=0.0L, b2_segment=0.0L;
+                    for(int k=0;k<n;++k) {
+                        const long double d=static_cast<long double>(ax_segment[k])-rhs[k];
+                        diff2+=d*d;
+                        b2_segment+=static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double res_segment=std::sqrt(diff2/std::max(b2_segment,1e-300L));
+                    if (segment.rank != factor.rank ||
+                        segment.positive_directions != factor.positive_directions ||
+                        segment.negative_directions != factor.negative_directions ||
+                        segment.two_by_two_pivots != factor.two_by_two_pivots ||
+                        segment.delayed_candidates != factor.delayed_candidates ||
+                        !std::isfinite(res_segment) || res_segment >= 1e-8) {
+                        std::cerr << "Segmented extend-add disagreement in " << name
+                                  << " rank=" << segment.rank << "/" << factor.rank
+                                  << " pivots2=" << segment.two_by_two_pivots << "/"
+                                  << factor.two_by_two_pivots
+                                  << " delayed=" << segment.delayed_candidates << "/"
+                                  << factor.delayed_candidates
+                                  << " residual=" << res_segment << '\n';
+                        pass = false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
