@@ -50,7 +50,8 @@ def main():
                         default=parse_pairs("32:32,32:64,64:32,64:64"))
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--cpu", type=int, default=90)
+    parser.add_argument("--cpu", type=int, default=None,
+                        help="Optional Linux CPU affinity; omit when not pinning")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--ordering", choices=("nd", "natural"), default="nd")
     args = parser.parse_args()
