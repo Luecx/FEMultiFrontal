@@ -42,6 +42,7 @@ int run_pivot_driver(int argc, char** argv) {
     int ldlt_block_size = 32;
     bool fast_pivoting = true, tiled_schur = true, relaxed_supernodes = true;
     bool cached_pivot_rows = true;
+    bool lazy_pivot_cache = true;
     bool indexed_schur = true;
     bool fast_contribution_copy = true;
     bool fast_front_prepare = true;
@@ -61,6 +62,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--ldlt-no-fast-contribution-copy") { fast_contribution_copy = false; }
         else if (option == "--ldlt-no-fast-front-prepare") { fast_front_prepare = false; }
         else if (option == "--ldlt-no-pivot-cache") { cached_pivot_rows = false; }
+        else if (option == "--ldlt-no-lazy-pivot-cache") { lazy_pivot_cache = false; }
         else if (option == "--ldlt-no-relaxed-supernodes") { relaxed_supernodes = false; }
         else if (option == "--analyze-only") { analyze_only = true; }
         else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
@@ -120,6 +122,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.fast_contribution_copy = fast_contribution_copy;
     factor.fast_front_prepare = fast_front_prepare;
     factor.cached_pivot_rows = cached_pivot_rows;
+    factor.lazy_pivot_cache = lazy_pivot_cache;
     factor.relaxed_supernodes = relaxed_supernodes;
     std::vector<double> totals;
     for (int trial = 0; trial < repeat; ++trial) {
