@@ -171,6 +171,44 @@ int main() {
                         pass = false;
                     }
                 }
+                // Compare the complete experimental staged-GEMM solver
+                // against the default factor on the same symbolic input,
+                // including signed 2x2 pivots and rank-deficient operators.
+                // A larger dense fixture below forces actual GEMM flushes.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor gemm_factor;
+                    gemm_factor.kind = mf::PivotFactor::Kind::Symmetric;
+                    gemm_factor.supernode_size = factor.supernode_size;
+                    gemm_factor.staged_gemm_schur = true;
+                    gemm_factor.factorize(matrix,symbolic);
+                    const auto gemm_x = gemm_factor.solve(rhs);
+                    const auto gemm_ax = matrix.multiply(gemm_x);
+                    long double gr2 = 0.0L, gb2 = 0.0L;
+                    for (int k=0;k<n;++k) {
+                        const long double d = static_cast<long double>(gemm_ax[k])-rhs[k];
+                        gr2 += d*d;
+                        gb2 += static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double gres=std::sqrt(gr2/std::max(gb2,1e-300L));
+                    const bool equivalent =
+                        gemm_factor.rank == factor.rank &&
+                        gemm_factor.positive_directions == factor.positive_directions &&
+                        gemm_factor.negative_directions == factor.negative_directions &&
+                        gemm_factor.two_by_two_pivots == factor.two_by_two_pivots &&
+                        std::isfinite(gres) && gres < 1e-8;
+                    if (!equivalent) {
+                        std::cerr << "Staged GEMM LDLT disagreement in " << name
+                                  << " rank=" << gemm_factor.rank << "/" << factor.rank
+                                  << " inertia+=" << gemm_factor.positive_directions << "/"
+                                  << factor.positive_directions
+                                  << " inertia-=" << gemm_factor.negative_directions << "/"
+                                  << factor.negative_directions
+                                  << " pivots2=" << gemm_factor.two_by_two_pivots << "/"
+                                  << factor.two_by_two_pivots
+                                  << " residual=" << gres << '\n';
+                        pass = false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
@@ -334,6 +372,24 @@ int main() {
     check("unsymmetric_swaps", 3, {0,2,0,1,0,3,4,1,5}, false, 3);
     check("unsymmetric_scaled", 2, {1e-10,2e-10,-1,2}, false, 2);
     check("unsymmetric_singular", 3, {1,2,3,2,4,6,0,1,1}, false, 2);
+
+    // A 256x256 fully populated indefinite front forces the staged-GEMM
+    // eligibility threshold (>192 active rows and >=16 accumulated pivots).
+    // Its two leading zero diagonals require one 2x2 pivot; the remaining
+    // diagonal signs exercise signed rank-k updates across multiple panels.
+    {
+        constexpr int n=256;
+        std::vector<double> dense(n*n);
+        for (int r=0;r<n;++r) {
+            for (int c=0;c<n;++c) {
+                dense[r*n+c] = r==c
+                    ? (r<2 ? 0.0 : (r%2 ? 2.0 : -2.0))
+                    : 0.0001*std::cos(0.1*(r+c));
+            }
+        }
+        dense[1] = dense[n] = 1.0;
+        check("dense256_indefinite_gemm",n,dense,true,n,false,true);
+    }
 
     // Dense fronts exceed the SIMD cutoff and force an indefinite 2-by-2 block
     {
