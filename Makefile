@@ -10,11 +10,19 @@ LDLIBS   ?=
 
 # Keep serial and OpenMP objects separate so configuration changes never mix.
 WITH_OPENMP ?= 0
+WITH_CBLAS  ?= 0
+BLAS_CPPFLAGS ?=
+BLAS_LIBS   ?= -lopenblas
 VARIANT     := native
 ifeq ($(WITH_OPENMP),1)
 VARIANT  := $(VARIANT)-omp
 CXXFLAGS += -fopenmp
 LDFLAGS  += -fopenmp
+endif
+ifeq ($(WITH_CBLAS),1)
+VARIANT := $(VARIANT)-cblas
+CPPFLAGS += -DFEMF_USE_CBLAS $(BLAS_CPPFLAGS)
+LDLIBS += $(BLAS_LIBS)
 endif
 BUILD_DIR := build/$(VARIANT)
 
