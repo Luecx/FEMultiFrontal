@@ -40,6 +40,8 @@ def main():
                         help="Compare scalar per-entry cache rebuild with pivot-major SIMD refresh")
     parser.add_argument("--simd-cache-apply-ablation", action="store_true",
                         help="Compare SIMD vs scalar cache row updates on top of pivot-major cache refresh")
+    parser.add_argument("--segmented-extend-add-ablation", action="store_true",
+                        help="Compare segmented vs scalar child-to-parent extend-add on top of both cache optimizations")
     parser.add_argument("--contribution-copy-ablation", action="store_true",
                         help="Compare exact original contribution compaction with optimized packed row copies")
     parser.add_argument("--front-prepare-ablation", action="store_true",
@@ -77,9 +79,13 @@ def main():
 
         if sum((args.ablations, args.indexed_ablation, args.contribution_copy_ablation,
                 args.front_prepare_ablation, args.pivot_major_cache_ablation,
-                args.simd_cache_apply_ablation)) > 1:
+                args.simd_cache_apply_ablation,
+                args.segmented_extend_add_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply"),
+             "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-segmented-extend-add")}
+            if args.segmented_extend_add_ablation else
             {"previous": ("--ldlt-pivot-major-cache-refresh",),
              "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply")}
             if args.simd_cache_apply_ablation else
@@ -146,7 +152,8 @@ def main():
                                      args.contribution_copy_ablation,
                                      args.front_prepare_ablation,
                                      args.pivot_major_cache_ablation,
-                                     args.simd_cache_apply_ablation)) else "legacy"
+                                     args.simd_cache_apply_ablation,
+                                     args.segmented_extend_add_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
