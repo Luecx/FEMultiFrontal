@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--ablations", action="store_true", help="Compare PR23 baseline with the pivot-cache-only candidate")
+    parser.add_argument("--indexed-ablation", action="store_true",
+                        help="Compare current production Schur kernel with new packed-indexed kernel")
     parser.add_argument("--ordering", choices=("nd", "natural"), default="nd")
     parser.add_argument("--cpu", type=int, help="Optional Linux taskset CPU; leave empty for multi-thread runs")
     parser.add_argument("--pivot-tolerance", type=float, default=0.1)
@@ -65,10 +67,14 @@ def main():
         if args.cpu is not None:
             command = ["taskset", "-c", str(args.cpu)] + command
 
+        if args.ablations and args.indexed_ablation:
+            parser.error("--ablations and --indexed-ablation are mutually exclusive")
         variants = (
-            {"previous": ("--ldlt-no-pivot-cache",),
-             "candidate": ()}
-            if args.ablations else {"legacy": LEGACY, "candidate": ()}
+            {"previous": ("--ldlt-no-indexed-schur",), "candidate": ()}
+            if args.indexed_ablation else
+            {"previous": ("--ldlt-no-pivot-cache",), "candidate": ()}
+            if args.ablations else
+            {"legacy": LEGACY, "candidate": ()}
         )
         labels = list(variants)
 
@@ -117,7 +123,7 @@ def main():
             median = medians[label]
             mad = statistics.median(abs(x-median) for x in values)
             print(f"{label}_median_s={median:.9f} {label}_MAD_s={mad:.9f}")
-        baseline = "previous" if args.ablations else "legacy"
+        baseline = "previous" if args.ablations or args.indexed_ablation else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
