@@ -382,6 +382,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> front_position_map_s(profile ? n : 0,0.0);
     std::vector<std::size_t> front_contained_sources(profile ? n : 0,0);
     std::vector<std::size_t> front_merged_sources(profile ? n : 0,0);
+    std::vector<std::size_t> tiled_fronts(profile ? n : 0,0);
+    std::vector<std::size_t> tiled_flushes(profile ? n : 0,0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
@@ -492,6 +494,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
         const int width = static_cast<int>(front.rows.size());
         widths[owner] = width;
+        if (profile && front.tiled) { ++tiled_fronts[owner]; }
         double* const values = front.values.data();
         auto at = [&](int r, int c) -> double& {
             const int physical_row = front.origin + std::max(r,c);
@@ -693,6 +696,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             if (panel.rank == 0) { return; }
             const auto t = profile ? Clock::now() : Clock::time_point{};
             if (front.tiled) {
+                if (profile) { ++tiled_flushes[owner]; }
                 dense::rank_k_ldlt_tiled_front(
                     front.origin, width, active, panel.rank,
                     panel.left.data(), panel.right.data(), values);
@@ -1184,6 +1188,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
             "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
             "front_contained_sources=%zu front_merged_sources=%zu "
+            "tiled_fronts=%zu tiled_flushes=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1194,7 +1199,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum(contribution_copy_s),sum(contribution_move_s),
             sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts),
             sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
-            sum_count(front_contained_sources),sum_count(front_merged_sources));
+            sum_count(front_contained_sources),sum_count(front_merged_sources),
+            sum_count(tiled_fronts),sum_count(tiled_flushes));
     }
     factor.ready = true;
 }
