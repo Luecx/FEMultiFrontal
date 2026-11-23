@@ -171,6 +171,48 @@ int main() {
                         pass = false;
                     }
                 }
+                // Independent solve/check for persistent tile-major
+                // frontal storage. All pivoting, rank decisions and external
+                // factor representation are shared with the row-packed path.
+                // This exercises full assembly, inherited child contributions,
+                // delayed 2x2 pivots, and singular low-rank root blocks.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor tile_factor;
+                    tile_factor.kind = mf::PivotFactor::Kind::Symmetric;
+                    tile_factor.supernode_size = factor.supernode_size;
+                    tile_factor.tiled_front_storage = true;
+                    tile_factor.factorize(matrix,symbolic);
+                    const auto tile_x=tile_factor.solve(rhs);
+                    const auto tile_ax=matrix.multiply(tile_x);
+                    long double tr2=0.0L,tb2=0.0L;
+                    for(int k=0;k<n;++k) {
+                        const long double diff=static_cast<long double>(tile_ax[k])-rhs[k];
+                        tr2+=diff*diff;
+                        tb2+=static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double tile_residual=std::sqrt(tr2/std::max(tb2,1e-300L));
+                    const bool equivalent =
+                        tile_factor.rank == factor.rank &&
+                        tile_factor.positive_directions == factor.positive_directions &&
+                        tile_factor.negative_directions == factor.negative_directions &&
+                        tile_factor.two_by_two_pivots == factor.two_by_two_pivots &&
+                        tile_factor.delayed_candidates == factor.delayed_candidates &&
+                        std::isfinite(tile_residual) && tile_residual < 1e-8;
+                    if (!equivalent) {
+                        std::cerr << "Tile-packed front disagreement in " << name
+                                  << " rank=" << tile_factor.rank << "/" << factor.rank
+                                  << " inertia+=" << tile_factor.positive_directions
+                                  << "/" << factor.positive_directions
+                                  << " inertia-=" << tile_factor.negative_directions
+                                  << "/" << factor.negative_directions
+                                  << " pivots2=" << tile_factor.two_by_two_pivots
+                                  << "/" << factor.two_by_two_pivots
+                                  << " delayed=" << tile_factor.delayed_candidates
+                                  << "/" << factor.delayed_candidates
+                                  << " residual=" << tile_residual << '\n';
+                        pass=false;
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
