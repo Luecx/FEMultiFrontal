@@ -43,6 +43,7 @@ int run_pivot_driver(int argc, char** argv) {
     bool fast_pivoting = true, tiled_schur = true, relaxed_supernodes = true;
     bool cached_pivot_rows = true;
     bool indexed_schur = true;
+    bool wide_indexed_schur = true;
     bool fast_contribution_copy = true;
     bool fast_front_prepare = true;
     bool analyze_only = false;
@@ -58,6 +59,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--ldlt-legacy-pivot-order") { fast_pivoting = false; }
         else if (option == "--ldlt-no-tiled-schur") { tiled_schur = false; }
         else if (option == "--ldlt-no-indexed-schur") { indexed_schur = false; }
+        else if (option == "--ldlt-no-wide-indexed-schur") { wide_indexed_schur = false; }
         else if (option == "--ldlt-no-fast-contribution-copy") { fast_contribution_copy = false; }
         else if (option == "--ldlt-no-fast-front-prepare") { fast_front_prepare = false; }
         else if (option == "--ldlt-no-pivot-cache") { cached_pivot_rows = false; }
@@ -117,6 +119,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.fast_pivoting = fast_pivoting;
     factor.tiled_schur = tiled_schur;
     factor.indexed_schur = indexed_schur;
+    factor.wide_indexed_schur = wide_indexed_schur;
     factor.fast_contribution_copy = fast_contribution_copy;
     factor.fast_front_prepare = fast_front_prepare;
     factor.cached_pivot_rows = cached_pivot_rows;
