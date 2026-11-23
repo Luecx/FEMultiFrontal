@@ -259,6 +259,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     }
 #endif
     const int n = input.n;
+    const int max_supernode_size = factor.supernode_size == 0
+        ? factor.block_size : factor.supernode_size;
+    if (max_supernode_size < 1 || max_supernode_size > 256) {
+        throw std::runtime_error("Invalid blocked LDLT supernode size");
+    }
     factor.matrix = &input;
     factor.blocks.clear();
     factor.packed_blocks.clear();
@@ -311,7 +316,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         int head = first;
         int count = 1;
         group_first[head] = first;
-        while (count < factor.block_size) {
+        while (count < max_supernode_size) {
             const int parent = symbolic.parent[head];
             if (parent == -1) { break; }
             const bool exact = symbolic.reuse_child[parent] == head;
