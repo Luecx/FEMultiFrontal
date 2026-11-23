@@ -339,8 +339,13 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
     // Fine-grained bins are disjoint from each other and from the coarse
     // assembly/search/Schur bins. One writer per front avoids atomics.
-    std::vector<double> setup_s(n,0.0), cache_refresh_s(n,0.0), cache_apply_s(n,0.0);
-    std::vector<double> panel_build_s(n,0.0), pivot_bookkeeping_s(n,0.0), contribution_s(n,0.0);
+    // Keep the fine-grained arrays empty unless profiling is requested.
+    std::vector<double> setup_s(profile ? n : 0,0.0);
+    std::vector<double> cache_refresh_s(profile ? n : 0,0.0);
+    std::vector<double> cache_apply_s(profile ? n : 0,0.0);
+    std::vector<double> panel_build_s(profile ? n : 0,0.0);
+    std::vector<double> pivot_bookkeeping_s(profile ? n : 0,0.0);
+    std::vector<double> contribution_s(profile ? n : 0,0.0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
