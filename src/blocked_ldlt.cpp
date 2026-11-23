@@ -978,13 +978,36 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 output.stride = static_cast<int>(active.size());
                 output.values.reserve(active.size() * (active.size()+1) / 2);
                 if (front.tiled) {
-                    // Outgoing contributions remain compact row-packed
-                    // triangles unless ownership transfers the entire tiled
-                    // physical buffer. This keeps parent assembly compatible
-                    // with leaves that still use the original layout.
-                    for (std::size_t r=0; r<active.size(); ++r) {
-                        for (std::size_t c=0; c<=r; ++c) {
-                            output.values.push_back(at(active[r],active[c]));
+                    // A parent that cannot inherit this tile-major physical
+                    // allocation still expects a canonical compact triangle.
+                    // Convert contiguous active suffixes one tile-row segment
+                    // at a time instead of doing an indexed lookup per entry.
+                    const std::size_t nactive=active.size();
+                    output.values.resize(nactive*(nactive+1)/2);
+                    const int first_active=active.front();
+                    const bool contiguous=static_cast<std::size_t>(
+                        active.back()-first_active+1)==nactive;
+                    for (std::size_t r=0; r<nactive; ++r) {
+                        double* target=output.values.data()+r*(r+1)/2;
+                        const int physical_row=front.origin+active[r];
+                        if (contiguous) {
+                            int physical_col=front.origin+first_active;
+                            const int end_col=physical_row+1;
+                            while (physical_col<end_col) {
+                                const int remaining_in_tile =
+                                    dense::front_tile_size - physical_col%dense::front_tile_size;
+                                const int count=std::min(end_col-physical_col,remaining_in_tile);
+                                const double* source=values+
+                                    dense::tiled_front_offset(physical_row,physical_col);
+                                std::copy_n(source,count,target);
+                                target+=count;
+                                physical_col+=count;
+                            }
+                        } else {
+                            // Noncontiguous delayed pivots leave holes.
+                            for (std::size_t c=0;c<=r;++c) {
+                                target[c]=at(active[r],active[c]);
+                            }
                         }
                     }
                 } else if (factor.fast_contribution_copy && !active.empty()) {
