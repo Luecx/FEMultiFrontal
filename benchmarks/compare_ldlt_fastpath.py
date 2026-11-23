@@ -40,6 +40,8 @@ def main():
                         help="Compare exact original contribution compaction with optimized packed row copies")
     parser.add_argument("--front-prepare-ablation", action="store_true",
                         help="Compare original concatenation/sort versus sorted-union front construction")
+    parser.add_argument("--tiled-front-ablation", action="store_true",
+                        help="Compare row-packed frontal storage with persistent 32x32 tile-packed storage")
     parser.add_argument("--ordering", choices=("nd", "natural"), default="nd")
     parser.add_argument("--cpu", type=int, help="Optional Linux taskset CPU; leave empty for multi-thread runs")
     parser.add_argument("--pivot-tolerance", type=float, default=0.1)
@@ -72,9 +74,11 @@ def main():
             command = ["taskset", "-c", str(args.cpu)] + command
 
         if sum((args.ablations, args.indexed_ablation, args.contribution_copy_ablation,
-                args.front_prepare_ablation)) > 1:
+                args.front_prepare_ablation, args.tiled_front_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": (), "candidate": ("--ldlt-tiled-front",)}
+            if args.tiled_front_ablation else
             {"previous": ("--ldlt-no-fast-front-prepare",), "candidate": ()}
             if args.front_prepare_ablation else
             {"previous": ("--ldlt-no-fast-contribution-copy",), "candidate": ()}
@@ -134,7 +138,8 @@ def main():
             print(f"{label}_median_s={median:.9f} {label}_MAD_s={mad:.9f}")
         baseline = "previous" if any((args.ablations, args.indexed_ablation,
                                      args.contribution_copy_ablation,
-                                     args.front_prepare_ablation)) else "legacy"
+                                     args.front_prepare_ablation,
+                                     args.tiled_front_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
