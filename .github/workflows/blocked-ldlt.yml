@@ -22,6 +22,7 @@ jobs:
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-supernode-size 64
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-pivot-major-cache-refresh
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-pivot-major-cache-refresh --ldlt-simd-cache-apply
+          ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-pivot-major-cache-refresh --ldlt-simd-cache-apply --ldlt-segmented-extend-add
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-no-indexed-schur
           ./build/native/mfsolve tests/symmetric.mtx --matrix-type symmetric --ordering natural --threads 1 --ldlt-block-size 32 --ldlt-legacy-pivot-order --ldlt-no-tiled-schur --ldlt-no-relaxed-supernodes
       - name: Smoke-test reproducible LDLT A/B benchmark
@@ -32,6 +33,7 @@ jobs:
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --indexed-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --pivot-major-cache-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --simd-cache-apply-ablation
+          python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --segmented-extend-add-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --contribution-copy-ablation
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --front-prepare-ablation
           python3 -m py_compile benchmarks/sweep_ldlt_panel_supernode.py
@@ -60,6 +62,8 @@ jobs:
           grep -q 'front_contained_sources=' /tmp/ldlt-profile.txt
           grep -q 'front_merged_sources=' /tmp/ldlt-profile.txt
           grep -q 'simd_cache_apply_quads=' /tmp/ldlt-profile.txt
+          grep -q 'segmented_extend_add_sources=' /tmp/ldlt-profile.txt
+          grep -q 'segmented_extend_add_rows=' /tmp/ldlt-profile.txt
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"
