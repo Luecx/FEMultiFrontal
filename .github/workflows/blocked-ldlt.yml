@@ -23,6 +23,7 @@ jobs:
         run: |
           python3 -m py_compile benchmarks/compare_ldlt_fastpath.py
           python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1
+          python3 benchmarks/compare_ldlt_fastpath.py tests/symmetric.mtx --binary build/native/mfsolve --threads 1 --ordering natural --warmups 0 --rounds 1 --ablations
       - name: Compile and run OpenMP regressions
         run: |
           make -j2 WITH_OPENMP=1 check CXXFLAGS="-O3 -march=native -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -fopenmp"

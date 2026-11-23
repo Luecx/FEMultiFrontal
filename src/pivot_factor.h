@@ -79,6 +79,7 @@ struct PivotFactor {
     // The general LU and scalar LDLT paths are unaffected.
     bool fast_pivoting = true;
     bool tiled_schur = true;
+    bool cached_pivot_rows = true; // Incrementally updated lookahead rows and diagonals.
     bool relaxed_supernodes = true;
 
     // Legacy per-pivot representation for scalar LDLT and general LU.

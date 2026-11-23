@@ -103,6 +103,7 @@ int main() {
                     legacy.kind = mf::PivotFactor::Kind::Symmetric;
                     legacy.fast_pivoting = false;
                     legacy.tiled_schur = false;
+                    legacy.cached_pivot_rows = false;
                     legacy.relaxed_supernodes = false;
                     legacy.factorize(matrix,symbolic);
                     const auto lx = legacy.solve(rhs);

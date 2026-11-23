@@ -20,6 +20,7 @@ from pathlib import Path
 LEGACY = (
     "--ldlt-legacy-pivot-order",
     "--ldlt-no-tiled-schur",
+    "--ldlt-no-pivot-cache",
     "--ldlt-no-relaxed-supernodes",
 )
 METRIC = re.compile(r"\b(\w+)=([^\s]+)")
@@ -32,6 +33,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument("--ablations", action="store_true", help="Compare PR23 baseline with the pivot-cache-only candidate")
     parser.add_argument("--ordering", choices=("nd", "natural"), default="nd")
     parser.add_argument("--cpu", type=int, help="Optional Linux taskset CPU; leave empty for multi-thread runs")
     parser.add_argument("--pivot-tolerance", type=float, default=0.1)
@@ -63,8 +65,15 @@ def main():
         if args.cpu is not None:
             command = ["taskset", "-c", str(args.cpu)] + command
 
+        variants = (
+            {"previous": ("--ldlt-no-pivot-cache",),
+             "candidate": ()}
+            if args.ablations else {"legacy": LEGACY, "candidate": ()}
+        )
+        labels = list(variants)
+
         def measure(label):
-            flags = LEGACY if label == "legacy" else ()
+            flags = variants[label]
             completed = subprocess.run(
                 command + list(flags), check=True, capture_output=True,
                 text=True, env=env,
@@ -87,15 +96,15 @@ def main():
         print(f"rounds={args.rounds} warmups={args.warmups} executable={args.binary}", flush=True)
         reference = None
         for i in range(args.warmups):
-            for label in ("legacy", "candidate"):
+            for label in labels:
                 _, state = measure(label)
                 if reference is None:
                     reference = state
                 if state != reference:
                     raise RuntimeError(f"Rank/inertia mismatch in warmup: {state} != {reference}")
-        observations = {"legacy": [], "candidate": []}
+        observations = {label: [] for label in labels}
         for i in range(args.rounds):
-            for label in (("legacy", "candidate") if i%2 == 0 else ("candidate", "legacy")):
+            for label in (labels if i%2 == 0 else list(reversed(labels))):
                 seconds, state = measure(label)
                 if reference is None:
                     reference = state
@@ -103,14 +112,13 @@ def main():
                     raise RuntimeError(f"Rank/inertia mismatch: {label}: {state} != {reference}")
                 observations[label].append(seconds)
                 print(f"round={i+1} variant={label} factor_s={seconds:.9f}",flush=True)
-        a = statistics.median(observations["legacy"])
-        b = statistics.median(observations["candidate"])
-        speedup = a/b
-        mad_a = statistics.median(abs(x-a) for x in observations["legacy"])
-        mad_b = statistics.median(abs(x-b) for x in observations["candidate"])
-        print(f"legacy_median_s={a:.9f} legacy_MAD_s={mad_a:.9f}")
-        print(f"candidate_median_s={b:.9f} candidate_MAD_s={mad_b:.9f}")
-        print(f"speedup={speedup:.5f}x rank_and_inertia={reference}")
+        medians = {label: statistics.median(values) for label, values in observations.items()}
+        for label, values in observations.items():
+            median = medians[label]
+            mad = statistics.median(abs(x-median) for x in values)
+            print(f"{label}_median_s={median:.9f} {label}_MAD_s={mad:.9f}")
+        baseline = "previous" if args.ablations else "legacy"
+        print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
     main()
