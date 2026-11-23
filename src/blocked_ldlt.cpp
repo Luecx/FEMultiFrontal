@@ -362,6 +362,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<double> front_position_map_s(profile ? n : 0,0.0);
     std::vector<std::size_t> front_contained_sources(profile ? n : 0,0);
     std::vector<std::size_t> front_merged_sources(profile ? n : 0,0);
+    std::vector<std::size_t> cache_prefetched_rows(profile ? n : 0,0);
+    std::vector<std::size_t> cache_demand_rows(profile ? n : 0,0);
     std::vector<std::vector<int>> worker_positions(factor.threads);
     std::atomic<bool> failed{false};
     std::exception_ptr failure;
@@ -586,9 +588,14 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
             return raw_current(r,c);
         };
-        auto refresh_candidates = [&](std::size_t count) {
+        // Retain existing cached lookahead rows, but materialize only the
+        // candidate prefix that will actually be tested. This avoids keeping
+        // 8 large cached rows current when the first pivot is accepted.
+        auto refresh_candidates = [&](std::size_t count, std::size_t requested,
+                                      bool on_demand) {
             if (!factor.cached_pivot_rows) { return; }
             const int keep=static_cast<int>(std::min<std::size_t>(cache_capacity,count));
+            const int create=static_cast<int>(std::min<std::size_t>(keep,requested));
             // Only cache rows in the current lookahead. Delayed rows can
             // remain unchanged for many iterations, retaining their slots.
             for (int slot=0;slot<cache_capacity;++slot) {
@@ -603,7 +610,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     cached_ids[slot]=-1;
                 }
             }
-            for (int j=0;j<keep;++j) {
+            for (int j=0;j<create;++j) {
                 const int r=active[j];
                 if (cache_slot[r]>=0) { continue; }
                 int slot=0;
@@ -617,6 +624,10 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 for (int c:active) { row[c]=raw_current(r,c); }
                 cached_ids[slot]=r;
                 cache_slot[r]=slot;
+                if (profile) {
+                    if (on_demand) { ++cache_demand_rows[owner]; }
+                    else { ++cache_prefetched_rows[owner]; }
+                }
             }
         };
         auto apply_new_pivots_to_cache = [&](int base_rank,int count) {
@@ -681,7 +692,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             const auto eligible_count = static_cast<std::size_t>(eligible_end - active.begin());
             if (eligible_count == 0) { break; }
             const auto cache_refresh_started = profile ? Clock::now() : Clock::time_point{};
-            refresh_candidates(eligible_count);
+            const bool lazy_cache = factor.lazy_pivot_cache && factor.fast_pivoting;
+            refresh_candidates(eligible_count, lazy_cache ? 1 : cache_capacity, false);
             if (profile) {
                 cache_refresh_s[owner] +=
                     std::chrono::duration<double>(Clock::now()-cache_refresh_started).count();
@@ -703,6 +715,17 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 const std::size_t lookahead = std::min<std::size_t>(eligible_count,8);
                 for (std::size_t i = 0; i < lookahead; ++i) {
                     const int r = active[i];
+                    if (lazy_cache && factor.cached_pivot_rows && cache_slot[r] < 0) {
+                        const auto lazy_started = profile ? Clock::now() : Clock::time_point{};
+                        // Only materialize row i once all preceding candidates
+                        // have failed. Keeping previously examined rows avoids
+                        // repeated rank-length reconstruction on delayed pivots.
+                        refresh_candidates(eligible_count, i + 1, true);
+                        if (profile) {
+                            cache_refresh_s[owner] += std::chrono::duration<double>(
+                                Clock::now()-lazy_started).count();
+                        }
+                    }
                     const double magnitude = std::abs(current(r,r));
                     if (!(magnitude > factor.rank_tolerance)) { continue; }
                     double maximum = magnitude;
@@ -1123,6 +1146,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             "contribution_copy_entries=%zu contribution_moved_fronts=%zu "
             "front_row_union_s=%.6f front_zero_s=%.6f front_position_map_s=%.6f "
             "front_contained_sources=%zu front_merged_sources=%zu "
+            "cache_prefetched_rows=%zu cache_demand_rows=%zu "
             "(phase sums overlap with parallel work; subphases included in parent bins)\n",
             factor.grouped_fronts,factor.relaxed_groups,factor.fast_path_pivots,
             factor.fallback_searches,sum(assembly_s),sum(search_s),
@@ -1133,7 +1157,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             sum(contribution_copy_s),sum(contribution_move_s),
             sum_count(contribution_copy_entries),sum_count(contribution_moved_fronts),
             sum(front_row_union_s),sum(front_zero_s),sum(front_position_map_s),
-            sum_count(front_contained_sources),sum_count(front_merged_sources));
+            sum_count(front_contained_sources),sum_count(front_merged_sources),
+            sum_count(cache_prefetched_rows),sum_count(cache_demand_rows));
     }
     factor.ready = true;
 }
