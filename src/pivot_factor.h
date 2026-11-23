@@ -109,6 +109,8 @@ struct PivotFactor {
     std::size_t grouped_fronts     = 0;
     std::size_t fast_path_pivots   = 0;
     std::size_t fallback_searches  = 0;
+    std::size_t signed_batch_attempts = 0; // Number of narrow batch trials.
+    std::size_t signed_batch_pivots = 0; // Threshold-accepted signed 1x1 pivots.
     std::size_t relaxed_groups     = 0;
     double minimum_pivot          = 0.0;
 
