@@ -127,6 +127,52 @@ int main() {
                         pass = false;
                     }
                 }
+                // The contribution compaction change is purely a data-copy
+                // optimization. It must reproduce the exact elimination
+                // sequence, multiplier storage, inertia and solve residual on
+                // large fronts (including delayed pivots, 2x2 and singularity).
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    mf::PivotFactor previous;
+                    previous.kind = mf::PivotFactor::Kind::Symmetric;
+                    previous.fast_contribution_copy = false;
+                    previous.factorize(matrix,symbolic);
+                    const auto px = previous.solve(rhs);
+                    const auto pax = matrix.multiply(px);
+                    long double pr2=0.0L, pb2=0.0L;
+                    for (int k=0; k<n; ++k) {
+                        const long double d=static_cast<long double>(pax[k])-rhs[k];
+                        pr2+=d*d;
+                        pb2+=static_cast<long double>(rhs[k])*rhs[k];
+                    }
+                    const double pres=std::sqrt(pr2/std::max(pb2,1e-300L));
+                    bool metadata_identical =
+                        previous.rank == factor.rank &&
+                        previous.positive_directions == factor.positive_directions &&
+                        previous.negative_directions == factor.negative_directions &&
+                        previous.two_by_two_pivots == factor.two_by_two_pivots &&
+                        previous.packed_lower_rows == factor.packed_lower_rows &&
+                        previous.packed_lower_values == factor.packed_lower_values &&
+                        previous.packed_blocks.size() == factor.packed_blocks.size();
+                    if (metadata_identical) {
+                        for (std::size_t i=0;i<factor.packed_blocks.size();++i) {
+                            const auto& a=factor.packed_blocks[i];
+                            const auto& b=previous.packed_blocks[i];
+                            if (a.size!=b.size || a.rows!=b.rows ||
+                                a.diagonal!=b.diagonal ||
+                                a.lower_begin!=b.lower_begin ||
+                                a.value_begin!=b.value_begin ||
+                                a.lower_count!=b.lower_count) {
+                                metadata_identical=false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!metadata_identical || !std::isfinite(pres) || pres>1e-8) {
+                        std::cerr << "Fast contribution copy disagreement in "
+                                  << name << " old_residual=" << pres << '\n';
+                        pass=false;
+                    }
+                }
                 if (name.rfind("forced_2x2",0) == 0 && factor.two_by_two_pivots == 0) { pass = false; }
                 // A supernode may eliminate a previously delayed scalar
                 // candidate in the same assembled panel instead of passing it

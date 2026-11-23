@@ -43,6 +43,7 @@ int run_pivot_driver(int argc, char** argv) {
     bool fast_pivoting = true, tiled_schur = true, relaxed_supernodes = true;
     bool cached_pivot_rows = true;
     bool indexed_schur = true;
+    bool fast_contribution_copy = true;
     bool analyze_only = false;
     for (int i = 2; i < argc; ++i) {
         const std::string option = argv[i];
@@ -56,6 +57,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--ldlt-legacy-pivot-order") { fast_pivoting = false; }
         else if (option == "--ldlt-no-tiled-schur") { tiled_schur = false; }
         else if (option == "--ldlt-no-indexed-schur") { indexed_schur = false; }
+        else if (option == "--ldlt-no-fast-contribution-copy") { fast_contribution_copy = false; }
         else if (option == "--ldlt-no-pivot-cache") { cached_pivot_rows = false; }
         else if (option == "--ldlt-no-relaxed-supernodes") { relaxed_supernodes = false; }
         else if (option == "--analyze-only") { analyze_only = true; }
@@ -113,6 +115,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.fast_pivoting = fast_pivoting;
     factor.tiled_schur = tiled_schur;
     factor.indexed_schur = indexed_schur;
+    factor.fast_contribution_copy = fast_contribution_copy;
     factor.cached_pivot_rows = cached_pivot_rows;
     factor.relaxed_supernodes = relaxed_supernodes;
     std::vector<double> totals;
