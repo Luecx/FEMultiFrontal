@@ -172,6 +172,22 @@ int main() {
                         }
                     }
                     if (!metadata_identical || !std::isfinite(pres) || pres>1e-8) {
+                        if (ablation == 2) {
+                            std::cerr << " lazy_cache rank=" << previous.rank << "/" << factor.rank
+                                      << " inertia+=" << previous.positive_directions << "/" << factor.positive_directions
+                                      << " inertia-=" << previous.negative_directions << "/" << factor.negative_directions
+                                      << " packed_values=" << previous.packed_lower_values.size() << "/" << factor.packed_lower_values.size()
+                                      << " headers=" << previous.packed_blocks.size() << "/" << factor.packed_blocks.size();
+                            for (std::size_t k=0;k<std::min(previous.packed_lower_values.size(),factor.packed_lower_values.size());++k) {
+                                if (previous.packed_lower_values[k] != factor.packed_lower_values[k]) {
+                                    std::cerr << " first_diff_index=" << k
+                                              << " eager=" << std::setprecision(17) << previous.packed_lower_values[k]
+                                              << " lazy=" << factor.packed_lower_values[k];
+                                    break;
+                                }
+                            }
+                            std::cerr << "\n";
+                        }
                         std::cerr << (ablation == 0 ?
                             "Fast contribution copy disagreement in " :
                             ablation == 1 ?
