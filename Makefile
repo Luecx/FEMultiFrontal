@@ -20,7 +20,7 @@ BUILD_DIR := build/$(VARIANT)
 
 LIB_SOURCES := $(filter-out src/main.cpp,$(wildcard src/*.cpp))
 LIB_OBJECTS := $(LIB_SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)
-TEST_OBJECTS := $(BUILD_DIR)/tests/check.o $(BUILD_DIR)/tests/robustness.o $(BUILD_DIR)/tests/pivot_update.o $(BUILD_DIR)/tests/ldlt_schur.o
+TEST_OBJECTS := $(BUILD_DIR)/tests/check.o $(BUILD_DIR)/tests/robustness.o $(BUILD_DIR)/tests/pivot_update.o $(BUILD_DIR)/tests/ldlt_schur.o $(BUILD_DIR)/tests/ldlt_extend_add.o
 OBJECTS := $(LIB_OBJECTS) $(BUILD_DIR)/main.o $(TEST_OBJECTS)
 
 .PHONY: all check test clean
@@ -33,6 +33,9 @@ $(BUILD_DIR)/tests/check: $(LIB_OBJECTS) $(BUILD_DIR)/tests/check.o
 	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BUILD_DIR)/tests/ldlt_schur: $(LIB_OBJECTS) $(BUILD_DIR)/tests/ldlt_schur.o
+	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
+$(BUILD_DIR)/tests/ldlt_extend_add: $(LIB_OBJECTS) $(BUILD_DIR)/tests/ldlt_extend_add.o
 	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BUILD_DIR)/tests/robustness: $(LIB_OBJECTS) $(BUILD_DIR)/tests/robustness.o
@@ -49,11 +52,12 @@ $(BUILD_DIR)/tests/%.o: tests/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-check: $(BUILD_DIR)/tests/check $(BUILD_DIR)/tests/robustness $(BUILD_DIR)/tests/pivot_update $(BUILD_DIR)/tests/ldlt_schur
+check: $(BUILD_DIR)/tests/check $(BUILD_DIR)/tests/robustness $(BUILD_DIR)/tests/pivot_update $(BUILD_DIR)/tests/ldlt_schur $(BUILD_DIR)/tests/ldlt_extend_add
 	./$(BUILD_DIR)/tests/check
 	./$(BUILD_DIR)/tests/robustness
 	./$(BUILD_DIR)/tests/pivot_update
 	./$(BUILD_DIR)/tests/ldlt_schur
+	./$(BUILD_DIR)/tests/ldlt_extend_add
 
 test: check
 
