@@ -40,6 +40,8 @@ def main():
                         help="Compare scalar per-entry cache rebuild with pivot-major SIMD refresh")
     parser.add_argument("--simd-cache-apply-ablation", action="store_true",
                         help="Compare SIMD vs scalar cache row updates on top of pivot-major cache refresh")
+    parser.add_argument("--signed-batch-skip-diagonal-ablation", action="store_true",
+                        help="Compare signed batches with and without redundant diagonal cache updates")
     parser.add_argument("--signed-batch-ablation", action="store_true",
                         help="Compare merged-main cache path with signed threshold batch panels")
     parser.add_argument("--signed-batch-width", type=int, default=16)
@@ -84,9 +86,13 @@ def main():
         if sum((args.ablations, args.indexed_ablation, args.contribution_copy_ablation,
                 args.front_prepare_ablation, args.pivot_major_cache_ablation,
                 args.simd_cache_apply_ablation,
-                args.segmented_extend_add_ablation, args.signed_batch_ablation)) > 1:
+                args.segmented_extend_add_ablation, args.signed_batch_ablation,
+                args.signed_batch_skip_diagonal_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels"),
+             "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels", "--ldlt-signed-batch-skip-diagonal-cache")}
+            if args.signed_batch_skip_diagonal_ablation else
             {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply"),
              "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels")}
             if args.signed_batch_ablation else
@@ -110,6 +116,8 @@ def main():
         )
         labels = list(variants)
 
+        batch_diagnostics = {}
+
         def measure(label):
             flags = variants[label]
             completed = subprocess.run(
@@ -121,6 +129,15 @@ def main():
             if trial is None:
                 raise RuntimeError("Missing trial metrics: "+completed.stdout[-2000:])
             data = dict(METRIC.findall(trial))
+            if args.signed_batch_skip_diagonal_ablation:
+                summary = next((line for line in completed.stdout.splitlines()
+                                if "signed_batch_skipped_diagonal_updates=" in line), "")
+                metrics = dict(METRIC.findall(summary))
+                diagnostics = {key: metrics[key] for key in (
+                    "signed_batch_attempts", "signed_batch_pivots",
+                    "signed_batch_skipped_diagonal_updates") if key in metrics}
+                if diagnostics and label not in batch_diagnostics:
+                    batch_diagnostics[label] = diagnostics
             factor = float(data["factor_s"])
             residual = float(data["relative_residual"])
             if not (factor > 0 and residual <= 1e-8):
@@ -161,8 +178,11 @@ def main():
                                      args.pivot_major_cache_ablation,
                                      args.simd_cache_apply_ablation,
                                      args.segmented_extend_add_ablation,
-                                     args.signed_batch_ablation)) else "legacy"
+                                     args.signed_batch_ablation, args.signed_batch_skip_diagonal_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
+        for label, diagnostics in batch_diagnostics.items():
+            print(f"variant={label} " + " ".join(
+                f"{key}={value}" for key, value in diagnostics.items()))
 
 if __name__ == "__main__":
     main()
