@@ -325,6 +325,49 @@ int main() {
                         pass=false;
                     }
                 }
+                // Cache-elision must also exercise a full numerical panel,
+                // not just the original width-16 partial batches. Compare
+                // both widths with the incumbent rank/inertia and original
+                // residual; a dense signed fixture must really skip work.
+                if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    for (int batch_width : {16,31}) {
+                        mf::PivotFactor skip;
+                        skip.kind = mf::PivotFactor::Kind::Symmetric;
+                        skip.supernode_size = factor.supernode_size;
+                        skip.pivot_major_cache_refresh = true;
+                        skip.simd_cache_apply = true;
+                        skip.signed_batch_panels = true;
+                        skip.signed_batch_width = batch_width;
+                        skip.signed_batch_skip_diagonal_cache = true;
+                        skip.factorize(matrix,symbolic);
+                        const auto sx = skip.solve(rhs);
+                        const auto sax = matrix.multiply(sx);
+                        long double sr2=0.0L,sb2=0.0L;
+                        for (int k=0;k<n;++k) {
+                            const long double d=static_cast<long double>(sax[k])-rhs[k];
+                            sr2+=d*d;
+                            sb2+=static_cast<long double>(rhs[k])*rhs[k];
+                        }
+                        const double sres=std::sqrt(sr2/std::max(sb2,1e-300L));
+                        const bool exercised = name != "signed_batch_dense" ||
+                            batch_width != 31 || skip.signed_batch_skipped_diagonal_updates > 0;
+                        if (skip.rank != factor.rank ||
+                            skip.positive_directions != factor.positive_directions ||
+                            skip.negative_directions != factor.negative_directions ||
+                            !exercised || !std::isfinite(sres) || sres>=1e-8) {
+                            std::cerr << "Signed batch diagonal cache elision disagreement in "
+                                      << name << " width=" << batch_width
+                                      << " rank=" << skip.rank << "/" << factor.rank
+                                      << " inertia=(" << skip.positive_directions << ","
+                                      << skip.negative_directions << ")/("
+                                      << factor.positive_directions << ","
+                                      << factor.negative_directions << ")"
+                                      << " skipped=" << skip.signed_batch_skipped_diagonal_updates
+                                      << " residual=" << sres << '\n';
+                            pass=false;
+                        }
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
