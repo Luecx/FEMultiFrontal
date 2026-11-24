@@ -368,6 +368,60 @@ int main() {
                         }
                     }
                 }
+                // Compare the explicit rectangle kernel to the same signed
+                // batch algorithm (including diagonal cache elision).
+                // Widths exercise vector boundaries and scalar tails.
+                if (symmetric && !incompatible && n >= 96) {
+                    for (int batch_width : {8,16,31}) {
+                        mf::PivotFactor reference, simd;
+                        for (auto* variant : {&reference,&simd}) {
+                            variant->kind = mf::PivotFactor::Kind::Symmetric;
+                            variant->threads = threads;
+                            variant->supernode_size = factor.supernode_size;
+                            variant->pivot_major_cache_refresh = true;
+                            variant->simd_cache_apply = true;
+                            variant->signed_batch_panels = true;
+                            variant->signed_batch_width = batch_width;
+                            variant->signed_batch_skip_diagonal_cache = true;
+                        }
+                        simd.signed_batch_simd_rectangle = true;
+                        reference.factorize(matrix,symbolic);
+                        simd.factorize(matrix,symbolic);
+                        const auto sx = simd.solve(rhs);
+                        const auto sax = matrix.multiply(sx);
+                        long double sr2=0.0L,sb2=0.0L;
+                        for (int k=0;k<n;++k) {
+                            const long double d=static_cast<long double>(sax[k])-rhs[k];
+                            sr2+=d*d;
+                            sb2+=static_cast<long double>(rhs[k])*rhs[k];
+                        }
+                        const double sres=std::sqrt(sr2/std::max(sb2,1e-300L));
+                        bool exercised = reference.signed_batch_simd_entries == 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                        if (name == "signed_batch_dense") {
+                            exercised = exercised && simd.signed_batch_simd_entries > 0;
+                        }
+#else
+                        exercised = exercised && simd.signed_batch_simd_entries == 0;
+#endif
+                        if (simd.rank != reference.rank ||
+                            simd.rank != expected_rank ||
+                            simd.positive_directions != reference.positive_directions ||
+                            simd.negative_directions != reference.negative_directions ||
+                            !exercised || !std::isfinite(sres) || sres>=1e-8) {
+                            std::cerr << "Signed batch SIMD rectangle disagreement in "
+                                      << name << " width=" << batch_width
+                                      << " rank=" << simd.rank << "/" << reference.rank
+                                      << " inertia=(" << simd.positive_directions << ","
+                                      << simd.negative_directions << ")/("
+                                      << reference.positive_directions << ","
+                                      << reference.negative_directions << ")"
+                                      << " simd_entries=" << simd.signed_batch_simd_entries
+                                      << " residual=" << sres << '\n';
+                            pass=false;
+                        }
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular

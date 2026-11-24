@@ -48,6 +48,7 @@ int run_pivot_driver(int argc, char** argv) {
     bool segmented_extend_add = false;
     bool signed_batch_panels = false;
     bool signed_batch_skip_diagonal_cache = false;
+    bool signed_batch_simd_rectangle = false;
     int signed_batch_width = 16;
     bool indexed_schur = true;
     bool fast_contribution_copy = true;
@@ -74,6 +75,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--ldlt-segmented-extend-add") { segmented_extend_add = true; }
         else if (option == "--ldlt-signed-batch-panels") { signed_batch_panels = true; }
         else if (option == "--ldlt-signed-batch-skip-diagonal-cache") { signed_batch_skip_diagonal_cache = true; }
+        else if (option == "--ldlt-signed-batch-simd-rectangle") { signed_batch_simd_rectangle = true; }
         else if (option == "--ldlt-signed-batch-width" && i + 1 < argc) { signed_batch_width = std::stoi(argv[++i]); }
         else if (option == "--ldlt-no-relaxed-supernodes") { relaxed_supernodes = false; }
         else if (option == "--analyze-only") { analyze_only = true; }
@@ -146,6 +148,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.segmented_extend_add = segmented_extend_add;
     factor.signed_batch_panels = signed_batch_panels;
     factor.signed_batch_skip_diagonal_cache = signed_batch_skip_diagonal_cache;
+    factor.signed_batch_simd_rectangle = signed_batch_simd_rectangle;
     factor.signed_batch_width = signed_batch_width;
     factor.relaxed_supernodes = relaxed_supernodes;
     std::vector<double> totals;
@@ -201,6 +204,8 @@ int run_pivot_driver(int argc, char** argv) {
                   << " signed_batch_attempts=" << factor.signed_batch_attempts
                   << " signed_batch_skip_diagonal_cache=" << int(signed_batch_skip_diagonal_cache)
                   << " signed_batch_skipped_diagonal_updates=" << factor.signed_batch_skipped_diagonal_updates
+                  << " signed_batch_simd_rectangle=" << int(signed_batch_simd_rectangle)
+                  << " signed_batch_simd_entries=" << factor.signed_batch_simd_entries
                   << " signed_batch_pivots=" << factor.signed_batch_pivots
                   << " segmented_extend_add=" << int(segmented_extend_add)
                   << " blocked_panels=" << factor.blocked_panels

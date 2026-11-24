@@ -277,6 +277,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.fast_path_pivots = factor.fallback_searches = factor.relaxed_groups = 0;
     factor.signed_batch_attempts = factor.signed_batch_pivots = 0;
     factor.signed_batch_skipped_diagonal_updates = 0;
+    factor.signed_batch_simd_entries = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
@@ -345,6 +346,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<std::size_t> fast_pivots(n, 0), fallback_searches(n, 0), relaxed_groups(n, 0);
     std::vector<std::size_t> signed_attempts(n, 0), signed_accepted(n, 0);
     std::vector<std::size_t> signed_skipped_diagonal_updates(factor.signed_batch_skip_diagonal_cache ? n : 0, 0);
+    std::vector<std::size_t> signed_simd_entries(factor.signed_batch_simd_rectangle ? n : 0, 0);
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
@@ -900,7 +902,57 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         // For every (r,c), c<=r, apply the accepted D
                         // correction exactly once. The full Schur matrix
                         // is deliberately not modified here.
-                        for (int r=j+1;r<m;++r) {
+                        int scalar_end = m;
+#if defined(__AVX2__) && defined(__FMA__)
+                        if (factor.signed_batch_simd_rectangle && m > k && k-j-1 >= 4) {
+                            // The upper part of the eliminated trial row is
+                            // unused by the triangular factorization. Pack
+                            // the current R coefficients there once; this
+                            // also works when active contains index holes.
+                            double* const pivot=trial.data()+static_cast<std::size_t>(j)*k;
+                            for (int c=j+1;c<k;++c) {
+                                pivot[c]=panel.right[base+active[c]];
+                            }
+
+                            // Only the small triangular candidate block
+                            // needs varying bounds. All suffix rows have
+                            // exactly the same contiguous column range.
+                            scalar_end=k;
+                            const int vector_end=j+1+((k-j-1)/4)*4;
+                            const __m256d sign_mask=_mm256_set1_pd(-0.0);
+                            const __m256d limit=_mm256_set1_pd(
+                                std::numeric_limits<double>::max());
+                            for (int r=k;r<m;++r) {
+                                double* const row=trial.data()+static_cast<std::size_t>(r)*k;
+                                const double multiplier=panel.left[base+active[r]];
+                                const __m256d alpha=_mm256_set1_pd(multiplier);
+                                int c=j+1;
+                                for (;c<vector_end;c+=4) {
+                                    const __m256d next=_mm256_fnmadd_pd(
+                                        alpha,_mm256_loadu_pd(pivot+c),
+                                        _mm256_loadu_pd(row+c));
+                                    const __m256d finite=_mm256_cmp_pd(
+                                        _mm256_andnot_pd(sign_mask,next),limit,_CMP_LE_OQ);
+                                    if (_mm256_movemask_pd(finite)!=15) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                    }
+                                    _mm256_storeu_pd(row+c,next);
+                                }
+                                for (;c<k;++c) {
+                                    row[c]-=multiplier*pivot[c];
+                                    if (!std::isfinite(row[c])) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                    }
+                                }
+                            }
+                            signed_simd_entries[owner]+=
+                                static_cast<std::size_t>(m-k)*(vector_end-j-1);
+                        }
+#endif
+                        // Keep the original scalar triangular kernel, and
+                        // the entire original path for portable/disabled
+                        // builds or a remainder shorter than one vector.
+                        for (int r=j+1;r<scalar_end;++r) {
                             double* const row=trial.data()+static_cast<std::size_t>(r)*k;
                             const double multiplier=panel.left[base+active[r]];
                             for (int c=j+1;c<k && c<=r;++c) {
@@ -1313,6 +1365,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         factor.fast_path_pivots += fast_pivots[owner];
         factor.signed_batch_attempts += signed_attempts[owner];
         factor.signed_batch_pivots += signed_accepted[owner];
+        if (factor.signed_batch_simd_rectangle) {
+            factor.signed_batch_simd_entries += signed_simd_entries[owner];
+        }
         if (factor.signed_batch_skip_diagonal_cache) {
             factor.signed_batch_skipped_diagonal_updates += signed_skipped_diagonal_updates[owner];
         }
