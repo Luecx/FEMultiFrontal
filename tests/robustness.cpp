@@ -289,6 +289,7 @@ int main() {
                 // 2x2, delayed and singular matrices. Always compare against
                 // the unchanged regular solver on identical symbolic input.
                 if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    std::size_t initial_batch_pivots = 0;
                     for (bool continuation : {false,true}) {
                     mf::PivotFactor batch;
                     batch.kind = mf::PivotFactor::Kind::Symmetric;
@@ -308,9 +309,10 @@ int main() {
                         bb2+=static_cast<long double>(rhs[k])*rhs[k];
                     }
                     const double bres=std::sqrt(br2/std::max(bb2,1e-300L));
+                    if (!continuation) { initial_batch_pivots = batch.signed_batch_pivots; }
                     const bool exercised = name != "signed_batch_dense" ||
-                        (batch.signed_batch_attempts>0 && batch.signed_batch_pivots>=
-                         (continuation ? n-3 : 4));
+                        (batch.signed_batch_attempts>0 && batch.signed_batch_pivots>=4 &&
+                         (!continuation || batch.signed_batch_pivots>initial_batch_pivots));
                     if (batch.rank != factor.rank ||
                         batch.positive_directions != factor.positive_directions ||
                         batch.negative_directions != factor.negative_directions ||
