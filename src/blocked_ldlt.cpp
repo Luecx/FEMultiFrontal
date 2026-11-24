@@ -279,6 +279,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.signed_batch_skipped_diagonal_updates = 0;
     factor.signed_batch_simd_entries = 0;
     factor.signed_batch_register_block_entries = 0;
+    factor.signed_batch_saved_mask_checks = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
@@ -349,6 +350,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<std::size_t> signed_skipped_diagonal_updates(factor.signed_batch_skip_diagonal_cache ? n : 0, 0);
     std::vector<std::size_t> signed_simd_entries(factor.signed_batch_simd_rectangle ? n : 0, 0);
     std::vector<std::size_t> signed_register_entries(factor.signed_batch_register_blocking ? n : 0, 0);
+    std::vector<std::size_t> signed_saved_mask_checks(factor.signed_batch_accumulate_finite_mask ? n : 0, 0);
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
@@ -929,50 +931,74 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                                 // Four independent rows share each loaded
                                 // coefficient vector. Combine the four ordered
                                 // finite comparisons before the single branch.
-                                for (;r+4<=m;r+=4) {
-                                    double* const row0=trial.data()+static_cast<std::size_t>(r)*k;
-                                    double* const row1=row0+k;
-                                    double* const row2=row1+k;
-                                    double* const row3=row2+k;
-                                    const double a0=panel.left[base+active[r]];
-                                    const double a1=panel.left[base+active[r+1]];
-                                    const double a2=panel.left[base+active[r+2]];
-                                    const double a3=panel.left[base+active[r+3]];
-                                    const __m256d v0=_mm256_set1_pd(a0);
-                                    const __m256d v1=_mm256_set1_pd(a1);
-                                    const __m256d v2=_mm256_set1_pd(a2);
-                                    const __m256d v3=_mm256_set1_pd(a3);
-                                    int c=j+1;
-                                    for (;c<vector_end;c+=4) {
-                                        const __m256d p=_mm256_loadu_pd(pivot+c);
-                                        const __m256d x0=_mm256_fnmadd_pd(v0,p,_mm256_loadu_pd(row0+c));
-                                        const __m256d x1=_mm256_fnmadd_pd(v1,p,_mm256_loadu_pd(row1+c));
-                                        const __m256d x2=_mm256_fnmadd_pd(v2,p,_mm256_loadu_pd(row2+c));
-                                        const __m256d x3=_mm256_fnmadd_pd(v3,p,_mm256_loadu_pd(row3+c));
-                                        const __m256d f0=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x0),limit,_CMP_LE_OQ);
-                                        const __m256d f1=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x1),limit,_CMP_LE_OQ);
-                                        const __m256d f2=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x2),limit,_CMP_LE_OQ);
-                                        const __m256d f3=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x3),limit,_CMP_LE_OQ);
-                                        const __m256d finite=_mm256_and_pd(_mm256_and_pd(f0,f1),_mm256_and_pd(f2,f3));
-                                        if (_mm256_movemask_pd(finite)!=15) {
-                                            throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                // Compile two loop bodies so the ablation
+                                // adds no runtime branch inside the hot loop.
+                                auto update_four_rows = [&]<bool Accumulate>() {
+                                    for (;r+4<=m;r+=4) {
+                                        double* const row0=trial.data()+static_cast<std::size_t>(r)*k;
+                                        double* const row1=row0+k;
+                                        double* const row2=row1+k;
+                                        double* const row3=row2+k;
+                                        const double a0=panel.left[base+active[r]];
+                                        const double a1=panel.left[base+active[r+1]];
+                                        const double a2=panel.left[base+active[r+2]];
+                                        const double a3=panel.left[base+active[r+3]];
+                                        const __m256d v0=_mm256_set1_pd(a0);
+                                        const __m256d v1=_mm256_set1_pd(a1);
+                                        const __m256d v2=_mm256_set1_pd(a2);
+                                        const __m256d v3=_mm256_set1_pd(a3);
+                                        __m256d all_finite=_mm256_castsi256_pd(_mm256_set1_epi64x(-1));
+                                        int c=j+1;
+                                        for (;c<vector_end;c+=4) {
+                                            const __m256d p=_mm256_loadu_pd(pivot+c);
+                                            const __m256d x0=_mm256_fnmadd_pd(v0,p,_mm256_loadu_pd(row0+c));
+                                            const __m256d x1=_mm256_fnmadd_pd(v1,p,_mm256_loadu_pd(row1+c));
+                                            const __m256d x2=_mm256_fnmadd_pd(v2,p,_mm256_loadu_pd(row2+c));
+                                            const __m256d x3=_mm256_fnmadd_pd(v3,p,_mm256_loadu_pd(row3+c));
+                                            const __m256d f0=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x0),limit,_CMP_LE_OQ);
+                                            const __m256d f1=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x1),limit,_CMP_LE_OQ);
+                                            const __m256d f2=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x2),limit,_CMP_LE_OQ);
+                                            const __m256d f3=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x3),limit,_CMP_LE_OQ);
+                                            const __m256d finite=_mm256_and_pd(_mm256_and_pd(f0,f1),_mm256_and_pd(f2,f3));
+                                            if constexpr (Accumulate) {
+                                                all_finite=_mm256_and_pd(all_finite,finite);
+                                            } else {
+                                                if (_mm256_movemask_pd(finite)!=15) {
+                                                    throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                                }
+                                            }
+                                            _mm256_storeu_pd(row0+c,x0);
+                                            _mm256_storeu_pd(row1+c,x1);
+                                            _mm256_storeu_pd(row2+c,x2);
+                                            _mm256_storeu_pd(row3+c,x3);
                                         }
-                                        _mm256_storeu_pd(row0+c,x0);
-                                        _mm256_storeu_pd(row1+c,x1);
-                                        _mm256_storeu_pd(row2+c,x2);
-                                        _mm256_storeu_pd(row3+c,x3);
-                                    }
-                                    for (;c<k;++c) {
-                                        const double p=pivot[c];
-                                        row0[c]-=a0*p;
-                                        row1[c]-=a1*p;
-                                        row2[c]-=a2*p;
-                                        row3[c]-=a3*p;
-                                        if (!std::isfinite(row0[c]) || !std::isfinite(row1[c]) ||
-                                            !std::isfinite(row2[c]) || !std::isfinite(row3[c])) {
-                                            throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                        if constexpr (Accumulate) {
+                                            // AND is monotone: any nonfinite lane
+                                            // permanently clears its bit. Check
+                                            // before the scalar tail or next pivot.
+                                            if (_mm256_movemask_pd(all_finite)!=15) {
+                                                throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                            }
+                                        }
+                                        for (;c<k;++c) {
+                                            const double p=pivot[c];
+                                            row0[c]-=a0*p;
+                                            row1[c]-=a1*p;
+                                            row2[c]-=a2*p;
+                                            row3[c]-=a3*p;
+                                            if (!std::isfinite(row0[c]) || !std::isfinite(row1[c]) ||
+                                                !std::isfinite(row2[c]) || !std::isfinite(row3[c])) {
+                                                throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                            }
                                         }
                                     }
+                                };
+                                if (factor.signed_batch_accumulate_finite_mask && vector_end-j-1 > 4) {
+                                    update_four_rows.template operator()<true>();
+                                    signed_saved_mask_checks[owner]+=
+                                        static_cast<std::size_t>((r-k)/4)*((vector_end-j-1)/4-1);
+                                } else {
+                                    update_four_rows.template operator()<false>();
                                 }
                                 signed_register_entries[owner]+=
                                     static_cast<std::size_t>(r-k)*(vector_end-j-1);
@@ -1426,6 +1452,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
         if (factor.signed_batch_register_blocking) {
             factor.signed_batch_register_block_entries += signed_register_entries[owner];
+        }
+        if (factor.signed_batch_accumulate_finite_mask) {
+            factor.signed_batch_saved_mask_checks += signed_saved_mask_checks[owner];
         }
         if (factor.signed_batch_skip_diagonal_cache) {
             factor.signed_batch_skipped_diagonal_updates += signed_skipped_diagonal_updates[owner];
