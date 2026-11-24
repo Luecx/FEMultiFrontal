@@ -51,6 +51,7 @@ int run_pivot_driver(int argc, char** argv) {
     bool signed_batch_simd_rectangle = false;
     bool signed_batch_register_blocking = false;
     bool signed_batch_simd_columns = false;
+    bool signed_batch_tiled_workspace = false;
     int signed_batch_width = 16;
     bool indexed_schur = true;
     bool fast_contribution_copy = true;
@@ -80,6 +81,7 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--ldlt-signed-batch-simd-rectangle") { signed_batch_simd_rectangle = true; }
         else if (option == "--ldlt-signed-batch-register-blocking") { signed_batch_register_blocking = true; }
         else if (option == "--ldlt-signed-batch-simd-columns") { signed_batch_simd_columns = true; }
+        else if (option == "--ldlt-signed-batch-tiled-workspace") { signed_batch_tiled_workspace = true; }
         else if (option == "--ldlt-signed-batch-width" && i + 1 < argc) { signed_batch_width = std::stoi(argv[++i]); }
         else if (option == "--ldlt-no-relaxed-supernodes") { relaxed_supernodes = false; }
         else if (option == "--analyze-only") { analyze_only = true; }
@@ -155,6 +157,7 @@ int run_pivot_driver(int argc, char** argv) {
     factor.signed_batch_simd_rectangle = signed_batch_simd_rectangle;
     factor.signed_batch_register_blocking = signed_batch_register_blocking;
     factor.signed_batch_simd_columns = signed_batch_simd_columns;
+    factor.signed_batch_tiled_workspace = signed_batch_tiled_workspace;
     factor.signed_batch_width = signed_batch_width;
     factor.relaxed_supernodes = relaxed_supernodes;
     std::vector<double> totals;
@@ -216,6 +219,8 @@ int run_pivot_driver(int argc, char** argv) {
                   << " signed_batch_register_block_entries=" << factor.signed_batch_register_block_entries
                   << " signed_batch_simd_columns=" << int(signed_batch_simd_columns)
                   << " signed_batch_simd_column_entries=" << factor.signed_batch_simd_column_entries
+                  << " signed_batch_tiled_workspace=" << int(signed_batch_tiled_workspace)
+                  << " signed_batch_tiled_entries=" << factor.signed_batch_tiled_entries
                   << " signed_batch_pivots=" << factor.signed_batch_pivots
                   << " segmented_extend_add=" << int(segmented_extend_add)
                   << " blocked_panels=" << factor.blocked_panels
