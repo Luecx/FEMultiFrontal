@@ -46,6 +46,8 @@ int run_pivot_driver(int argc, char** argv) {
     bool pivot_major_cache_refresh = false;
     bool simd_cache_apply = false;
     bool segmented_extend_add = false;
+    bool signed_batch_panels = false;
+    int signed_batch_width = 16;
     bool indexed_schur = true;
     bool fast_contribution_copy = true;
     bool fast_front_prepare = true;
@@ -69,9 +71,14 @@ int run_pivot_driver(int argc, char** argv) {
         else if (option == "--ldlt-pivot-major-cache-refresh") { pivot_major_cache_refresh = true; }
         else if (option == "--ldlt-simd-cache-apply") { simd_cache_apply = true; }
         else if (option == "--ldlt-segmented-extend-add") { segmented_extend_add = true; }
+        else if (option == "--ldlt-signed-batch-panels") { signed_batch_panels = true; }
+        else if (option == "--ldlt-signed-batch-width" && i + 1 < argc) { signed_batch_width = std::stoi(argv[++i]); }
         else if (option == "--ldlt-no-relaxed-supernodes") { relaxed_supernodes = false; }
         else if (option == "--analyze-only") { analyze_only = true; }
         else { throw std::runtime_error("Unsupported or incomplete pivoted-mode option: " + option); }
+    }
+    if (signed_batch_width < 4 || signed_batch_width > 256) {
+        throw std::runtime_error("--ldlt-signed-batch-width must be in [4,256]");
     }
     const bool symmetric = matrix_type == "symmetric" || matrix_type == "psd";
     if ((!symmetric && matrix_type != "general") || repeat < 1 || threads < 1) {
@@ -135,6 +142,8 @@ int run_pivot_driver(int argc, char** argv) {
     factor.pivot_major_cache_refresh = pivot_major_cache_refresh;
     factor.simd_cache_apply = simd_cache_apply;
     factor.segmented_extend_add = segmented_extend_add;
+    factor.signed_batch_panels = signed_batch_panels;
+    factor.signed_batch_width = signed_batch_width;
     factor.relaxed_supernodes = relaxed_supernodes;
     std::vector<double> totals;
     for (int trial = 0; trial < repeat; ++trial) {
@@ -184,6 +193,10 @@ int run_pivot_driver(int argc, char** argv) {
                   << (ldlt_supernode_size == 0 ? ldlt_block_size : ldlt_supernode_size)
                   << " pivot_major_cache_refresh=" << int(pivot_major_cache_refresh)
                   << " simd_cache_apply=" << int(simd_cache_apply)
+                  << " signed_batch_panels=" << int(signed_batch_panels)
+                  << " signed_batch_width=" << signed_batch_width
+                  << " signed_batch_attempts=" << factor.signed_batch_attempts
+                  << " signed_batch_pivots=" << factor.signed_batch_pivots
                   << " segmented_extend_add=" << int(segmented_extend_add)
                   << " blocked_panels=" << factor.blocked_panels
                   << " supernodes=" << factor.grouped_fronts

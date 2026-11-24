@@ -40,6 +40,9 @@ def main():
                         help="Compare scalar per-entry cache rebuild with pivot-major SIMD refresh")
     parser.add_argument("--simd-cache-apply-ablation", action="store_true",
                         help="Compare SIMD vs scalar cache row updates on top of pivot-major cache refresh")
+    parser.add_argument("--signed-batch-ablation", action="store_true",
+                        help="Compare merged-main cache path with signed threshold batch panels")
+    parser.add_argument("--signed-batch-width", type=int, default=16)
     parser.add_argument("--segmented-extend-add-ablation", action="store_true",
                         help="Compare segmented vs scalar child-to-parent extend-add on top of both cache optimizations")
     parser.add_argument("--contribution-copy-ablation", action="store_true",
@@ -71,6 +74,7 @@ def main():
             "--ordering", args.ordering,
             "--threads", str(args.threads),
             "--ldlt-block-size", str(args.block_size),
+            "--ldlt-signed-batch-width", str(args.signed_batch_width),
             "--pivot-tolerance", str(args.pivot_tolerance),
             "--rank-tolerance", str(args.rank_tolerance),
         ]
@@ -80,9 +84,12 @@ def main():
         if sum((args.ablations, args.indexed_ablation, args.contribution_copy_ablation,
                 args.front_prepare_ablation, args.pivot_major_cache_ablation,
                 args.simd_cache_apply_ablation,
-                args.segmented_extend_add_ablation)) > 1:
+                args.segmented_extend_add_ablation, args.signed_batch_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply"),
+             "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels")}
+            if args.signed_batch_ablation else
             {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply"),
              "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-segmented-extend-add")}
             if args.segmented_extend_add_ablation else
@@ -153,7 +160,8 @@ def main():
                                      args.front_prepare_ablation,
                                      args.pivot_major_cache_ablation,
                                      args.simd_cache_apply_ablation,
-                                     args.segmented_extend_add_ablation)) else "legacy"
+                                     args.segmented_extend_add_ablation,
+                                     args.signed_batch_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
 
 if __name__ == "__main__":
