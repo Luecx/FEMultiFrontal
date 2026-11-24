@@ -88,6 +88,7 @@ struct PivotFactor {
     bool simd_cache_apply = false; // Experimental AVX2 contiguous-run updates for retained candidate rows.
     bool segmented_extend_add = false; // Experimental contiguous-run child-to-parent packed assembly.
     bool signed_batch_panels = false; // Experimental stable signed 1x1 LDLT batch with exact threshold checks.
+    bool signed_batch_continue = false; // Fill a numerical panel with consecutive successful batches.
     int signed_batch_width = 16; // Max speculative pivots per dense working panel (up to block_size-1).
     bool relaxed_supernodes = true;
 
