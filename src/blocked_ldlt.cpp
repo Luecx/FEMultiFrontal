@@ -781,9 +781,16 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             }
         };
 
+        // Continue only after a completely accepted batch, never after a
+        // failed threshold check or a scalar/2x2 pivot. No cached rows are
+        // live in this state, since refresh_candidates has not run yet.
+        bool batch_continuation = false;
         while (!active.empty()) {
             // Limit a panel's rank; a 2x2 pivot must not straddle its boundary.
-            if (panel.rank >= factor.block_size - 1) { flush(); }
+            if (panel.rank >= factor.block_size - 1) {
+                flush();
+                batch_continuation = false;
+            }
             const auto eligible_end = std::upper_bound(
                 active.begin(), active.end(), owner,
                 [&](int id, int local) { return id < front.rows[local]; });
@@ -799,15 +806,20 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             // committed to the ordinary L/R Schur panel; the incumbent
             // 1x1/2x2 pivot search then handles the remainder unchanged.
             //
-            // Attempt only at an empty panel, immediately after a flush.
-            // Thus F is current and no lookahead rows are live. Batched
-            // rank-one corrections touch only C, not the packed front,
-            // which still receives one rank-k Schur update on flush.
+            // Start with a flushed front, or extend a fully accepted batch
+            // using the remaining numerical panel capacity. The continuation
+            // gathers current entries including the earlier batch correction.
+            // A failed prefix never triggers another speculative attempt
+            // before the robust search resumes.
+            const bool may_continue = factor.signed_batch_continue && batch_continuation;
+            batch_continuation = false;
             if (factor.signed_batch_panels && factor.fast_pivoting &&
-                panel.rank == 0 && eligible_count >= 4 && factor.block_size >= 5) {
+                (panel.rank == 0 || may_continue) &&
+                eligible_count >= 4 && factor.block_size >= 5) {
+                const int initial_rank = panel.rank;
                 const int k = std::min({
                     static_cast<int>(eligible_count), factor.signed_batch_width,
-                    factor.block_size - 1
+                    factor.block_size - 1 - initial_rank
                 });
                 if (k >= 4) {
                     ++signed_attempts[owner];
@@ -819,7 +831,8 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     for (int r=0;r<m;++r) {
                         double* const row=trial.data()+static_cast<std::size_t>(r)*k;
                         for (int j=0;j<k && j<=r;++j) {
-                            row[j]=at(active[r],active[j]);
+                            row[j]=initial_rank == 0 ? at(active[r],active[j]) :
+                                current(active[r],active[j]);
                         }
                     }
                     auto& owner_records = records[owner];
@@ -897,10 +910,11 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         // Only a prefix was removed; delayed/2x2 candidates
                         // never disappear from active before robust fallback.
                         active.erase(active.begin(),active.begin()+accepted);
-                        // No candidate cache slots exist at panel.rank==0;
-                        // maintain its diagonals with the same accepted
-                        // pivot sequence as the incumbent implementation.
-                        apply_new_pivots_to_cache(0,accepted);
+                        // No lookahead rows are live in either batch state.
+                        // Update only the newly accepted pivots, never apply
+                        // an earlier batch's diagonal correction twice.
+                        apply_new_pivots_to_cache(initial_rank,accepted);
+                        batch_continuation = accepted == k;
                     }
                     if (profile) {
                         panel_build_s[owner] += std::chrono::duration<double>(
