@@ -280,6 +280,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.signed_batch_simd_entries = 0;
     factor.signed_batch_register_block_entries = 0;
     factor.signed_batch_simd_column_entries = 0;
+    factor.signed_batch_tiled_entries = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
@@ -351,6 +352,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<std::size_t> signed_simd_entries(factor.signed_batch_simd_rectangle ? n : 0, 0);
     std::vector<std::size_t> signed_register_entries(factor.signed_batch_register_blocking ? n : 0, 0);
     std::vector<std::size_t> signed_column_entries(factor.signed_batch_simd_columns ? n : 0, 0);
+    std::vector<std::size_t> signed_tiled_entries(factor.signed_batch_tiled_workspace ? n : 0, 0);
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
@@ -839,273 +841,375 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     ++signed_attempts[owner];
                     const auto batch_started = profile ? Clock::now() : Clock::time_point{};
                     const int m = static_cast<int>(active.size());
-                    // Work is m-by-k, with row-major contiguous candidate
-                    // columns. Only C[r,j] for r>=j is needed.
-                    std::vector<double> trial(static_cast<std::size_t>(m)*k, 0.0);
-#if defined(__AVX2__) && defined(__FMA__)
-                    // Reused for all candidate columns in this trial. No
-                    // change to the row-major rectangular update layout.
-                    std::vector<double> packed_column;
-                    if (factor.signed_batch_simd_columns) { packed_column.resize(m); }
-#endif
-                    for (int r=0;r<m;++r) {
-                        double* const row=trial.data()+static_cast<std::size_t>(r)*k;
-                        for (int j=0;j<k && j<=r;++j) {
-                            row[j]=at(active[r],active[j]);
-                        }
-                    }
-                    auto& owner_records = records[owner];
+                    // Dispatch once per trial: no layout branch in the
+                    // scalar accessor or the rectangle microkernel.
                     int accepted = 0;
-                    for (int j=0;j<k;++j) {
-                        const double d=trial[static_cast<std::size_t>(j)*k+j];
-                        const double magnitude=std::abs(d);
-                        if (!std::isfinite(d)) {
-                            throw std::runtime_error("Nonfinite signed LDLT batch pivot");
-                        }
-                        if (!(magnitude > factor.rank_tolerance)) { break; }
-                        double maximum=magnitude;
-#if defined(__AVX2__) && defined(__FMA__)
-                        const bool pack_column=factor.signed_batch_simd_columns && m-j-1>=4;
-                        if (pack_column) {
-                            const __m256d abs_mask=_mm256_set1_pd(-0.0);
-                            const __m256d finite_limit=_mm256_set1_pd(
-                                std::numeric_limits<double>::max());
-                            __m256d vmax=_mm256_set1_pd(magnitude);
-                            int r=j+1;
-                            for (;r+4<=m;r+=4) {
-                                // One strided read per coupling, then packed
-                                // unit-stride loads for the accepted pivot.
-                                const double* col=trial.data()+static_cast<std::size_t>(r)*k+j;
-                                const __m256d x=_mm256_setr_pd(col[0],col[k],col[2*k],col[3*k]);
-                                const __m256d ax=_mm256_andnot_pd(abs_mask,x);
-                                const __m256d finite=_mm256_cmp_pd(ax,finite_limit,_CMP_LE_OQ);
-                                if (_mm256_movemask_pd(finite)!=15) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch coupling");
-                                }
-                                vmax=_mm256_max_pd(vmax,ax);
-                                _mm256_storeu_pd(packed_column.data()+r,x);
-                            }
-                            alignas(32) double maxima[4];
-                            _mm256_store_pd(maxima,vmax);
-                            maximum=std::max(std::max(maxima[0],maxima[1]),
-                                             std::max(maxima[2],maxima[3]));
-                            for (;r<m;++r) {
-                                const double coupling=trial[static_cast<std::size_t>(r)*k+j];
-                                if (!std::isfinite(coupling)) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch coupling");
-                                }
-                                packed_column[r]=coupling;
-                                maximum=std::max(maximum,std::abs(coupling));
-                            }
-                        } else
-#endif
-                        {
-                            for (int r=j+1;r<m;++r) {
-                                const double coupling=trial[static_cast<std::size_t>(r)*k+j];
-                                if (!std::isfinite(coupling)) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch coupling");
-                                }
-                                maximum=std::max(maximum,std::abs(coupling));
-                            }
-                        }
-                        if (magnitude < factor.pivot_tolerance*maximum) { break; }
-
-                        // 1x1 signed D, no Cholesky or positive-definite
-                        // assumption. Entries of trial(:,j) already include
-                        // every previously accepted pivot in this batch.
-                        PackedSymmetricPivot block;
-                        block.size=1;
-                        block.rows[0]=front.rows[active[j]];
-                        block.diagonal[0]=d;
-                        block.lower_begin=owner_records.lower_rows.size();
-                        block.value_begin=owner_records.lower_values.size();
-                        const int rank=panel.rank;
-                        panel.append(1);
-                        const auto base=static_cast<std::size_t>(rank)*width;
-                        panel.right[base+active[j]]=d;
-                        const double sign=d/magnitude;
-                        auto store_multiplier=[&](int r,double value,double multiplier) {
-                            panel.right[base+active[r]]=value;
-                            panel.left[base+active[r]]=multiplier;
-                            if (multiplier != 0.0) {
-                                owner_records.lower_rows.push_back(front.rows[active[r]]);
-                                owner_records.lower_values.push_back(multiplier);
+                    auto factor_trial = [&]<bool Tiled>() {
+                        const int padded_k=(k+3)&~3;
+                        const int padded_m=(m+3)&~3;
+                        std::vector<double> trial(Tiled ?
+                            static_cast<std::size_t>(padded_m)*padded_k :
+                            static_cast<std::size_t>(m)*k, 0.0);
+                        // Column-major within each 4x4 tile, tiles adjacent
+                        // along a four-row strip. A group of four rows of any
+                        // column is contiguous; a tile occupies 16 doubles.
+                        auto entry = [&](int r,int c) -> double& {
+                            if constexpr (Tiled) {
+                                return trial[(static_cast<std::size_t>(r/4)*padded_k+c)*4+r%4];
+                            } else {
+                                return trial[static_cast<std::size_t>(r)*k+c];
                             }
                         };
 #if defined(__AVX2__) && defined(__FMA__)
-                        if (pack_column) {
-                            const __m256d denominator=_mm256_set1_pd(magnitude);
-                            const __m256d flip=_mm256_set1_pd(sign<0.0 ? -0.0 : 0.0);
-                            const __m256d abs_mask=_mm256_set1_pd(-0.0);
-                            const __m256d finite_limit=_mm256_set1_pd(
-                                std::numeric_limits<double>::max());
-                            int r=j+1;
-                            for (;r+4<=m;r+=4) {
-                                const __m256d value=_mm256_loadu_pd(packed_column.data()+r);
-                                // Division by magnitude, then exact sign
-                                // flip (division by +/-1). No reciprocal
-                                // approximation, even for tiny pivots.
-                                const __m256d multiplier=_mm256_xor_pd(
-                                    _mm256_div_pd(value,denominator),flip);
-                                const __m256d finite=_mm256_cmp_pd(
-                                    _mm256_andnot_pd(abs_mask,multiplier),finite_limit,_CMP_LE_OQ);
-                                if (_mm256_movemask_pd(finite)!=15) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
-                                }
-                                alignas(32) double multipliers[4];
-                                _mm256_store_pd(multipliers,multiplier);
-                                for (int lane=0;lane<4;++lane) {
-                                    store_multiplier(r+lane,packed_column[r+lane],multipliers[lane]);
-                                }
-                            }
-                            signed_column_entries[owner]+=static_cast<std::size_t>(r-j-1);
-                            for (;r<m;++r) {
-                                const double value=packed_column[r];
-                                const double multiplier=(value/magnitude)/sign;
-                                if (!std::isfinite(multiplier)) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
-                                }
-                                store_multiplier(r,value,multiplier);
-                            }
-                        } else
+                        // Reused for all candidate columns in this trial.
+                        std::vector<double> packed_column;
+                        if (factor.signed_batch_simd_columns) { packed_column.resize(m); }
 #endif
-                        {
-                            for (int r=j+1;r<m;++r) {
-                                const double value=trial[static_cast<std::size_t>(r)*k+j];
-                                // Scale before division like the incumbent
-                                // 1x1 path, preserving signed scalar pivots.
-                                const double multiplier=(value/magnitude)/sign;
-                                if (!std::isfinite(multiplier)) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
-                                }
-                                store_multiplier(r,value,multiplier);
+                        for (int r=0;r<m;++r) {
+                            for (int j=0;j<k && j<=r;++j) {
+                                entry(r,j)=at(active[r],active[j]);
                             }
                         }
-                        block.lower_count=owner_records.lower_rows.size()-block.lower_begin;
-                        owner_records.blocks.push_back(block);
-                        ++panel.rank;
-                        ++accepted;
-                        ++fast_pivots[owner];
-
-                        // Small signed LDLT trailing solve/update on C.
-                        // For every (r,c), c<=r, apply the accepted D
-                        // correction exactly once. The full Schur matrix
-                        // is deliberately not modified here.
-                        int scalar_end = m;
-#if defined(__AVX2__) && defined(__FMA__)
-                        if (factor.signed_batch_simd_rectangle && m > k && k-j-1 >= 4) {
-                            // The upper part of the eliminated trial row is
-                            // unused by the triangular factorization. Pack
-                            // the current R coefficients there once; this
-                            // also works when active contains index holes.
-                            double* const pivot=trial.data()+static_cast<std::size_t>(j)*k;
-                            for (int c=j+1;c<k;++c) {
-                                pivot[c]=panel.right[base+active[c]];
+                        auto& owner_records = records[owner];
+                        for (int j=0;j<k;++j) {
+                            const double d=entry(j,j);
+                            const double magnitude=std::abs(d);
+                            if (!std::isfinite(d)) {
+                                throw std::runtime_error("Nonfinite signed LDLT batch pivot");
                             }
-
-                            // Only the small triangular candidate block
-                            // needs varying bounds. All suffix rows have
-                            // exactly the same contiguous column range.
-                            scalar_end=k;
-                            const int vector_end=j+1+((k-j-1)/4)*4;
-                            const __m256d sign_mask=_mm256_set1_pd(-0.0);
-                            const __m256d limit=_mm256_set1_pd(
-                                std::numeric_limits<double>::max());
-                            int r=k;
-                            if (factor.signed_batch_register_blocking) {
-                                // Four independent rows share each loaded
-                                // coefficient vector. Combine the four ordered
-                                // finite comparisons before the single branch.
+                            if (!(magnitude > factor.rank_tolerance)) { break; }
+                            double maximum=magnitude;
+#if defined(__AVX2__) && defined(__FMA__)
+                            const bool pack_column=factor.signed_batch_simd_columns && m-j-1>=4;
+                            if (pack_column) {
+                                const __m256d abs_mask=_mm256_set1_pd(-0.0);
+                                const __m256d finite_limit=_mm256_set1_pd(
+                                    std::numeric_limits<double>::max());
+                                __m256d vmax=_mm256_set1_pd(magnitude);
+                                int r=j+1;
+                                if constexpr (Tiled) {
+                                    // Align the first vector with the physical
+                                    // four-row tile. The short prefix is scalar.
+                                    for (;r<m && r%4!=0;++r) {
+                                        const double coupling=entry(r,j);
+                                        if (!std::isfinite(coupling)) {
+                                            throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                        }
+                                        packed_column[r]=coupling;
+                                        maximum=std::max(maximum,std::abs(coupling));
+                                    }
+                                    vmax=_mm256_set1_pd(maximum);
+                                }
                                 for (;r+4<=m;r+=4) {
-                                    double* const row0=trial.data()+static_cast<std::size_t>(r)*k;
-                                    double* const row1=row0+k;
-                                    double* const row2=row1+k;
-                                    double* const row3=row2+k;
-                                    const double a0=panel.left[base+active[r]];
-                                    const double a1=panel.left[base+active[r+1]];
-                                    const double a2=panel.left[base+active[r+2]];
-                                    const double a3=panel.left[base+active[r+3]];
-                                    const __m256d v0=_mm256_set1_pd(a0);
-                                    const __m256d v1=_mm256_set1_pd(a1);
-                                    const __m256d v2=_mm256_set1_pd(a2);
-                                    const __m256d v3=_mm256_set1_pd(a3);
+                                    __m256d x;
+                                    if constexpr (Tiled) {
+                                        x=_mm256_loadu_pd(&entry(r,j));
+                                    } else {
+                                        const double* col=trial.data()+static_cast<std::size_t>(r)*k+j;
+                                        x=_mm256_setr_pd(col[0],col[k],col[2*k],col[3*k]);
+                                    }
+                                    const __m256d ax=_mm256_andnot_pd(abs_mask,x);
+                                    const __m256d finite=_mm256_cmp_pd(ax,finite_limit,_CMP_LE_OQ);
+                                    if (_mm256_movemask_pd(finite)!=15) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                    }
+                                    vmax=_mm256_max_pd(vmax,ax);
+                                    _mm256_storeu_pd(packed_column.data()+r,x);
+                                }
+                                alignas(32) double maxima[4];
+                                _mm256_store_pd(maxima,vmax);
+                                maximum=std::max(std::max(maxima[0],maxima[1]),
+                                                 std::max(maxima[2],maxima[3]));
+                                for (;r<m;++r) {
+                                    const double coupling=entry(r,j);
+                                    if (!std::isfinite(coupling)) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                    }
+                                    packed_column[r]=coupling;
+                                    maximum=std::max(maximum,std::abs(coupling));
+                                }
+                            } else
+#endif
+                            {
+                                for (int r=j+1;r<m;++r) {
+                                    const double coupling=entry(r,j);
+                                    if (!std::isfinite(coupling)) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                    }
+                                    maximum=std::max(maximum,std::abs(coupling));
+                                }
+                            }
+                            if (magnitude < factor.pivot_tolerance*maximum) { break; }
+
+                            // 1x1 signed D, no Cholesky or positive-definite
+                            // assumption. Entries of trial(:,j) already include
+                            // every previously accepted pivot in this batch.
+                            PackedSymmetricPivot block;
+                            block.size=1;
+                            block.rows[0]=front.rows[active[j]];
+                            block.diagonal[0]=d;
+                            block.lower_begin=owner_records.lower_rows.size();
+                            block.value_begin=owner_records.lower_values.size();
+                            const int rank=panel.rank;
+                            panel.append(1);
+                            const auto base=static_cast<std::size_t>(rank)*width;
+                            panel.right[base+active[j]]=d;
+                            const double sign=d/magnitude;
+                            auto store_multiplier=[&](int r,double value,double multiplier) {
+                                panel.right[base+active[r]]=value;
+                                panel.left[base+active[r]]=multiplier;
+                                if (multiplier != 0.0) {
+                                    owner_records.lower_rows.push_back(front.rows[active[r]]);
+                                    owner_records.lower_values.push_back(multiplier);
+                                }
+                            };
+#if defined(__AVX2__) && defined(__FMA__)
+                            if (pack_column) {
+                                const __m256d denominator=_mm256_set1_pd(magnitude);
+                                const __m256d flip=_mm256_set1_pd(sign<0.0 ? -0.0 : 0.0);
+                                const __m256d abs_mask=_mm256_set1_pd(-0.0);
+                                const __m256d finite_limit=_mm256_set1_pd(
+                                    std::numeric_limits<double>::max());
+                                int r=j+1;
+                                for (;r+4<=m;r+=4) {
+                                    const __m256d value=_mm256_loadu_pd(packed_column.data()+r);
+                                    // Division by magnitude, then exact sign
+                                    // flip (division by +/-1). No reciprocal
+                                    // approximation, even for tiny pivots.
+                                    const __m256d multiplier=_mm256_xor_pd(
+                                        _mm256_div_pd(value,denominator),flip);
+                                    const __m256d finite=_mm256_cmp_pd(
+                                        _mm256_andnot_pd(abs_mask,multiplier),finite_limit,_CMP_LE_OQ);
+                                    if (_mm256_movemask_pd(finite)!=15) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                                    }
+                                    alignas(32) double multipliers[4];
+                                    _mm256_store_pd(multipliers,multiplier);
+                                    for (int lane=0;lane<4;++lane) {
+                                        store_multiplier(r+lane,packed_column[r+lane],multipliers[lane]);
+                                    }
+                                }
+                                signed_column_entries[owner]+=static_cast<std::size_t>(r-j-1);
+                                for (;r<m;++r) {
+                                    const double value=packed_column[r];
+                                    const double multiplier=(value/magnitude)/sign;
+                                    if (!std::isfinite(multiplier)) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                                    }
+                                    store_multiplier(r,value,multiplier);
+                                }
+                            } else
+#endif
+                            {
+                                for (int r=j+1;r<m;++r) {
+                                    const double value=entry(r,j);
+                                    // Scale before division like the incumbent
+                                    // 1x1 path, preserving signed scalar pivots.
+                                    const double multiplier=(value/magnitude)/sign;
+                                    if (!std::isfinite(multiplier)) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                                    }
+                                    store_multiplier(r,value,multiplier);
+                                }
+                            }
+                            block.lower_count=owner_records.lower_rows.size()-block.lower_begin;
+                            owner_records.blocks.push_back(block);
+                            ++panel.rank;
+                            ++accepted;
+                            ++fast_pivots[owner];
+
+                            // Small signed LDLT trailing solve/update on C.
+                            // For every (r,c), c<=r, apply the accepted D
+                            // correction exactly once. The full Schur matrix
+                            // is deliberately not modified here.
+                            int scalar_end = m;
+#if defined(__AVX2__) && defined(__FMA__)
+                            if constexpr (Tiled) {
+                                // For each full four-row group, each column
+                                // vector is contiguous. Reuse the four L
+                                // multipliers across four columns of a tile.
+                                if (factor.signed_batch_simd_rectangle && m>k && k-j-1>=4) {
+                                    const int first=(k+3)&~3;
+                                    const int last=m&~3;
+                                    const int end=j+1+((k-j-1)/4)*4;
+                                    const __m256d sign_mask=_mm256_set1_pd(-0.0);
+                                    const __m256d limit=_mm256_set1_pd(std::numeric_limits<double>::max());
+                                    for (int r=first;r<last;r+=4) {
+                                        const __m256d a=_mm256_setr_pd(
+                                            panel.left[base+active[r]],panel.left[base+active[r+1]],
+                                            panel.left[base+active[r+2]],panel.left[base+active[r+3]]);
+                                        int c=j+1;
+                                        for (;c<end;c+=4) {
+                                            const __m256d x0=_mm256_fnmadd_pd(a,_mm256_set1_pd(panel.right[base+active[c]]),_mm256_loadu_pd(&entry(r,c)));
+                                            const __m256d x1=_mm256_fnmadd_pd(a,_mm256_set1_pd(panel.right[base+active[c+1]]),_mm256_loadu_pd(&entry(r,c+1)));
+                                            const __m256d x2=_mm256_fnmadd_pd(a,_mm256_set1_pd(panel.right[base+active[c+2]]),_mm256_loadu_pd(&entry(r,c+2)));
+                                            const __m256d x3=_mm256_fnmadd_pd(a,_mm256_set1_pd(panel.right[base+active[c+3]]),_mm256_loadu_pd(&entry(r,c+3)));
+                                            const __m256d f0=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x0),limit,_CMP_LE_OQ);
+                                            const __m256d f1=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x1),limit,_CMP_LE_OQ);
+                                            const __m256d f2=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x2),limit,_CMP_LE_OQ);
+                                            const __m256d f3=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x3),limit,_CMP_LE_OQ);
+                                            if (_mm256_movemask_pd(_mm256_and_pd(_mm256_and_pd(f0,f1),_mm256_and_pd(f2,f3)))!=15) {
+                                                throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                            }
+                                            _mm256_storeu_pd(&entry(r,c),x0);
+                                            _mm256_storeu_pd(&entry(r,c+1),x1);
+                                            _mm256_storeu_pd(&entry(r,c+2),x2);
+                                            _mm256_storeu_pd(&entry(r,c+3),x3);
+                                        }
+                                        for (;c<k;++c) {
+                                            const double p=panel.right[base+active[c]];
+                                            for (int lane=0;lane<4;++lane) {
+                                                double& x=entry(r+lane,c);
+                                                x-=panel.left[base+active[r+lane]]*p;
+                                                if (!std::isfinite(x)) {
+                                                    throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Boundary strips must not update padding or
+                                    // the leading triangular candidate block.
+                                    for (int r=k;r<m;++r) {
+                                        if (r>=first && r<last) { r=last-1; continue; }
+                                        const double a=panel.left[base+active[r]];
+                                        for (int c=j+1;c<k;++c) {
+                                            double& x=entry(r,c);
+                                            const double p=panel.right[base+active[c]];
+                                            if (c<end) { x=std::fma(-a,p,x); }
+                                            else { x-=a*p; }
+                                            if (!std::isfinite(x)) {
+                                                throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                            }
+                                        }
+                                    }
+                                    const auto count=static_cast<std::size_t>(std::max(0,last-first))*(end-j-1);
+                                    signed_tiled_entries[owner]+=count;
+                                    signed_simd_entries[owner]+=count;
+                                    if (factor.signed_batch_register_blocking) { signed_register_entries[owner]+=count; }
+                                    scalar_end=k;
+                                }
+                            } else if (factor.signed_batch_simd_rectangle && m > k && k-j-1 >= 4) {
+                                // The upper part of the eliminated trial row is
+                                // unused by the triangular factorization. Pack
+                                // the current R coefficients there once; this
+                                // also works when active contains index holes.
+                                double* const pivot=trial.data()+static_cast<std::size_t>(j)*k;
+                                for (int c=j+1;c<k;++c) {
+                                    pivot[c]=panel.right[base+active[c]];
+                                }
+
+                                // Only the small triangular candidate block
+                                // needs varying bounds. All suffix rows have
+                                // exactly the same contiguous column range.
+                                scalar_end=k;
+                                const int vector_end=j+1+((k-j-1)/4)*4;
+                                const __m256d sign_mask=_mm256_set1_pd(-0.0);
+                                const __m256d limit=_mm256_set1_pd(
+                                    std::numeric_limits<double>::max());
+                                int r=k;
+                                if (factor.signed_batch_register_blocking) {
+                                    // Four independent rows share each loaded
+                                    // coefficient vector. Combine the four ordered
+                                    // finite comparisons before the single branch.
+                                    for (;r+4<=m;r+=4) {
+                                        double* const row0=trial.data()+static_cast<std::size_t>(r)*k;
+                                        double* const row1=row0+k;
+                                        double* const row2=row1+k;
+                                        double* const row3=row2+k;
+                                        const double a0=panel.left[base+active[r]];
+                                        const double a1=panel.left[base+active[r+1]];
+                                        const double a2=panel.left[base+active[r+2]];
+                                        const double a3=panel.left[base+active[r+3]];
+                                        const __m256d v0=_mm256_set1_pd(a0);
+                                        const __m256d v1=_mm256_set1_pd(a1);
+                                        const __m256d v2=_mm256_set1_pd(a2);
+                                        const __m256d v3=_mm256_set1_pd(a3);
+                                        int c=j+1;
+                                        for (;c<vector_end;c+=4) {
+                                            const __m256d p=_mm256_loadu_pd(pivot+c);
+                                            const __m256d x0=_mm256_fnmadd_pd(v0,p,_mm256_loadu_pd(row0+c));
+                                            const __m256d x1=_mm256_fnmadd_pd(v1,p,_mm256_loadu_pd(row1+c));
+                                            const __m256d x2=_mm256_fnmadd_pd(v2,p,_mm256_loadu_pd(row2+c));
+                                            const __m256d x3=_mm256_fnmadd_pd(v3,p,_mm256_loadu_pd(row3+c));
+                                            const __m256d f0=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x0),limit,_CMP_LE_OQ);
+                                            const __m256d f1=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x1),limit,_CMP_LE_OQ);
+                                            const __m256d f2=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x2),limit,_CMP_LE_OQ);
+                                            const __m256d f3=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x3),limit,_CMP_LE_OQ);
+                                            const __m256d finite=_mm256_and_pd(_mm256_and_pd(f0,f1),_mm256_and_pd(f2,f3));
+                                            if (_mm256_movemask_pd(finite)!=15) {
+                                                throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                            }
+                                            _mm256_storeu_pd(row0+c,x0);
+                                            _mm256_storeu_pd(row1+c,x1);
+                                            _mm256_storeu_pd(row2+c,x2);
+                                            _mm256_storeu_pd(row3+c,x3);
+                                        }
+                                        for (;c<k;++c) {
+                                            const double p=pivot[c];
+                                            row0[c]-=a0*p;
+                                            row1[c]-=a1*p;
+                                            row2[c]-=a2*p;
+                                            row3[c]-=a3*p;
+                                            if (!std::isfinite(row0[c]) || !std::isfinite(row1[c]) ||
+                                                !std::isfinite(row2[c]) || !std::isfinite(row3[c])) {
+                                                throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                            }
+                                        }
+                                    }
+                                    signed_register_entries[owner]+=
+                                        static_cast<std::size_t>(r-k)*(vector_end-j-1);
+                                }
+                                // The incumbent 1x4 kernel handles leftover rows.
+                                for (;r<m;++r) {
+                                    double* const row=trial.data()+static_cast<std::size_t>(r)*k;
+                                    const double multiplier=panel.left[base+active[r]];
+                                    const __m256d alpha=_mm256_set1_pd(multiplier);
                                     int c=j+1;
                                     for (;c<vector_end;c+=4) {
-                                        const __m256d p=_mm256_loadu_pd(pivot+c);
-                                        const __m256d x0=_mm256_fnmadd_pd(v0,p,_mm256_loadu_pd(row0+c));
-                                        const __m256d x1=_mm256_fnmadd_pd(v1,p,_mm256_loadu_pd(row1+c));
-                                        const __m256d x2=_mm256_fnmadd_pd(v2,p,_mm256_loadu_pd(row2+c));
-                                        const __m256d x3=_mm256_fnmadd_pd(v3,p,_mm256_loadu_pd(row3+c));
-                                        const __m256d f0=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x0),limit,_CMP_LE_OQ);
-                                        const __m256d f1=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x1),limit,_CMP_LE_OQ);
-                                        const __m256d f2=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x2),limit,_CMP_LE_OQ);
-                                        const __m256d f3=_mm256_cmp_pd(_mm256_andnot_pd(sign_mask,x3),limit,_CMP_LE_OQ);
-                                        const __m256d finite=_mm256_and_pd(_mm256_and_pd(f0,f1),_mm256_and_pd(f2,f3));
+                                        const __m256d next=_mm256_fnmadd_pd(
+                                            alpha,_mm256_loadu_pd(pivot+c),
+                                            _mm256_loadu_pd(row+c));
+                                        const __m256d finite=_mm256_cmp_pd(
+                                            _mm256_andnot_pd(sign_mask,next),limit,_CMP_LE_OQ);
                                         if (_mm256_movemask_pd(finite)!=15) {
                                             throw std::runtime_error("Nonfinite signed LDLT batch update");
                                         }
-                                        _mm256_storeu_pd(row0+c,x0);
-                                        _mm256_storeu_pd(row1+c,x1);
-                                        _mm256_storeu_pd(row2+c,x2);
-                                        _mm256_storeu_pd(row3+c,x3);
+                                        _mm256_storeu_pd(row+c,next);
                                     }
                                     for (;c<k;++c) {
-                                        const double p=pivot[c];
-                                        row0[c]-=a0*p;
-                                        row1[c]-=a1*p;
-                                        row2[c]-=a2*p;
-                                        row3[c]-=a3*p;
-                                        if (!std::isfinite(row0[c]) || !std::isfinite(row1[c]) ||
-                                            !std::isfinite(row2[c]) || !std::isfinite(row3[c])) {
+                                        row[c]-=multiplier*pivot[c];
+                                        if (!std::isfinite(row[c])) {
                                             throw std::runtime_error("Nonfinite signed LDLT batch update");
                                         }
                                     }
                                 }
-                                signed_register_entries[owner]+=
-                                    static_cast<std::size_t>(r-k)*(vector_end-j-1);
+                                signed_simd_entries[owner]+=
+                                    static_cast<std::size_t>(m-k)*(vector_end-j-1);
                             }
-                            // The incumbent 1x4 kernel handles leftover rows.
-                            for (;r<m;++r) {
-                                double* const row=trial.data()+static_cast<std::size_t>(r)*k;
-                                const double multiplier=panel.left[base+active[r]];
-                                const __m256d alpha=_mm256_set1_pd(multiplier);
-                                int c=j+1;
-                                for (;c<vector_end;c+=4) {
-                                    const __m256d next=_mm256_fnmadd_pd(
-                                        alpha,_mm256_loadu_pd(pivot+c),
-                                        _mm256_loadu_pd(row+c));
-                                    const __m256d finite=_mm256_cmp_pd(
-                                        _mm256_andnot_pd(sign_mask,next),limit,_CMP_LE_OQ);
-                                    if (_mm256_movemask_pd(finite)!=15) {
-                                        throw std::runtime_error("Nonfinite signed LDLT batch update");
-                                    }
-                                    _mm256_storeu_pd(row+c,next);
-                                }
-                                for (;c<k;++c) {
-                                    row[c]-=multiplier*pivot[c];
-                                    if (!std::isfinite(row[c])) {
-                                        throw std::runtime_error("Nonfinite signed LDLT batch update");
-                                    }
-                                }
-                            }
-                            signed_simd_entries[owner]+=
-                                static_cast<std::size_t>(m-k)*(vector_end-j-1);
-                        }
 #endif
-                        // Keep the original scalar triangular kernel, and
-                        // the entire original path for portable/disabled
-                        // builds or a remainder shorter than one vector.
-                        for (int r=j+1;r<scalar_end;++r) {
-                            double* const row=trial.data()+static_cast<std::size_t>(r)*k;
-                            const double multiplier=panel.left[base+active[r]];
-                            for (int c=j+1;c<k && c<=r;++c) {
-                                row[c]-=multiplier*
-                                    panel.right[base+active[c]];
-                                if (!std::isfinite(row[c])) {
-                                    throw std::runtime_error("Nonfinite signed LDLT batch update");
+                            // Keep the original scalar triangular kernel, and
+                            // the entire original path for portable/disabled
+                            // builds or a remainder shorter than one vector.
+                            for (int r=j+1;r<scalar_end;++r) {
+                                const double multiplier=panel.left[base+active[r]];
+                                for (int c=j+1;c<k && c<=r;++c) {
+                                    double& x=entry(r,c);
+                                    x-=multiplier*panel.right[base+active[c]];
+                                    if (!std::isfinite(x)) {
+                                        throw std::runtime_error("Nonfinite signed LDLT batch update");
+                                    }
                                 }
                             }
                         }
+                    };
+#if defined(__AVX2__) && defined(__FMA__)
+                    if (factor.signed_batch_tiled_workspace && factor.signed_batch_simd_rectangle &&
+                        factor.signed_batch_register_blocking && factor.signed_batch_simd_columns) {
+                        factor_trial.template operator()<true>();
+                    } else
+#endif
+                    {
+                        factor_trial.template operator()<false>();
                     }
                     if (accepted != 0) {
                         signed_accepted[owner]+=accepted;
@@ -1516,6 +1620,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
         if (factor.signed_batch_simd_columns) {
             factor.signed_batch_simd_column_entries += signed_column_entries[owner];
+        }
+        if (factor.signed_batch_tiled_workspace) {
+            factor.signed_batch_tiled_entries += signed_tiled_entries[owner];
         }
         if (factor.signed_batch_skip_diagonal_cache) {
             factor.signed_batch_skipped_diagonal_updates += signed_skipped_diagonal_updates[owner];
