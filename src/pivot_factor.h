@@ -92,6 +92,7 @@ struct PivotFactor {
     bool signed_batch_simd_rectangle = false; // AVX2/FMA rectangular batch workspace updates.
     bool signed_batch_register_blocking = false; // Four-row AVX2 rectangle kernel, requires SIMD rectangle.
     bool signed_batch_simd_columns = false; // Packed pivot column threshold and multiplier SIMD.
+    bool signed_batch_tiled_workspace = false; // 4x4 tiled workspace with SIMD columns and rectangle.
     int signed_batch_width = 16; // Max speculative pivots per dense working panel (up to block_size-1).
     bool relaxed_supernodes = true;
 
@@ -118,6 +119,7 @@ struct PivotFactor {
     std::size_t signed_batch_simd_entries = 0; // Workspace entries updated by explicit SIMD.
     std::size_t signed_batch_register_block_entries = 0; // Subset of SIMD entries in 4x4 tiles.
     std::size_t signed_batch_simd_column_entries = 0; // Accepted coupling entries normalized by SIMD.
+    std::size_t signed_batch_tiled_entries = 0; // Entries updated by tiled workspace SIMD.
     std::size_t signed_batch_pivots = 0; // Threshold-accepted signed 1x1 pivots.
     std::size_t relaxed_groups     = 0;
     double minimum_pivot          = 0.0;
