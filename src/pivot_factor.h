@@ -89,6 +89,7 @@ struct PivotFactor {
     bool segmented_extend_add = false; // Experimental contiguous-run child-to-parent packed assembly.
     bool signed_batch_panels = false; // Experimental stable signed 1x1 LDLT batch with exact threshold checks.
     bool signed_batch_skip_diagonal_cache = false; // Skip batch diagonal maintenance if a flush is mandatory.
+    bool signed_batch_simd_rectangle = false; // AVX2/FMA rectangular batch workspace updates.
     int signed_batch_width = 16; // Max speculative pivots per dense working panel (up to block_size-1).
     bool relaxed_supernodes = true;
 
@@ -112,6 +113,7 @@ struct PivotFactor {
     std::size_t fallback_searches  = 0;
     std::size_t signed_batch_attempts = 0; // Number of narrow batch trials.
     std::size_t signed_batch_skipped_diagonal_updates = 0; // Avoided scalar diagonal corrections.
+    std::size_t signed_batch_simd_entries = 0; // Workspace entries updated by explicit SIMD.
     std::size_t signed_batch_pivots = 0; // Threshold-accepted signed 1x1 pivots.
     std::size_t relaxed_groups     = 0;
     double minimum_pivot          = 0.0;
