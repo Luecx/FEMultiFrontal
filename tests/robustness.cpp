@@ -477,6 +477,63 @@ int main() {
                         }
                     }
                 }
+                // Mask accumulation changes only the timing of finite checks.
+                // Verify identical pivot diagnostics and require real savings
+                // on the dense fixture whenever multiple vectors are present.
+                if (symmetric && !incompatible && n >= 96) {
+                    for (int batch_width : {8,16,31}) {
+                        mf::PivotFactor reference, tiled;
+                        for (auto* variant : {&reference,&tiled}) {
+                            variant->kind = mf::PivotFactor::Kind::Symmetric;
+                            variant->threads = threads;
+                            variant->supernode_size = factor.supernode_size;
+                            variant->pivot_major_cache_refresh = true;
+                            variant->simd_cache_apply = true;
+                            variant->signed_batch_panels = true;
+                            variant->signed_batch_width = batch_width;
+                            variant->signed_batch_skip_diagonal_cache = true;
+                            variant->signed_batch_simd_rectangle = true;
+                            variant->signed_batch_register_blocking = true;
+                        }
+                        tiled.signed_batch_accumulate_finite_mask = true;
+                        reference.factorize(matrix,symbolic);
+                        tiled.factorize(matrix,symbolic);
+                        bool exercised = reference.signed_batch_saved_mask_checks == 0 &&
+                            tiled.signed_batch_simd_entries == reference.signed_batch_simd_entries &&
+                            tiled.signed_batch_register_block_entries == reference.signed_batch_register_block_entries &&
+                            tiled.signed_batch_saved_mask_checks <= tiled.signed_batch_register_block_entries/16;
+#if defined(__AVX2__) && defined(__FMA__)
+                        if (name == "signed_batch_dense" && batch_width >= 16) {
+                            exercised = exercised && tiled.signed_batch_saved_mask_checks > 0;
+                        }
+#else
+                        exercised = exercised && tiled.signed_batch_saved_mask_checks == 0;
+#endif
+                        const auto tx=tiled.solve(rhs);
+                        const auto tax=matrix.multiply(tx);
+                        long double tr2=0.0L,tb2=0.0L;
+                        for (int k=0;k<n;++k) {
+                            const long double d=static_cast<long double>(tax[k])-rhs[k];
+                            tr2+=d*d;
+                            tb2+=static_cast<long double>(rhs[k])*rhs[k];
+                        }
+                        const double tres=std::sqrt(tr2/std::max(tb2,1e-300L));
+                        if (tiled.rank != reference.rank ||
+                            tiled.rank != expected_rank ||
+                            tiled.positive_directions != reference.positive_directions ||
+                            tiled.negative_directions != reference.negative_directions ||
+                            tiled.signed_batch_pivots != reference.signed_batch_pivots ||
+                            tiled.signed_batch_skipped_diagonal_updates != reference.signed_batch_skipped_diagonal_updates ||
+                            !exercised || !std::isfinite(tres) || tres>=1e-8) {
+                            std::cerr << "Signed batch finite mask accumulation disagreement in "
+                                      << name << " width=" << batch_width
+                                      << " rank=" << tiled.rank << "/" << reference.rank
+                                      << " saved_mask_checks=" << tiled.signed_batch_saved_mask_checks
+                                      << " residual=" << tres << '\n';
+                            pass=false;
+                        }
+                    }
+                }
                 // Both front row-union and contribution compaction must
                 // reconstruct the identical factor, not merely its residual:
                 // test them independently on delayed, indefinite and singular
