@@ -289,6 +289,7 @@ int main() {
                 // 2x2, delayed and singular matrices. Always compare against
                 // the unchanged regular solver on identical symbolic input.
                 if (symmetric && !incompatible && threads == 1 && n >= 96) {
+                    for (bool continuation : {false,true}) {
                     mf::PivotFactor batch;
                     batch.kind = mf::PivotFactor::Kind::Symmetric;
                     batch.supernode_size = factor.supernode_size;
@@ -296,6 +297,7 @@ int main() {
                     batch.simd_cache_apply = true;
                     batch.signed_batch_panels = true;
                     batch.signed_batch_width = 16;
+                    batch.signed_batch_continue = continuation;
                     batch.factorize(matrix,symbolic);
                     const auto bx = batch.solve(rhs);
                     const auto bax = matrix.multiply(bx);
@@ -307,7 +309,8 @@ int main() {
                     }
                     const double bres=std::sqrt(br2/std::max(bb2,1e-300L));
                     const bool exercised = name != "signed_batch_dense" ||
-                        (batch.signed_batch_attempts>0 && batch.signed_batch_pivots>=4);
+                        (batch.signed_batch_attempts>0 && batch.signed_batch_pivots>=
+                         (continuation ? n-3 : 4));
                     if (batch.rank != factor.rank ||
                         batch.positive_directions != factor.positive_directions ||
                         batch.negative_directions != factor.negative_directions ||
@@ -319,10 +322,12 @@ int main() {
                                   << batch.negative_directions << ")/("
                                   << factor.positive_directions << ","
                                   << factor.negative_directions << ")"
+                                  << " continuation=" << continuation
                                   << " attempts=" << batch.signed_batch_attempts
                                   << " accepted=" << batch.signed_batch_pivots
                                   << " residual=" << bres << '\n';
                         pass=false;
+                    }
                     }
                 }
                 // Both front row-union and contribution compaction must
