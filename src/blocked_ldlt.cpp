@@ -276,6 +276,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.blocked_panels = factor.grouped_fronts = 0;
     factor.fast_path_pivots = factor.fallback_searches = factor.relaxed_groups = 0;
     factor.signed_batch_attempts = factor.signed_batch_pivots = 0;
+    factor.signed_batch_skipped_diagonal_updates = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
@@ -343,6 +344,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<std::size_t> delays(n, 0), widths(n, 0), panels(n, 0), groups(n, 0);
     std::vector<std::size_t> fast_pivots(n, 0), fallback_searches(n, 0), relaxed_groups(n, 0);
     std::vector<std::size_t> signed_attempts(n, 0), signed_accepted(n, 0);
+    std::vector<std::size_t> signed_skipped_diagonal_updates(factor.signed_batch_skip_diagonal_cache ? n : 0, 0);
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
@@ -752,6 +754,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                 }
             }
         };
+        // A batch may leave the diagonal cache stale only when no pivot
+        // selection can occur before this panel is flushed.
+        bool batch_diagonal_stale = false;
         auto flush = [&] {
             if (panel.rank == 0) { return; }
             const auto t = profile ? Clock::now() : Clock::time_point{};
@@ -776,8 +781,23 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
             if (factor.cached_pivot_rows) {
                 for (int slot=0;slot<cache_capacity;++slot) { cached_ids[slot]=-1; }
                 std::fill(cache_slot.begin(),cache_slot.end(),-1);
-                // Cached diagonals already include every accepted correction.
-                // Fresh rows will be rebuilt from the flushed physical front.
+                if (batch_diagonal_stale) {
+                    // The Schur update has materialized the current diagonal.
+                    // Rebuild once instead of applying every pivot to every
+                    // surviving cached diagonal. If this front is finished,
+                    // there is no need to write the cache at all.
+                    const bool need_cache = !active.empty() && front.rows[active.front()] <= owner;
+                    for (int r : active) {
+                        const double d = at(r,r);
+                        if (!std::isfinite(d)) {
+                            throw std::runtime_error("Nonfinite LDLT flushed batch diagonal");
+                        }
+                        if (need_cache) { diagonal[r] = d; }
+                    }
+                    batch_diagonal_stale = false;
+                }
+                // Otherwise cached diagonals already include every accepted
+                // correction. Fresh rows are always rebuilt after a flush.
             }
         };
 
@@ -897,10 +917,22 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         // Only a prefix was removed; delayed/2x2 candidates
                         // never disappear from active before robust fallback.
                         active.erase(active.begin(),active.begin()+accepted);
-                        // No candidate cache slots exist at panel.rank==0;
-                        // maintain its diagonals with the same accepted
-                        // pivot sequence as the incumbent implementation.
-                        apply_new_pivots_to_cache(0,accepted);
+                        // No candidate cache slots exist at panel.rank==0.
+                        // A full panel must flush before the next pivot; a
+                        // fully eliminated eligible prefix ends this front.
+                        // Only these two cases can safely skip maintaining
+                        // the diagonal cache. A partial batch with remaining
+                        // eligible pivots needs the original updates for
+                        // the robust 1x1/2x2 fallback.
+                        if (factor.signed_batch_skip_diagonal_cache && factor.cached_pivot_rows &&
+                            (panel.rank >= factor.block_size - 1 ||
+                             static_cast<std::size_t>(accepted) == eligible_count)) {
+                            batch_diagonal_stale = true;
+                            signed_skipped_diagonal_updates[owner] +=
+                                static_cast<std::size_t>(accepted)*active.size();
+                        } else {
+                            apply_new_pivots_to_cache(0,accepted);
+                        }
                     }
                     if (profile) {
                         panel_build_s[owner] += std::chrono::duration<double>(
@@ -1281,6 +1313,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         factor.fast_path_pivots += fast_pivots[owner];
         factor.signed_batch_attempts += signed_attempts[owner];
         factor.signed_batch_pivots += signed_accepted[owner];
+        if (factor.signed_batch_skip_diagonal_cache) {
+            factor.signed_batch_skipped_diagonal_updates += signed_skipped_diagonal_updates[owner];
+        }
         factor.fallback_searches += fallback_searches[owner];
         factor.relaxed_groups += relaxed_groups[owner];
         factor.delayed_candidates += delays[owner];
