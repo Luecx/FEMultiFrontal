@@ -40,6 +40,8 @@ def main():
                         help="Compare scalar per-entry cache rebuild with pivot-major SIMD refresh")
     parser.add_argument("--simd-cache-apply-ablation", action="store_true",
                         help="Compare SIMD vs scalar cache row updates on top of pivot-major cache refresh")
+    parser.add_argument("--signed-batch-simd-columns-ablation", action="store_true",
+                        help="Compare scalar and packed SIMD pivot-column evaluation")
     parser.add_argument("--signed-batch-register-blocking-ablation", action="store_true",
                         help="Compare 1x4 and 4x4 signed batch AVX2 kernels")
     parser.add_argument("--signed-batch-simd-rectangle-ablation", action="store_true",
@@ -91,9 +93,12 @@ def main():
                 args.front_prepare_ablation, args.pivot_major_cache_ablation,
                 args.simd_cache_apply_ablation,
                 args.segmented_extend_add_ablation, args.signed_batch_ablation,
-                args.signed_batch_skip_diagonal_ablation, args.signed_batch_simd_rectangle_ablation, args.signed_batch_register_blocking_ablation)) > 1:
+                args.signed_batch_skip_diagonal_ablation, args.signed_batch_simd_rectangle_ablation, args.signed_batch_register_blocking_ablation, args.signed_batch_simd_columns_ablation)) > 1:
             parser.error("Ablation switches are mutually exclusive")
         variants = (
+            {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels", "--ldlt-signed-batch-skip-diagonal-cache", "--ldlt-signed-batch-simd-rectangle", "--ldlt-signed-batch-register-blocking"),
+             "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels", "--ldlt-signed-batch-skip-diagonal-cache", "--ldlt-signed-batch-simd-rectangle", "--ldlt-signed-batch-register-blocking", "--ldlt-signed-batch-simd-columns")}
+            if args.signed_batch_simd_columns_ablation else
             {"previous": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels", "--ldlt-signed-batch-skip-diagonal-cache", "--ldlt-signed-batch-simd-rectangle"),
              "candidate": ("--ldlt-pivot-major-cache-refresh", "--ldlt-simd-cache-apply", "--ldlt-signed-batch-panels", "--ldlt-signed-batch-skip-diagonal-cache", "--ldlt-signed-batch-simd-rectangle", "--ldlt-signed-batch-register-blocking")}
             if args.signed_batch_register_blocking_ablation else
@@ -140,14 +145,14 @@ def main():
                 raise RuntimeError("Missing trial metrics: "+completed.stdout[-2000:])
             data = dict(METRIC.findall(trial))
             if (args.signed_batch_skip_diagonal_ablation or args.signed_batch_simd_rectangle_ablation
-                    or args.signed_batch_register_blocking_ablation):
+                    or args.signed_batch_register_blocking_ablation or args.signed_batch_simd_columns_ablation):
                 summary = next((line for line in completed.stdout.splitlines()
                                 if "signed_batch_skipped_diagonal_updates=" in line), "")
                 metrics = dict(METRIC.findall(summary))
                 diagnostics = {key: metrics[key] for key in (
                     "signed_batch_attempts", "signed_batch_pivots",
                     "signed_batch_skipped_diagonal_updates", "signed_batch_simd_entries",
-                    "signed_batch_register_block_entries") if key in metrics}
+                    "signed_batch_register_block_entries", "signed_batch_simd_column_entries") if key in metrics}
                 if diagnostics and label not in batch_diagnostics:
                     batch_diagnostics[label] = diagnostics
             factor = float(data["factor_s"])
@@ -192,7 +197,8 @@ def main():
                                      args.segmented_extend_add_ablation,
                                      args.signed_batch_ablation, args.signed_batch_skip_diagonal_ablation,
                                      args.signed_batch_simd_rectangle_ablation,
-                                     args.signed_batch_register_blocking_ablation)) else "legacy"
+                                     args.signed_batch_register_blocking_ablation,
+                                     args.signed_batch_simd_columns_ablation)) else "legacy"
         print(f"speedup={medians[baseline]/medians['candidate']:.5f}x rank_and_inertia={reference}")
         for label, diagnostics in batch_diagnostics.items():
             print(f"variant={label} " + " ".join(
