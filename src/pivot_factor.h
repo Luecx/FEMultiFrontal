@@ -91,6 +91,7 @@ struct PivotFactor {
     bool signed_batch_skip_diagonal_cache = false; // Skip batch diagonal maintenance if a flush is mandatory.
     bool signed_batch_simd_rectangle = false; // AVX2/FMA rectangular batch workspace updates.
     bool signed_batch_register_blocking = false; // Four-row AVX2 rectangle kernel, requires SIMD rectangle.
+    bool signed_batch_accumulate_finite_mask = false; // Reduce mask checks across each four-row tile group.
     int signed_batch_width = 16; // Max speculative pivots per dense working panel (up to block_size-1).
     bool relaxed_supernodes = true;
 
@@ -116,6 +117,7 @@ struct PivotFactor {
     std::size_t signed_batch_skipped_diagonal_updates = 0; // Avoided scalar diagonal corrections.
     std::size_t signed_batch_simd_entries = 0; // Workspace entries updated by explicit SIMD.
     std::size_t signed_batch_register_block_entries = 0; // Subset of SIMD entries in 4x4 tiles.
+    std::size_t signed_batch_saved_mask_checks = 0; // Avoided movemask checks in register-blocked updates.
     std::size_t signed_batch_pivots = 0; // Threshold-accepted signed 1x1 pivots.
     std::size_t relaxed_groups     = 0;
     double minimum_pivot          = 0.0;
