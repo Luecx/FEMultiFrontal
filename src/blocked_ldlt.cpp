@@ -279,6 +279,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     factor.signed_batch_skipped_diagonal_updates = 0;
     factor.signed_batch_simd_entries = 0;
     factor.signed_batch_register_block_entries = 0;
+    factor.signed_batch_simd_column_entries = 0;
     factor.minimum_pivot = std::numeric_limits<double>::infinity();
 
     // Validate exactly mirrored symmetric entries and derive lower CSC starts.
@@ -349,6 +350,7 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
     std::vector<std::size_t> signed_skipped_diagonal_updates(factor.signed_batch_skip_diagonal_cache ? n : 0, 0);
     std::vector<std::size_t> signed_simd_entries(factor.signed_batch_simd_rectangle ? n : 0, 0);
     std::vector<std::size_t> signed_register_entries(factor.signed_batch_register_blocking ? n : 0, 0);
+    std::vector<std::size_t> signed_column_entries(factor.signed_batch_simd_columns ? n : 0, 0);
     using Clock = std::chrono::steady_clock;
     const bool profile = std::getenv("FEMF_LDLT_PROFILE") != nullptr;
     std::vector<double> assembly_s(n,0.0), search_s(n,0.0), schur_s(n,0.0), front_s(n,0.0);
@@ -840,6 +842,12 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                     // Work is m-by-k, with row-major contiguous candidate
                     // columns. Only C[r,j] for r>=j is needed.
                     std::vector<double> trial(static_cast<std::size_t>(m)*k, 0.0);
+#if defined(__AVX2__) && defined(__FMA__)
+                    // Reused for all candidate columns in this trial. No
+                    // change to the row-major rectangular update layout.
+                    std::vector<double> packed_column;
+                    if (factor.signed_batch_simd_columns) { packed_column.resize(m); }
+#endif
                     for (int r=0;r<m;++r) {
                         double* const row=trial.data()+static_cast<std::size_t>(r)*k;
                         for (int j=0;j<k && j<=r;++j) {
@@ -856,12 +864,49 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         }
                         if (!(magnitude > factor.rank_tolerance)) { break; }
                         double maximum=magnitude;
-                        for (int r=j+1;r<m;++r) {
-                            const double coupling=trial[static_cast<std::size_t>(r)*k+j];
-                            if (!std::isfinite(coupling)) {
-                                throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+#if defined(__AVX2__) && defined(__FMA__)
+                        const bool pack_column=factor.signed_batch_simd_columns && m-j-1>=4;
+                        if (pack_column) {
+                            const __m256d abs_mask=_mm256_set1_pd(-0.0);
+                            const __m256d finite_limit=_mm256_set1_pd(
+                                std::numeric_limits<double>::max());
+                            __m256d vmax=_mm256_set1_pd(magnitude);
+                            int r=j+1;
+                            for (;r+4<=m;r+=4) {
+                                // One strided read per coupling, then packed
+                                // unit-stride loads for the accepted pivot.
+                                const double* col=trial.data()+static_cast<std::size_t>(r)*k+j;
+                                const __m256d x=_mm256_setr_pd(col[0],col[k],col[2*k],col[3*k]);
+                                const __m256d ax=_mm256_andnot_pd(abs_mask,x);
+                                const __m256d finite=_mm256_cmp_pd(ax,finite_limit,_CMP_LE_OQ);
+                                if (_mm256_movemask_pd(finite)!=15) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                }
+                                vmax=_mm256_max_pd(vmax,ax);
+                                _mm256_storeu_pd(packed_column.data()+r,x);
                             }
-                            maximum=std::max(maximum,std::abs(coupling));
+                            alignas(32) double maxima[4];
+                            _mm256_store_pd(maxima,vmax);
+                            maximum=std::max(std::max(maxima[0],maxima[1]),
+                                             std::max(maxima[2],maxima[3]));
+                            for (;r<m;++r) {
+                                const double coupling=trial[static_cast<std::size_t>(r)*k+j];
+                                if (!std::isfinite(coupling)) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                }
+                                packed_column[r]=coupling;
+                                maximum=std::max(maximum,std::abs(coupling));
+                            }
+                        } else
+#endif
+                        {
+                            for (int r=j+1;r<m;++r) {
+                                const double coupling=trial[static_cast<std::size_t>(r)*k+j];
+                                if (!std::isfinite(coupling)) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch coupling");
+                                }
+                                maximum=std::max(maximum,std::abs(coupling));
+                            }
                         }
                         if (magnitude < factor.pivot_tolerance*maximum) { break; }
 
@@ -879,19 +924,61 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
                         const auto base=static_cast<std::size_t>(rank)*width;
                         panel.right[base+active[j]]=d;
                         const double sign=d/magnitude;
-                        for (int r=j+1;r<m;++r) {
-                            const double value=trial[static_cast<std::size_t>(r)*k+j];
-                            // Scale before division like the incumbent
-                            // 1x1 path, preserving signed scalar pivots.
-                            const double multiplier=(value/magnitude)/sign;
-                            if (!std::isfinite(multiplier)) {
-                                throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
-                            }
+                        auto store_multiplier=[&](int r,double value,double multiplier) {
                             panel.right[base+active[r]]=value;
                             panel.left[base+active[r]]=multiplier;
                             if (multiplier != 0.0) {
                                 owner_records.lower_rows.push_back(front.rows[active[r]]);
                                 owner_records.lower_values.push_back(multiplier);
+                            }
+                        };
+#if defined(__AVX2__) && defined(__FMA__)
+                        if (pack_column) {
+                            const __m256d denominator=_mm256_set1_pd(magnitude);
+                            const __m256d flip=_mm256_set1_pd(sign<0.0 ? -0.0 : 0.0);
+                            const __m256d abs_mask=_mm256_set1_pd(-0.0);
+                            const __m256d finite_limit=_mm256_set1_pd(
+                                std::numeric_limits<double>::max());
+                            int r=j+1;
+                            for (;r+4<=m;r+=4) {
+                                const __m256d value=_mm256_loadu_pd(packed_column.data()+r);
+                                // Division by magnitude, then exact sign
+                                // flip (division by +/-1). No reciprocal
+                                // approximation, even for tiny pivots.
+                                const __m256d multiplier=_mm256_xor_pd(
+                                    _mm256_div_pd(value,denominator),flip);
+                                const __m256d finite=_mm256_cmp_pd(
+                                    _mm256_andnot_pd(abs_mask,multiplier),finite_limit,_CMP_LE_OQ);
+                                if (_mm256_movemask_pd(finite)!=15) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                                }
+                                alignas(32) double multipliers[4];
+                                _mm256_store_pd(multipliers,multiplier);
+                                for (int lane=0;lane<4;++lane) {
+                                    store_multiplier(r+lane,packed_column[r+lane],multipliers[lane]);
+                                }
+                            }
+                            signed_column_entries[owner]+=static_cast<std::size_t>(r-j-1);
+                            for (;r<m;++r) {
+                                const double value=packed_column[r];
+                                const double multiplier=(value/magnitude)/sign;
+                                if (!std::isfinite(multiplier)) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                                }
+                                store_multiplier(r,value,multiplier);
+                            }
+                        } else
+#endif
+                        {
+                            for (int r=j+1;r<m;++r) {
+                                const double value=trial[static_cast<std::size_t>(r)*k+j];
+                                // Scale before division like the incumbent
+                                // 1x1 path, preserving signed scalar pivots.
+                                const double multiplier=(value/magnitude)/sign;
+                                if (!std::isfinite(multiplier)) {
+                                    throw std::runtime_error("Nonfinite signed LDLT batch multiplier");
+                                }
+                                store_multiplier(r,value,multiplier);
                             }
                         }
                         block.lower_count=owner_records.lower_rows.size()-block.lower_begin;
@@ -1426,6 +1513,9 @@ void factorize_blocked_ldlt(PivotFactor& factor, const GeneralMatrix& input,
         }
         if (factor.signed_batch_register_blocking) {
             factor.signed_batch_register_block_entries += signed_register_entries[owner];
+        }
+        if (factor.signed_batch_simd_columns) {
+            factor.signed_batch_simd_column_entries += signed_column_entries[owner];
         }
         if (factor.signed_batch_skip_diagonal_cache) {
             factor.signed_batch_skipped_diagonal_updates += signed_skipped_diagonal_updates[owner];
